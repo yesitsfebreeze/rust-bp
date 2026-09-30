@@ -1,16 +1,5 @@
-//! boiler — the hot-reload + profiler framework an agent drives through the
-//! `boiler-mcp` control server.
-//!
-//! One project, three loops:
-//!
-//! 1. **Hot reload** — [`hot::Supervisor`] watches the sources, rebuilds on
-//!    change and swaps the executable, keeping the old build on a failed one.
-//! 2. **Live channels** — [`channels`] is the preset profiler channel:
-//!    counters, latency histograms and last-values recorded in the
-//!    executable and read live over a Unix socket.
-//! 3. **Valgrind + Jev** — [`valgrind`] runs any command under callgrind or
-//!    memcheck inside a Linux container (the host Mac has no valgrind) and
-//!    stores parsed runs; [`jev`] ranks them over the Jev wire.
+//! The hot-reload + profiler framework an agent drives through the
+//! `boiler-mcp` control server. (module docs: see README.md)
 //!
 //! Conventions: everything the framework writes lands under `.boiler/` of
 //! the project root (the current directory of whoever runs it); the
@@ -19,7 +8,9 @@
 
 pub mod channels;
 pub mod hot;
+#[cfg(feature = "jev")]
 pub mod jev;
+pub mod native;
 pub mod util;
 pub mod valgrind;
 pub mod watch;

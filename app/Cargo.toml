@@ -5,7 +5,7 @@ edition.workspace = true
 description = "The demo executable: replace this crate with your project; it only shows the channels contract"
 
 [dependencies]
-boiler = { path = "../crates/boiler" }
+boiler = { path = "../crates/boiler", default-features = false }
 
 [[bin]]
 name = "app"

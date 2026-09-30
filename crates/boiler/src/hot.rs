@@ -223,9 +223,11 @@ impl Supervisor {
             let _ = live.wait();
         }
         let child = spawn(&self.child_command);
-        let mut sh = state.shared.lock().unwrap();
-        sh.swaps += 1;
-        sh.last_swap_ms = now_ms();
+        {
+            let mut sh = state.shared.lock().unwrap();
+            sh.swaps += 1;
+            sh.last_swap_ms = now_ms();
+        }
         if let Some(pid) = child.as_ref().map(|c| c.id()) {
             println!("supervisor: swapped to pid {pid}");
         } else {

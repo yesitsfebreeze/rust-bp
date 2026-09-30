@@ -10,7 +10,7 @@
 //! supervisor socket, the app channel socket, the `.boiler/valgrind/` runs
 //! — is project-root relative.
 
-use boiler::{channels, jev, valgrind, wire, APP_SOCKET, SUPERVISOR_SOCKET};
+use boiler::{channels, jev, native, valgrind, wire, APP_SOCKET, SUPERVISOR_SOCKET};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
@@ -45,6 +45,37 @@ fn tool_channels() -> String {
         Ok(snapshot) => channels::render_table(&snapshot),
         Err(error) => format!("{error}\n{SERVE_HINT}"),
     }
+}
+
+fn supervised_pid() -> Option<u32> {
+    let status = wire::ask(SUPERVISOR_SOCKET, json!({"op": "status"})).ok()?;
+    status["child_pid"].as_u64().map(|pid| pid as u32)
+}
+
+fn tool_memory_report(args: &Value) -> Result<String, String> {
+    let pid = match args["pid"].as_u64().map(|pid| pid as u32) {
+        Some(pid) => pid,
+        None => match supervised_pid().or_else(|| {
+            channels::read(APP_SOCKET)
+                .ok()
+                .and_then(|snapshot| snapshot["process"]["pid"].as_u64().map(|pid| pid as u32))
+        }) {
+            Some(pid) => pid,
+            None => {
+                return Err(
+                    "no pid to inspect: pass `pid`, or start the supervisor (or serve the channel socket) so the framework knows the executable".into(),
+                )
+            }
+        },
+    };
+    let backtraces = args["backtraces"].as_u64().unwrap_or(5) as usize;
+    let mut report = format!("process {pid} — native, on this machine, nothing containerized\n\n");
+    report.push_str(&native::leaks_report(pid, backtraces)?);
+    if args["heap"].as_bool().unwrap_or(false) {
+        report.push_str("\n\nheap (allocation classes):\n");
+        report.push_str(&native::heap_summary(pid)?);
+    }
+    Ok(report)
 }
 
 fn tool_valgrind_run(args: &Value) -> Result<String, String> {
@@ -233,8 +264,21 @@ fn tools() -> Vec<Tool> {
             |_| Ok(tool_channels()),
         ),
         (
+            "memory_report",
+            "Native memory debugging of the live executable, on this machine — nothing containerized (macOS: the system's `leaks`, opt-in `heap`). Leaked bytes with the allocation callstacks, read from the process where it actually runs — the honest view for graphics programs (Metal, the window server, driver allocations). The pid defaults to the supervised app.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer"},
+                    "backtraces": {"type": "integer", "minimum": 1, "maximum": 30},
+                    "heap": {"type": "boolean"}
+                }
+            }),
+            tool_memory_report,
+        ),
+        (
             "valgrind_run",
-            "Run a command under valgrind (callgrind or memcheck) inside the Linux container, the project mounted at /repo; parse and store the run under .boiler/valgrind/<name>.json. `build` (a shell line, e.g. `cargo build --release -p app`) runs first in the container; its cargo target is .boiler/target-linux, so host builds are untouched. The command must terminate — give a bounded workload.",
+            "Run a command under valgrind (callgrind or memcheck) — natively when a valgrind is on PATH (same machine, same libc, the exact binary this machine builds), otherwise inside the Linux container with the project mounted at /repo (Apple Silicon has no valgrind). Parses and stores the run under .boiler/valgrind/<name>.json. `build` (a shell line, e.g. `cargo build --release -p app`) runs first — on the host natively, in the container otherwise. The command must terminate — give a bounded workload.",
             json!({
                 "type": "object",
                 "properties": {

@@ -1,8 +1,10 @@
-//! The valgrind runner: callgrind and memcheck runs of any command, inside
-//! a Linux container — Apple Silicon macOS builds no valgrind, so the
-//! project is mounted at `/repo` in the `boiler-valgrind` image (OrbStack or
-//! any Docker), and container builds land in `.boiler/target-linux` so they
-//! never clobber the host's `target/`.
+//! The valgrind runner: callgrind and memcheck runs of any command —
+//! **native first**. When a valgrind is on the machine's PATH (Linux, Intel
+//! Mac) it runs the exact binary this machine builds, no container, same
+//! libc, same values. When there is none (Apple Silicon macOS builds no
+//! valgrind), the run falls back to the `boiler-valgrind` Linux container
+//! (OrbStack or any Docker), project mounted at `/repo`, container builds
+//! in `.boiler/target-linux` so they never clobber the host's `target/`.
 //!
 //! Every run is stored parsed under `.boiler/valgrind/<name>.json`
 //! (callgrind: per-function instruction counts; memcheck: grouped findings
@@ -42,12 +44,13 @@ pub struct Request {
     /// Stored as `.boiler/valgrind/<name>.json`; one path component.
     pub name: String,
     pub tool: Tool,
-    /// The argv the container runs under valgrind, from `/repo`.
+    /// The argv valgrind runs, from the project root.
     pub command: Vec<String>,
-    /// A shell line run in the container before valgrind (e.g.
-    /// `cargo build --release -p app` — its target dir is .boiler/target-linux).
+    /// A shell line run before valgrind (e.g. `cargo build --release -p
+    /// app`) — natively on the host, or in the container when the docker
+    /// fallback serves the run. A failed build refuses the run.
     pub build: Option<String>,
-    /// Bound on the whole container run. Default 600.
+    /// Bound on the whole run. Default 600.
     pub timeout_s: u64,
 }
 
@@ -58,23 +61,111 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run one valgrind job; the reply is the stored run record.
+/// A valgrind on the machine's PATH — the native runner serves the run.
+pub fn native_available() -> bool {
+    util::succeeds(&["valgrind".into(), "--version".into()])
+}
+
+/// Run one valgrind job: native when a valgrind exists on PATH, otherwise
+/// the Linux container. The reply is the stored run record.
 pub fn run(req: Request) -> Result<Value, String> {
     if req.name.is_empty() || req.name.contains('/') || req.name.contains("..") {
         return Err("`name` must be one path component (it names .boiler/valgrind/<name>.json)".into());
     }
     if req.command.is_empty() {
-        return Err("`command` is empty: give the argv the container runs under valgrind".into());
+        return Err("`command` is empty: give the argv valgrind runs".into());
     }
     let root = std::env::current_dir().map_err(|e| e.to_string())?;
     let dir = root.join(crate::VALGRIND_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let out = format!("{}/{}.out", crate::VALGRIND_DIR, req.name);
-    let log = format!("{}/{}.log", crate::VALGRIND_DIR, req.name);
-    let ann = format!("{}/{}.ann", crate::VALGRIND_DIR, req.name);
+
+    let runner = if native_available() { "native" } else { "docker" };
+    let started = Instant::now();
+    let run_error = if native_available() {
+        run_native(&req)?
+    } else {
+        run_docker(&req, &root)?
+    };
+    let mut record = json!({
+        "name": req.name,
+        "tool": req.tool.name(),
+        "runner": runner,
+        "command": req.command,
+        "build": req.build,
+        "created_ms": now_ms(),
+        "run_seconds": started.elapsed().as_secs(),
+        "run_error": run_error,
+    });
+    parse_and_store(&req, &root, &mut record)?;
+    let path = dir.join(format!("{}.json", req.name));
+    std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap())
+        .map_err(|e| e.to_string())?;
+    Ok(record)
+}
+
+/// Paths every run writes, relative to the project root.
+fn artifacts(name: &str) -> (String, String, String) {
+    (
+        format!("{}/{name}.out", crate::VALGRIND_DIR),
+        format!("{}/{name}.log", crate::VALGRIND_DIR),
+        format!("{}/{name}.ann", crate::VALGRIND_DIR),
+    )
+}
+
+/// The native runner: valgrind runs the host's own binary directly.
+/// Ok(Some(text)) when valgrind exited nonzero (the numbers it recorded may
+/// still be usable); Err when the build or valgrind itself failed.
+fn run_native(req: &Request) -> Result<Option<String>, String> {
+    let (out, log, _) = artifacts(&req.name);
+    let timeout = Duration::from_secs(req.timeout_s.max(30));
+    if let Some(build) = &req.build {
+        util::run_with_timeout(&["sh".into(), "-c".into(), build.clone()], timeout, 2000)
+            .map_err(|e| format!("the build line refused the run: {e}"))?;
+    }
+    let mut valgrind = vec!["valgrind".to_string()];
+    match req.tool {
+        Tool::Callgrind => valgrind.extend([
+            "--tool=callgrind".to_string(),
+            format!("--callgrind-out-file={out}"),
+            format!("--log-file={log}"),
+            "--".to_string(),
+        ]),
+        Tool::Memcheck => valgrind.extend([
+            "--tool=memcheck".to_string(),
+            "--leak-check=full".to_string(),
+            "--show-leak-kinds=definite,indirect,possible".to_string(),
+            "--track-origins=yes".to_string(),
+            format!("--log-file={log}"),
+            "--".to_string(),
+        ]),
+    }
+    valgrind.extend(req.command.iter().cloned());
+    let outcome = util::run_with_timeout(&valgrind, timeout, 2000);
+    if req.tool == Tool::Callgrind {
+        let annotate = util::run_with_timeout(
+            &[
+                "callgrind_annotate".to_string(),
+                "--threshold=100".to_string(),
+                out.clone(),
+            ],
+            timeout,
+            2_000_000,
+        );
+        if let Ok(text) = annotate {
+            let _ = std::fs::write(format!("{}/{}.ann", crate::VALGRIND_DIR, req.name), text);
+        }
+    }
+    Ok(match outcome {
+        Ok(_) => None,
+        Err(error) => Some(error),
+    })
+}
+
+/// The container runner: the project mounted at /repo, valgrind inside.
+fn run_docker(req: &Request, root: &std::path::Path) -> Result<Option<String>, String> {
+    let (out, log, ann) = artifacts(&req.name);
     docker_up()?;
     ensure_image()?;
-
     let command = req
         .command
         .iter()
@@ -120,21 +211,16 @@ pub fn run(req: Request) -> Result<Value, String> {
         "-c".to_string(),
         script,
     ];
-    let started = Instant::now();
-    let run_error = match util::run_with_timeout(&docker, Duration::from_secs(req.timeout_s.max(30)), 2000) {
+    Ok(match util::run_with_timeout(&docker, Duration::from_secs(req.timeout_s.max(30)), 2000) {
         Ok(_) => None,
         Err(error) => Some(error),
-    };
+    })
+}
 
-    let mut record = json!({
-        "name": req.name,
-        "tool": req.tool.name(),
-        "command": req.command,
-        "build": req.build,
-        "created_ms": now_ms(),
-        "run_seconds": started.elapsed().as_secs(),
-        "run_error": run_error,
-    });
+/// Read the run's artifacts, parse them, and fill the record the caller
+/// stores. Callgrind needs the annotate listing; memcheck the log.
+fn parse_and_store(req: &Request, root: &std::path::Path, record: &mut Value) -> Result<(), String> {
+    let (out, log, ann) = artifacts(&req.name);
     match req.tool {
         Tool::Callgrind => {
             let text = std::fs::read_to_string(root.join(&ann))
@@ -144,7 +230,7 @@ pub fn run(req: Request) -> Result<Value, String> {
             if total == 0 {
                 return Err(format!(
                     "callgrind recorded nothing in {out}{}",
-                    run_error.map(|e| format!(" — the run failed: {e}")).unwrap_or_default()
+                    record["run_error"].as_str().map(|e| format!(" — the run failed: {e}")).unwrap_or_default()
                 ));
             }
             let mut rows: Vec<Value> = functions
@@ -167,7 +253,7 @@ pub fn run(req: Request) -> Result<Value, String> {
             if errors == 0 {
                 return Err(format!(
                     "memcheck found nothing{}",
-                    run_error.map(|e| format!(" — the run failed: {e}")).unwrap_or_default()
+                    record["run_error"].as_str().map(|e| format!(" — the run failed: {e}")).unwrap_or_default()
                 ));
             }
             record["findings_total"] = json!(findings.len());
@@ -178,13 +264,10 @@ pub fn run(req: Request) -> Result<Value, String> {
             record["files"] = json!({"log": log});
         }
     }
-    let path = dir.join(format!("{}.json", req.name));
-    std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap())
-        .map_err(|e| e.to_string())?;
-    Ok(record)
+    Ok(())
 }
 
-/// Every stored run, one row each, newest last.
+/// Every stored run, one row each, oldest first.
 pub fn list() -> Result<Value, String> {
     let root = std::env::current_dir().map_err(|e| e.to_string())?;
     let dir = root.join(crate::VALGRIND_DIR);
@@ -200,6 +283,7 @@ pub fn list() -> Result<Value, String> {
             rows.push(json!({
                 "name": name,
                 "tool": record["tool"],
+                "runner": record["runner"],
                 "created_ms": record["created_ms"],
                 "total_ir": record.get("total_ir").cloned().unwrap_or(Value::Null),
                 "errors_total": record.get("errors_total").cloned().unwrap_or(Value::Null),
@@ -237,7 +321,7 @@ fn docker_up() -> Result<(), String> {
             return Ok(());
         }
     }
-    Err("no docker daemon answers `docker info` — start it (on a Mac: `orb start`)".into())
+    Err("no docker daemon answers `docker info` — start it (on a Mac: `orb start`), or install a native valgrind".into())
 }
 
 /// Build the valgrind image once; reuse it afterwards. The caller runs with
@@ -312,15 +396,30 @@ const ERROR_STARTS: &[&str] = &[
     "jump to the invalid address",
     "Bad permissions",
     "Invalid alignment",
-    "Uninit",
 ];
 
+const LOST_KINDS: &[&str] = &["definitely lost", "indirectly lost", "possibly lost", "still reachable"];
+
 /// Memcheck log → grouped findings, the leak summary and the error summary.
+/// Findings come in two shapes: live error lines ("Invalid read of size 8",
+/// grouped by kind and message, count accumulating) and leak records
+/// ("20,480 bytes in 5 blocks are definitely lost in loss record 2 of 2",
+/// counted in blocks). Notes ("Uninitialised value was created by …",
+/// "Address 0x… is …") are not findings; the first stack frame is kept.
 pub fn parse_memcheck(text: &str) -> (Vec<Value>, Value, String) {
     let mut findings: Vec<Value> = Vec::new();
     let mut seen: Vec<(String, String)> = Vec::new();
     let mut leak = Map::new();
     let mut summary = String::new();
+    let push = |findings: &mut Vec<Value>, seen: &mut Vec<(String, String)>, kind: &str, message: String, count: u64| {
+        let key = (kind.to_string(), message.clone());
+        if let Some(i) = seen.iter().position(|k| k == &key) {
+            findings[i]["count"] = json!(findings[i]["count"].as_u64().unwrap_or(0) + count);
+        } else {
+            seen.push(key);
+            findings.push(json!({"kind": kind, "message": message, "count": count, "frame": ""}));
+        }
+    };
     for line in text.lines() {
         let Some(body) = line
             .strip_prefix("==")
@@ -329,23 +428,33 @@ pub fn parse_memcheck(text: &str) -> (Vec<Value>, Value, String) {
         else {
             continue;
         };
-        if let Some((kind, _)) = ERROR_STARTS
-            .iter()
-            .find(|k| body.starts_with(*k))
-            .map(|k| (*k, body))
-        {
-            let message = body.to_string();
-            let key = (kind.to_string(), message.clone());
-            match seen.iter().position(|k| k == &key) {
-                Some(i) => findings[i]["count"] = json!(findings[i]["count"].as_u64().unwrap_or(0) + 1),
-                None => {
-                    seen.push(key);
-                    findings.push(json!({"kind": kind, "message": message, "count": 1, "frame": ""}));
-                }
-            }
+        if let Some(kind) = ERROR_STARTS.iter().find(|k| body.starts_with(*k)) {
+            push(&mut findings, &mut seen, kind, body.to_string(), 1);
             continue;
         }
-        if let Some(rest) = body.strip_prefix("at 0x") {
+        // "20,480 bytes in 5 blocks are definitely lost in loss record 2 of 2"
+        if body.contains(" in loss record") && body.contains(" are ") {
+            if let Some(kind) = LOST_KINDS.iter().find(|k| body.contains(*k)) {
+                let mut numbers = body
+                    .replace(',', "")
+                    .split_whitespace()
+                    .filter_map(|w| w.parse::<u64>().ok())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter();
+                let (bytes, blocks, record) = (numbers.next().unwrap_or(0), numbers.next().unwrap_or(1), numbers.next());
+                let message = match record {
+                    Some(record) => format!("{bytes} bytes in {blocks} blocks are {kind} in loss record {record}"),
+                    None => body.to_string(),
+                };
+                push(&mut findings, &mut seen, kind, message, blocks.max(1));
+                continue;
+            }
+        }
+        if let Some(rest) = body
+            .strip_prefix("at 0x")
+            .or_else(|| body.strip_prefix("by 0x"))
+        {
             let frame = rest
                 .split_once(": ")
                 .and_then(|(_, tail)| tail.split_once(" (").map(|(name, _)| name.to_string()))
@@ -411,6 +520,26 @@ Profile data file 'x.out' (creator: callgrind-3.22.0)
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0], ("????:???:???: ???".to_string(), 27_534_715));
         assert_eq!(rows[1], ("/repo/src/main.rs:app::parse_work".to_string(), 6_872));
+    }
+
+    #[test]
+    fn leak_records_become_findings_with_blocks_as_count() {
+        let text = "\
+==17== 20,480 bytes in 5 blocks are definitely lost in loss record 2 of 2
+==17==    by 0x12B713: leaky::main (leaky.rs:24)
+==17==        by 0x110D0B: main (in /repo/leaky)
+==17== 
+==17== LEAK SUMMARY:
+==17==    definitely lost: 20,480 bytes in 5 blocks
+==17== ERROR SUMMARY: 1 errors from 1 contexts
+";
+        let (findings, leak, summary) = parse_memcheck(text);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0]["kind"], "definitely lost");
+        assert_eq!(findings[0]["count"], 5);
+        assert_eq!(findings[0]["frame"], "leaky::main");
+        assert_eq!(leak["definitely_lost_bytes"], 20_480);
+        assert_eq!(summary, "1 errors from 1 contexts");
     }
 
     #[test]

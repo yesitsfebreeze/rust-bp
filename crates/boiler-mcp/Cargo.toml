@@ -9,5 +9,5 @@ name = "boiler-mcp"
 path = "src/main.rs"
 
 [dependencies]
-boiler = { path = "../boiler" }
+boiler = { path = "../boiler", features = ["jev"] }
 serde_json = { workspace = true }

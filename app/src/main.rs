@@ -43,6 +43,6 @@ fn main() {
 }
 
 fn parse_work(round: u64) -> usize {
-    let text = format!("round {round} alpha beta gamma delta epsilon").repeat(64);
+    let text = format!("round {round} alpha beta gamma delta epsilon zeta").repeat(64);
     black_box(text.split_whitespace().filter(|word| word.len() > 3).count())
 }
