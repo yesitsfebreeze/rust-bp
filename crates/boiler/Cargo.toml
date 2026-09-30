@@ -1,0 +1,9 @@
+[package]
+name = "boiler"
+version.workspace = true
+edition.workspace = true
+description = "The framework lib: preset profiler channels, hot-reload supervisor, valgrind runner, Jev wire"
+
+[dependencies]
+serde_json = { workspace = true }
+ureq = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "boiler-mcp"
+version.workspace = true
+edition.workspace = true
+description = "The control MCP: one agent-facing server over the supervisor, the channel socket and valgrind"
+
+[[bin]]
+name = "boiler-mcp"
+path = "src/main.rs"
+
+[dependencies]
+boiler = { path = "../boiler" }
+serde_json = { workspace = true }

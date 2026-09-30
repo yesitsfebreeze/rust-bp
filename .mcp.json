@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "boiler": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--release", "--quiet", "-p", "boiler-mcp"],
+      "env": {}
+    }
+  }
+}
