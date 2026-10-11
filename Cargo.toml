@@ -1,15 +1,59 @@
 [workspace]
 resolver = "2"
-members = ["crates/boiler", "crates/boiler-mcp", "app"]
+# The root package is the app. Every manifest under target/gen/ is written by
+# src/runtime/manifest/build.rs (the app's build script); see that file.
+members = ["target/gen/*"]
+default-members = [".", "target/gen/*"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 
+# The app: src/main.rs and src/bin/*.rs, Cargo's own layout. Its build script
+# is the manifest generator, so a plain `cargo build` re-derives target/gen/.
+# `./setup.sh <name>` renames it. The framework crates live under src/runtime/.
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+description = "The demo executable — replace this crate with your project"
+build = "src/runtime/manifest/build.rs"
+
+[dependencies]
+daemon = { path = "target/gen/daemon" }
+
+# Dev: the inner loop (cargo test, cargo check). Workspace crates keep
+# file:line tables for backtraces; dependencies carry no debug info at all,
+# which is most of the link work.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Release: what the daemon hot-swaps and what valgrind / `leaks` inspect.
+# Line tables are all callgrind annotation and leak callstacks need; full
+# debug info would only grow the binary. Never add `strip`, `lto` or
+# `panic = "abort"` here: they remove the symbols the profilers report
+# against and change the unwinding/heap paths being measured.
 [profile.release]
-debug = true
+debug = "line-tables-only"
+
+[profile.release.package."*"]
+debug = false
+
+# Distribution: the small binary for shipping. Opt in with
+# `cargo build --profile distribution`; nothing in the framework uses it.
+[profile.distribution]
+inherits = "release"
+debug = false
+strip = true
+lto = true
+codegen-units = 1
