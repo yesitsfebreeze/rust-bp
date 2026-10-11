@@ -1,6 +1,7 @@
 # Workspace guidance
 
-For repository work, read `SYSTEM.md` and follow its workflow.
+For repository work, read `docs/workflow.txt` and follow its workflow.
+Use `llms.txt` to find task-specific documentation.
 Answer ordinary conversation and subjective opinions directly from available
 context; mentioning Codex or tooling does not require a skill or file lookup.
 Ground evaluations in evidence: distinguish capabilities visible in tool descriptions

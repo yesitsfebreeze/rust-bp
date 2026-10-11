@@ -1,0 +1,25 @@
+# rust-boilerplate
+
+> A Rust starter with a hello-world app and a local MCP harness for building, reloading, inspecting, and profiling your code.
+
+The application starts in `src/main.rs` and only prints `hello world` before exiting.
+Reusable tooling lives in `src/runtime/`; instrumented test workloads live in `tests/fixtures/`.
+Read the workflow for repository work, then load only the guides relevant to the task.
+Links are relative to this file. Guide paths and commands are relative to the repository root.
+
+## Development
+
+- [Getting started](docs/getting-started.txt): Requirements, layout, build commands, project naming, and first run.
+- [Repository workflow](docs/workflow.txt): Task scope, editing, verification, and evidence requirements.
+- [Architecture](docs/architecture.txt): Daemon, MCP launcher and worker, optional channels, and build profiles.
+- [Testing](docs/testing.txt): Unit tests, isolated lifecycle checks, and profiling integration tests.
+
+## Tools
+
+- [Agent setup](docs/agent-setup.txt): Connect an MCP host and understand worker rebuilds.
+- [MCP tools](docs/tools.txt): Tool reference, batch requests, startup guidance, and failure recovery.
+
+## Optional
+
+- [Profiling](docs/profiling.txt): Instrumentation, memory inspection, Valgrind, and before/after comparisons.
+- [Events and activity](docs/events.txt): Activity viewer, compiler events, notifications, and troubleshooting.

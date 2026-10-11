@@ -341,6 +341,11 @@ fn copy_fixture_sources(root: &Path, directory: &Path) {
 	// The complete build closure must sit inside the single Docker /repo mount.
 	copy_dir(&root.join("src"), &directory.join("src"));
 	copy_dir(&root.join("tests"), &directory.join("tests"));
+	std::fs::copy(
+		root.join("tests/fixtures/workload.rs"),
+		directory.join("src/main.rs"),
+	)
+	.unwrap();
 	for name in ["Cargo.toml", "Cargo.lock", "valgrind.Dockerfile", "mcp.sh"] {
 		std::fs::copy(root.join(name), directory.join(name)).unwrap();
 	}
@@ -705,7 +710,7 @@ fn check() {
 	} else {
 		"./target/release/".to_string()
 	};
-	for (tool, executable) in [("callgrind", "app"), ("memcheck", "leaky")] {
+	for (tool, executable) in [("callgrind", "app"), ("memcheck", "app")] {
 		let mut record = json!({});
 		for suffix in ["before", "after"] {
 			let name = format!("{tool}-{suffix}");
@@ -744,8 +749,8 @@ fn check() {
 			} else {
 				pass(
 					record["allocations"]["allocs"].as_u64().unwrap_or(0) > 0
-						&& record["errors_total"].as_u64().unwrap_or(0) > 0,
-					"allocation counts and intentional defects recorded",
+						&& record["errors_total"].as_u64() == Some(0),
+					"allocation counts recorded with no memory errors",
 				);
 				let raw = std::fs::read_to_string(daemon_dir.join(format!("valgrind/{name}.log"))).unwrap();
 				let total: u64 = raw
@@ -795,18 +800,20 @@ fn check() {
 				);
 			}
 		}
-		let ranked = mcp.call("rank", json!({"name": format!("{tool}-after"), "top": 2}));
-		pass(
-			ranked.contains("priority"),
-			&format!(
-				"{tool} ranking via {}",
-				if live_jev {
-					"live Jev"
-				} else {
-					"local Jev fixture"
-				}
-			),
-		);
+		if tool == "callgrind" {
+			let ranked = mcp.call("rank", json!({"name": format!("{tool}-after"), "top": 2}));
+			pass(
+				ranked.contains("priority"),
+				&format!(
+					"{tool} ranking via {}",
+					if live_jev {
+						"live Jev"
+					} else {
+						"local Jev fixture"
+					}
+				),
+			);
+		}
 		let mismatch = format!("{tool}-mismatch");
 		mcp.call(
             "valgrind_run",

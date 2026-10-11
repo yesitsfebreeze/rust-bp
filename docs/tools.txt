@@ -1,0 +1,102 @@
+# MCP tools
+
+Documentation index: [llms.txt](../llms.txt).
+Paths and commands are relative to the repository root. Examples use the default app name, `app`.
+
+## Tools
+
+| Tool | What it does |
+|------|--------------|
+| `docs` | offline how-to topics and search (`query`); startup, tools, batching, audit, profiling, visualizer |
+| `status` | structured daemon state and readiness; `start:false` inspects without starting |
+| `reload` / `stop` | rebuild-and-swap (`wait:true` waits for success/failure) / idempotent stop |
+| `channels` | live snapshot; `top` limits rows, `filter` selects name substrings; quantiles are approximate bucket lower bounds |
+| `memory_report` | native `leaks` (+`heap`) on the live executable, pid defaults to the supervised app |
+| `valgrind_run` | one callgrind or memcheck run, parsed and stored under `valgrind/` in the daemon dir |
+| `runs` / `show` | filter/sort runs with timing and age / compact report (`raw:true` includes benchmark snapshots; `group_by_function:true` groups Callgrind self costs) |
+| `rank` | `mode:auto` uses Jev when configured, otherwise local measured-cost/error-class ordering; `local` and `jev` select explicitly |
+| `benchmark` | native timings and channel summaries; `warmups` defaults to 1; records SHA-256 of executable and sample spread |
+| `compare` | guarded before/after instruction, allocation, or native timing comparisons |
+| `events` | compiler events by default; `kind:all` or exact kind; forward paging via `cursor`/`next_cursor`; opt-in delivery |
+| `lsp` | rust-analyzer, owned by the daemon: `definition` / `references` / `hover` (file, line, col), `symbols` (query), `diagnostics` (cargo check), `status`, `rename` (new_name), `call_hierarchy` (direction), `code_actions`; edits are previews, raw LSP ranges use zero-based UTF-16 |
+| `ast_grep` | structural search or rewrite with ast-grep: a `pattern` (+ `rewrite`) or a YAML `rule`; dry run unless `apply` |
+| `audit` | read-only failure and latency evidence; `mode:local` uses no external service |
+| `usage` | frequent tools, failures and activity counts; `just viz` shows live local-time rows with selected-event details, and `--heatmap` selects the colour timeline |
+
+Status/reload/channels failures return MCP `isError`. Benchmark min/max and median absolute deviation describe sample variability, not confidence intervals. Warmups count toward the total timeout. Executable hashes identify the command binary; scripts, input files, and environment variables still need to be held constant. The usage summary lists frequent tools and tools with failures; idle graph nodes do not prove dead code.
+
+
+## Per-tool batches
+
+Every MCP tool accepts its usual argument object or a batch of 1–32 objects.
+The same input works through stdio MCP and `just call`:
+
+```sh
+just call lsp '{"items":[{"method":"symbols","query":"main"},{"method":"symbols","query":"serve"}],"concurrency":4}'
+just call show '{"items":[{"name":"baseline"},{"name":"candidate"}]}'
+```
+
+Read batches run concurrently (default 4 workers, maximum 8); `concurrency:1`
+runs reads one at a time while still collecting every result. Responses retain
+input order, even when execution finishes out of order:
+
+```json
+{"results":[{"index":0,"result":{"content":"original tool response","error":false}}],"failed":0,"skipped":0}
+```
+
+Each item's `content` is the unchanged single-call text, including JSON text
+where the tool normally returns JSON. A failed item has `error:true` and its
+error message as content. Any failure sets MCP `isError:true` (or a nonzero
+CLI exit), while preserving successful results in the same response.
+
+| Execution | Tools |
+| --- | --- |
+| Parallel reads | `docs`, `lsp` navigation/status/edit previews, `ast_grep` previews, `events` reads, `audit`, `usage`, `compare`, `status`, `channels`, `runs`, `show`, `rank` |
+| Sequential, stop on first error | `reload`, `stop`, `benchmark`, `valgrind_run`, `memory_report`; any batch containing `lsp` diagnostics, `ast_grep apply:true`, or an `events` subscription change |
+
+A sequential batch keeps input order and reports the unexecuted tail in
+`skipped`. Completed effects are not rolled back. Profiling runs are serialized
+to avoid competing measurements. Diagnostics are serialized because flycheck
+shares progress state. LSP navigation uses concurrent requests to the daemon's
+single rust-analyzer; it does not launch an analyzer for each item.
+
+Put all tool arguments inside the individual items. Mixed single/batch inputs,
+nested batches, empty/oversized batches, and invalid concurrency are rejected
+before any item runs. Items share the process's workspace and daemon directory.
+Each executed item emits its own timed `tool_call` event, so the visualizer
+continues to show individual operations, without an extra aggregate event.
+
+
+## Startup docs and audit escalation
+
+MCP initialization returns a compact quick start directly. It makes no tool
+call, writes no activity event, and requires no follow-up documentation fetch.
+Use `docs {"query":"profiling"}` or a specific topic only when a workflow needs
+explanation; all guides are offline and support batching. Full audit recovery
+instructions are available under `docs {"topic":"audit"}` when an alert occurs.
+Conversation and subjective tooling feedback need no startup calls. Repository
+workflow selection lives in `docs/workflow.txt`; installed skills are not a checklist.
+
+Three failures of the same recorded operation, source, arguments and working
+directory within ten minutes, without a matching success, set
+`audit_required:true`. External hooks omit arguments, so their alerts group
+by the recorded tool identity. Other successful calls and running an audit
+do not clear the alert. A matching successful operation resets its streak;
+window expiry alone does not prove a repair.
+
+Subsequent tool responses include `audit_required` and `audit_state` with
+counts, operation keys, event IDs and log lines. JSON object responses keep
+their existing fields; plain-text responses are wrapped under `content`
+when an alert is attached. Batch results and success/error status are preserved.
+Malformed calls also count as failures. Counts cover recorded failure events;
+nested compiler/model/tool failures can describe the same underlying defect.
+
+On an alert, run `audit {"mode":"local"}`, then delegate the problem to a
+subagent with the evidence, expected behavior and a bounded scope. Use one
+worker per distinct problem. Reproduce, fix the root cause, rerun the exact
+operation, and audit with `since_ms` set to the repair start. Verify the
+subagent's result; an empty audit window is not evidence of success. If the
+host lacks subagents, follow that workflow directly and report the limitation.
+Audit diagnoses and supplies instructions; the host agent performs repairs.
+Intentional negative tests are not automatically defects.
+

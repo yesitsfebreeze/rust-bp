@@ -6,7 +6,7 @@
 [![MCP](https://img.shields.io/badge/MCP-server-7C3AED)](https://modelcontextprotocol.io)
 [![Stars](https://img.shields.io/github/stars/yesitsfebreeze/rust-bp?style=social)](https://github.com/yesitsfebreeze/rust-bp/stargazers)
 
-Start with `src/main.rs`. The harness in `src/runtime/` gives your agent one
+Start with `src/main.rs`, which prints `hello world` and exits. The harness in `src/runtime/` gives your agent one
 MCP server to run the app, inspect it and measure changes.
 
 - **Reload on edit.** Rebuild and restart automatically; failed builds keep the last working app running.
@@ -41,7 +41,7 @@ directory as its working directory.
 
 Try:
 
-> Start the app and show me its live counters.
+> Run the app and show me its output.
 
 > Find the code behind this function and explain its callers.
 
@@ -66,10 +66,8 @@ just ci       # formatting, Clippy and tests
 just smoke    # real MCP and reload journey; no Docker or API key
 ```
 
-Keep `src/bin/leaky.rs` intentionally broken: it is the memory-profiling fixture.
-
 For the tool list, agent configuration, profiling workflows and troubleshooting,
-see the [reference](docs/reference.md).
+start with [llms.txt](llms.txt), which links to the focused guides in `docs/*.txt`.
 
 ## Star history
 

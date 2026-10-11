@@ -1,0 +1,121 @@
+# Profiling
+
+Documentation index: [llms.txt](../llms.txt).
+Paths and commands are relative to the repository root. Examples use the default app name, `app`.
+
+The starter exits after printing `hello world`; it has no live channels or sustained
+workload. Add instrumentation and a bounded workload to your application when needed.
+The integration tests use `tests/fixtures/workload.rs` in a temporary checkout.
+
+## The loops
+
+1. **Hot reload** — the daemon watches `src/` and `Cargo.toml`,
+   rebuilds on change and SIGKILLs the old child only when the new build is
+   good; a failed build keeps the old one serving. `daemon status / reload /
+   stop` (and the MCP tools of the same names) drive it; `status`, `reload`
+   and `channels` start it as a daemon when none runs, `stop` ends it, and
+   it ends itself after 30 idle minutes (`serve --detach --idle 0` to stay).
+   Replace the child with `daemon serve [--detach] -- <command>`.
+
+2. **Live channels** — the preset profiler channel, in-process:
+   `channels::inc("items")`, `channels::timer("op.x").done()`,
+   `channels::set("depth", 1.5)`. The executable serves them once at startup:
+
+   ```rust
+   daemon::channels::serve(&daemon::app_socket())?;
+   ```
+
+   `daemon channels` (or the MCP `channels` tool) reads the snapshot live:
+   counters, latency histograms (mean/p50/p90/p99/max µs) and last values.
+   Channels are per-process — every hot swap starts them from zero.
+
+3. **Memory, native where it runs** — `memory_report` reads the *live*
+   process on this machine (macOS `leaks`, opt-in `heap`): leaked bytes with
+   allocation callstacks, the honest view for graphics programs (Metal and
+   the window server live in the same process). The pid defaults to the
+   supervised app. Nothing containerized.
+
+4. **Valgrind + Jev** — `valgrind_run {name, command, build?, tool?}` runs a
+   bounded command under **callgrind** (per-function instruction counts) or
+   **memcheck** (memory errors, leak records), native when a valgrind is on
+   PATH — same machine, same libc, the exact binary you build — and inside
+   the Linux container otherwise (Apple Silicon has no valgrind; Docker/
+   OrbStack, the project mounted at `/repo`, the daemon dir mounted at its
+   own path, container builds in `<daemon dir>/target-linux`). `runs` lists
+   the stored runs, `show` prints one,
+   and `rank` feeds it to Jev:
+
+   ```sh
+   dir=$(cargo run -q --release -p daemon -- dir)   # same path inside the container
+   cargo run --release -p mcp -- --call valgrind_run "{\"name\":\"demo\",
+     \"command\":[\"$dir/target-linux/release/app\"],
+     \"build\":\"cargo build --release -p app\"}"
+   cargo run --release -p mcp -- --call rank '{"name":"demo"}'
+   ```
+
+   Callgrind totals count **executed instructions**, including repetitions,
+   from the raw `Ir` summary. The self-cost source/function rows must sum to
+   that total; program totals, call edges and source annotations are excluded.
+   `show` also lists the most frequent caller → callee edges, call counts,
+   inclusive instructions and instructions per call. These costs overlap:
+   never add them to self costs. Cycles, inlining and ARM call detection can
+   distort edge attribution; a high call count is evidence to investigate,
+   not proof of redundant work. `rank` receives the relevant edges too.
+   Legacy reports are corrected from their artifacts when read; rerun them
+   to collect the call tree if their annotation predates this change.
+
+   Callgrind rows answer *how pressing* (0-4), *what work dominates*
+   (hash/copy/parse/math/syscall/lock/by_design) and *whether a
+   behavior-preserving reduction is plausible*; priority = pressing/4 ×
+   P(safe), ×0.2 for startup-by-design. Memcheck rows answer *severity* and
+   *real-defect-vs-allocator-noise*; priority = severity/4 × P(real). Work
+   the top row, change the code, swap, re-run, compare. Needs
+   `TYPESAFE_API_KEY` (`JEV_URL` overrides the endpoint).
+
+
+## Before/after profiles
+
+Run the same `valgrind_run` command twice, using different names before and
+after an edit, then call `compare {"before":"baseline","after":"candidate"}`.
+Callgrind compares self instruction totals and per-location changes; Memcheck
+compares allocations, frees, allocated bytes and definitely lost bytes. A clean
+Memcheck run is valid too. Inclusive call costs are never summed as work.
+
+For native timing, call `benchmark` twice around the edit:
+
+```json
+{"name":"baseline","command":["./target/release/app"],"repeats":5,"workload":"hello world"}
+```
+
+The tool stores individual wall-time samples and p50/p90. Apps opt into final
+channel capture by calling `daemon::channels::save_requested_snapshot()` at
+normal exit (the integration-test workload does this). Without that call, wall times are still
+available but channel metrics are absent. Channel comparisons use medians of
+per-run summaries, not pooled quantiles. The comparison refuses different
+commands, runner/environment metadata, workload labels, repeat counts,
+channel sets, workload counts, and failed runs. Keep input files and relevant
+environment variables fixed yourself; these are not captured. Repeated timing
+runs are needed to distinguish a change from noise. Legacy reports without
+environment or allocation metadata must be rerun before comparison.
+
+`show` flags edges whose inclusive cost exceeds the entire run (the number
+is dropped, the call count stays) and direct recursive edges. The optimizer
+folds small hot functions into their caller; mark the ones you want their own
+row with `#[inline(never)]`, as `parse_work` in `tests/fixtures/workload.rs` does. Where a file is inside this checkout and a Rust definition
+can be resolved, it includes its path, line and snippet. This is a current
+source definition, **not** an inferred measured call site. External library
+sources and optimized/inlined names may not resolve. `rank` receives those
+same flags and source evidence.
+
+
+## Notes
+
+- The container image builds once (`docker build -f valgrind.Dockerfile -t
+  valgrind-v2 .`), with a rustup stable toolchain — the distro rustc
+  cannot read a v4 Cargo.lock. A `valgrind-cargo` volume caches the registry;
+  the first in-container build is slow, later ones are incremental.
+- `cargo test` covers the channels snapshot, the watcher, and the annotate/
+  memcheck/leak-record parsers.
+- To make it yours: rewrite `src/main.rs`. Add `channels::serve` if you need
+  live counters and timings. Change the daemon child with
+  `daemon serve -- <command>` if your executable is elsewhere.

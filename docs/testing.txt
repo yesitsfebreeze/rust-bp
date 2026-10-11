@@ -1,0 +1,27 @@
+# Testing
+
+Documentation index: [llms.txt](../llms.txt).
+Paths and commands are relative to the repository root. Examples use the default app name, `app`.
+
+## Repeatable checks
+
+```sh
+cargo test --workspace --locked
+cargo test -p mcp --test integration -- --ignored --nocapture check
+# Daemon lifecycle only, without the profilers:
+CHECK_JOURNEY=lifecycle cargo test -p mcp --test integration -- --ignored --nocapture check
+# Also exercise the real Jev service (requires TYPESAFE_API_KEY):
+CHECK_LIVE_JEV=1 cargo test -p mcp --test integration -- --ignored --nocapture check
+```
+
+The `check` test copies the workspace into an owned temporary directory, replaces
+its hello-world main with `tests/fixtures/workload.rs`, and checks the advertised tool contract and exercises the tools over the persistent stdio MCP launcher.
+It asserts PID swaps, preservation of the app after a deliberate compile
+error, compiler notifications, native memory inspection (macOS), both Valgrind
+modes, comparison arithmetic, source context, ranking, and worker replacement
+without reconnecting. Linux checks the explicit unsupported-platform result
+for native memory tools. Default ranking uses a local Jev protocol fixture;
+`CHECK_LIVE_JEV=1` uses the external service. Docker must be running when native
+Valgrind is unavailable. The temporary checkout and its isolated build artifacts
+are removed after the test.
+

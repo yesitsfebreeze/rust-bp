@@ -7,7 +7,7 @@ const TOOLS: &str = "docs: offline instructions; topic selects a guide, query se
 
 const BATCHING: &str = "Call a tool with its normal object or {items:[argument objects],concurrency:4}. 1..32 items, concurrency 1..8, default 4. Results keep input order as {results:[{index,result:{content,error}}],failed,skipped}. Read batches collect all outcomes concurrently. A batch containing a mutation or profiling operation runs sequentially and stops at its first failure; completed work is not rolled back. Serialized tools: reload, stop, benchmark, valgrind_run, memory_report; also lsp diagnostics, ast_grep apply:true and events subscription changes. Each executed item records one visualizer event. Inspect failed/skipped and audit_required; MCP isError or CLI exit 1 preserves the successful items too. Mixed envelopes and nested batches are rejected before execution.";
 
-const PROFILING: &str = "Use channels for live counters and timings. Run benchmark twice with the same bounded command, repeats, workload and inputs, with names baseline and candidate; compare {before:baseline,after:candidate}. For CPU instruction counts use valgrind_run tool:callgrind; for leaks and memory errors use tool:memcheck. Native Valgrind is preferred; otherwise the Docker profiler image is needed. memory_report uses native leaks/heap on macOS. runs lists stored runs; show explains one; rank mode:local prioritizes measured evidence. Preserve src/bin/leaky.rs: its faults are intentional profiling fixtures.";
+const PROFILING: &str = "Use channels for live counters and timings. Run benchmark twice with the same bounded command, repeats, workload and inputs, with names baseline and candidate; compare {before:baseline,after:candidate}. For CPU instruction counts use valgrind_run tool:callgrind; for leaks and memory errors use tool:memcheck. Native Valgrind is preferred; otherwise the Docker profiler image is needed. memory_report uses native leaks/heap on macOS. runs lists stored runs; show explains one; rank mode:local prioritizes measured evidence.";
 
 const VISUALIZER: &str = "Run just viz. The selected activity row uses reverse video; OK is green, FAIL red, and unknown EVENT yellow. The header retains total errors and failed MCP calls, plus the number of operations currently requiring audit. Selected-operation counts distinguish a noisy operation from isolated failures. j/k or arrows move, g/G go newest/oldest, q quits. The live clock still advances when no events arrive. --heatmap selects the duration heatmap. Counts come from the same event log used by audit, including trusted host hooks. Missing telemetry is not proof that an operation succeeded.";
 
@@ -53,7 +53,7 @@ pub fn tool(args: &Value) -> Result<String, String> {
 	let includes_audit = sections.iter().any(|section| section["topic"] == "audit");
 	let mut result = json!({"topic":topic,"sections":sections,
 		"topics":topics.iter().map(|(name,_)| *name).collect::<Vec<_>>(),
-		"reference":"docs/reference.md"});
+		"reference":"llms.txt"});
 	if includes_audit {
 		let recovery = json!({
 		"audit_threshold":daemon::health::FAILURE_THRESHOLD,"audit_window_ms":daemon::health::WINDOW_MS,

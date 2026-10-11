@@ -24,7 +24,7 @@ if [[ ! "$new" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
   exit 2
 fi
 case "$new" in
-  daemon|mcp|mcp-launcher|mcp-usage-hook|rustc-events|viz|leaky)
+  daemon|mcp|mcp-launcher|mcp-usage-hook|rustc-events|viz)
     echo "setup.sh: '$new' is taken by a framework binary" >&2
     exit 2 ;;
 esac

@@ -70,8 +70,7 @@
 - `./mcp.sh` starts MCP; `just call <tool> '<json>'` is the shell fallback.
   Inspect with `status {start:false}`; build and run with `reload {wait:true}`.
   Profiling and visualization instructions are available through `docs` on demand.
-- Preserve the intentionally faulty `src/bin/leaky.rs` profiling fixture and
-  release compiler symbols. Unused telemetry does not prove code is dead.
+- Preserve release compiler symbols. Unused telemetry does not prove code is dead.
 
 ## Recover when there is evidence of a failure
 

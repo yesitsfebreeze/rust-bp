@@ -1,0 +1,71 @@
+# Runtime architecture
+
+Documentation index: [llms.txt](../llms.txt).
+Paths and commands are relative to the repository root. Examples use the default app name, `app`.
+
+## How it works
+
+Three processes, two Unix sockets, one directory:
+
+```text
+agent ──stdio/JSON-RPC──▶ mcp-launcher ──per request──▶ target/release/mcp
+                                                              │ <daemon dir>/daemon.sock
+                                                              ▼
+                              cargo build --release ◀── daemon serve (daemon)
+                                      │ swaps on success        │ spawn / SIGKILL
+                                      ▼                         ▼
+                              target/release/app ───────▶ <daemon dir>/app.sock (channels)
+```
+
+1. **Daemon** (`daemon serve`, `src/runtime/daemon/hot.rs`): builds once,
+   spawns `./target/release/app`, polls `src/` and `Cargo.toml` for changes,
+   rebuilds, and swaps the child only when the build succeeded. It answers
+   `status` / `reload` / `stop` on `daemon.sock` in the daemon dir.
+   Nobody has to start it: the first `status`, `reload` or `channels` (CLI
+   or MCP) that finds no socket starts `daemon serve --detach --idle 30m`,
+   a per-project daemon in its own session that logs to `daemon.log`
+   in the daemon dir and exits after 30 minutes without a request or a
+   source edit. `daemon serve` in a terminal is the same loop without the
+   idle exit; the socket is the lock, so only one runs per project.
+The starter app exits immediately and does not open `app.sock`.
+
+2. **Channels** (`src/runtime/daemon/channels.rs`): the executable calls
+   `daemon::channels::serve(&daemon::app_socket())` once, then records
+   counters, latency histograms and values in-process. Any reader asks the
+   socket for a snapshot. Channels are per-process; each swap restarts at zero.
+3. **MCP worker** (`src/runtime/mcp`): stateless. `mcp-launcher` (same
+   crate, started by `.mcp.json` through `mcp.sh`) keeps the stdio
+   connection to the agent open and starts the current worker binary for every
+   request, so a rebuilt worker is live on the next call without reconnecting.
+   The worker talks to the two sockets, runs `leaks` / valgrind, and sends
+   results to Jev. Every tool also runs from the shell with `--call`.
+4. **Compile events** (`daemon::events`): the daemon appends one event
+   per build it runs to `events.jsonl` in the daemon dir; the launcher tails it
+   and forwards failures to the agent as MCP log notifications. The optional
+   `rustc-events` wrapper records every crate of every build instead.
+
+5. **Code intelligence** (`src/runtime/daemon/lsp.rs`, `src/runtime/mcp/astgrep.rs`): the
+   daemon starts one `rust-analyzer` on the first `lsp` request and keeps it
+   for its lifetime, so the index is built once per project and survives
+   every worker swap; rust-analyzer watches the sources itself, so an edit
+   is live on the next question. Positions are 1-based on the wire. While
+   it still indexes, the reply says so and the agent retries. `ast_grep` is
+   stateless and runs the `ast-grep` binary per call from the project root.
+   Both need the tool on PATH (`rustup component add rust-analyzer`,
+   `brew install ast-grep`).
+
+
+## Build profiles
+
+Defined in the root `Cargo.toml`; the choice follows what each build is for.
+
+| profile        | used by                         | debug info                                   | why                                                                   |
+|----------------|---------------------------------|----------------------------------------------|-----------------------------------------------------------------------|
+| `dev`          | `cargo test`, `cargo check`     | line tables for workspace crates, none for deps | fast inner loop, readable backtraces                                 |
+| `release`      | daemon swaps, valgrind, `leaks` | line tables for workspace crates, none for deps | callgrind annotation and leak callstacks need file:line, nothing more |
+| `distribution` | `cargo build --profile distribution` | none; `strip`, `lto`, `codegen-units = 1`  | the small binary to ship; nothing in the framework uses it            |
+
+`release` deliberately has no `strip`, `lto` or `panic = "abort"`: they remove
+the symbols the profilers report against and change the unwinding and heap
+paths being measured. Put size work into `distribution`.
+

@@ -1,0 +1,56 @@
+# Agent setup
+
+Documentation index: [llms.txt](../llms.txt).
+Paths and commands are relative to the repository root. Examples use the default app name, `app`.
+
+## Wiring the agent
+
+The MCP server must run with this directory as cwd (that is how MCP servers
+launch); the framework's paths are project-root relative.
+
+- **pi** — register `./mcp.sh` as a stdio MCP server from the project root.
+- **Claude Code** — `.mcp.json` supplies `mcpServers.app`. First run
+  `cargo build --release --locked -p mcp` to avoid a cold-build connection
+  timeout, then `claude mcp get app` from this project root. If Pending
+  approval, approve the project server in Claude or explicitly register it
+  locally: `claude mcp add --scope local app -- ./mcp.sh`
+  (run from the project root; the launcher resolves paths against its working directory).
+  A local registration applies only to that checkout. Reconnect existing sessions.
+- **Codex** — `~/.codex/config.toml`:
+
+  ```toml
+  [mcp_servers.app]
+  command = "/absolute/path/to/your/project/mcp.sh"
+  args = []
+  cwd = "/absolute/path/to/your/project"
+  env_vars = ["TYPESAFE_API_KEY", "JEV_URL"]
+  startup_timeout_sec = 120
+  tool_timeout_sec = 1200
+  ```
+
+This checkout also supplies project-local `.codex/config.toml`. Start Codex
+from the project root and trust the project to load it. See the
+[official OpenAI MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+Skill filtering must be checked in the host, not inferred from this file.
+On Codex CLI 0.162.1, `config/read` with this repository's `cwd` reported the
+project's skill disables, but a fresh `skills/list` with `forceReload:true`
+still marked those skills enabled. A command-line override disabled the same
+skill. This is an observed host discrepancy, not a verified project filter.
+`docs/workflow.txt` therefore defines task boundaries even when those skills appear.
+Do not add more disable entries and claim success without checking the result.
+
+`mcp.sh` builds the launcher and worker in one Cargo invocation, then executes
+the launcher without a redundant worker build. Build diagnostics go to stderr;
+stdout carries JSON-RPC only. The launcher
+keeps the MCP connection open. Each
+request uses a fresh stateless worker, so a successful `cargo build --release
+-p mcp` is picked up on the next request, with a tool-list change
+notification. In-flight requests finish on their original binary. A failed
+build leaves the last successful worker usable. This is not source watching:
+use the daemon or Cargo to rebuild. Changing the launcher/configuration
+itself still requires reconnecting once.
+
+Every tool also runs from the shell:
+`cargo run --release -p mcp -- --call <tool> '<json args>'`.
+
