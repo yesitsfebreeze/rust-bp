@@ -1,0 +1,82 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+description = "The hot-reload + profiler framework an agent drives through the `mcp` control server"
+default-run = "daemon"
+
+[lib]
+path = "lib.rs"
+
+[[test]]
+name = "channels"
+path = "../../../tests/daemon/channels.rs"
+
+[[test]]
+name = "dir"
+path = "../../../tests/daemon/dir.rs"
+
+[[test]]
+name = "events"
+path = "../../../tests/daemon/events.rs"
+
+[[test]]
+name = "hot"
+path = "../../../tests/daemon/hot.rs"
+
+[[test]]
+name = "lifecycle"
+path = "../../../tests/daemon/lifecycle.rs"
+
+[[test]]
+name = "lsp"
+path = "../../../tests/daemon/lsp.rs"
+
+[[test]]
+name = "native"
+path = "../../../tests/daemon/native.rs"
+
+[[test]]
+name = "profiles"
+path = "../../../tests/daemon/profiles.rs"
+
+[[test]]
+name = "usage"
+path = "../../../tests/daemon/usage.rs"
+
+[[test]]
+name = "util"
+path = "../../../tests/daemon/util.rs"
+
+[[test]]
+name = "valgrind"
+path = "../../../tests/daemon/valgrind.rs"
+
+[[test]]
+name = "watch"
+path = "../../../tests/daemon/watch.rs"
+
+[[bin]]
+name = "daemon"
+path = "bin/daemon.rs"
+
+[[bin]]
+name = "rustc-events"
+path = "bin/rustc-events.rs"
+
+[[bin]]
+name = "viz"
+path = "bin/viz.rs"
+
+[[bin]]
+name = "mcp-usage-hook"
+path = "bin/mcp-usage-hook.rs"
+
+[[test]]
+name = "mcp_usage_hook"
+path = "../../../tests/daemon/mcp_usage_hook.rs"
+
+[dependencies]
+libc.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true

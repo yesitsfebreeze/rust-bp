@@ -1,10 +1,10 @@
 # The valgrind side of the boilerplate: macOS builds no valgrind on Apple
 # Silicon, so every callgrind/memcheck run happens inside this Linux image
 # (OrbStack/Docker), with the project mounted at /repo. The rustup stable
-# toolchain (not the distro's older rustc — it cannot parse a v4 Cargo.lock)
-# lets a run build the target for Linux first (`build:` argument of
-# valgrind_run); container builds go to .boiler/target-linux so they never
-# clobber the host's target/.
+# toolchain lets a run build the target for Linux first (`build:` argument of
+# valgrind_run); container builds go to <daemon dir>/target-linux (the host's
+# daemon dir is mounted at its own path) so they never clobber the host's
+# target/.
 FROM ubuntu:24.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl ca-certificates valgrind \

@@ -10,69 +10,45 @@ dependencies outside this repository.
 ## Layout
 
 ```text
-Cargo.toml           the one hand-written manifest: the app package, the workspace, shared
-                     dependency versions and build profiles; its build script writes target/gen/
+Cargo.toml           app package, workspace members, shared dependency versions and build profiles
 src/main.rs          bin `app`: your executable (the demo shows the contract); src/bin/leaky.rs beside it
-src/runtime/         the harness, one folder per crate, sources only; package name = folder name
+src/runtime/         the harness; daemon/ and mcp/ each have a normal Cargo.toml
   daemon/            lib `daemon` + bin/daemon.rs: channels, daemon, valgrind runner, wire
                      + bin/rustc-events.rs: optional RUSTC_WRAPPER recording per-crate compile events
   mcp/               lib `mcp` (Jev wire, events and usage tools) + main.rs: the control MCP server (stdio, JSON-RPC 2.0)
                      + bin/mcp-launcher.rs: stable MCP transport; starts the latest worker per request
-  manifest/          build.rs that derives every manifest under target/gen/ (see Manifests)
-tests/<crate>/       integration tests, one file per target; nothing under src/ is a test
+tests/<crate>/       integration tests, explicitly listed in each crate's Cargo.toml
   daemon/            <module>.rs per module (parsers, channels, watcher, ...), lifecycle.rs: daemon lifecycle
   mcp/               integration.rs: isolated end-to-end checks, Docker regressions, receipt check; jev.rs, usage.rs
-target/gen/          generated, not checked in: target/gen/<crate>/Cargo.toml pointing at src/runtime/<crate>/
 justfile             the recipes: just build / check / ci / serve / call <tool>, grouped build / check / run; `just` lists them
-setup.sh             bootstrap target/gen/ and build: ./setup.sh; name the project: ./setup.sh <name>
-mcp.sh               the MCP server entry point: bootstraps target/gen/ if missing, then runs the launcher
+setup.sh             optional project rename and build: ./setup.sh <name>
+mcp.sh               build the MCP binaries together, then start the persistent launcher
 valgrind.Dockerfile  the Linux container valgrind falls back to
 .mcp.json            wires `app` as an MCP server for Claude Code, through mcp.sh
 ```
 
-## Manifests
+## Development
 
-The root `Cargo.toml` is the app's manifest, in Cargo's own layout
-(`src/main.rs`, `src/bin/*.rs`), and the only one you edit. Every framework
-manifest is written to `target/gen/<crate>/Cargo.toml` by
-`src/runtime/manifest/build.rs`, the app's build script, from the sources on
-every `cargo build`; `target/gen/` is not checked in. One folder under
-`src/runtime/` is one crate:
-
-- the package is named after the folder; the description is the first `//!`
-  sentence of `lib.rs` or `main.rs`
-- `lib.rs` is the library, `main.rs` the binary named like the crate,
-  `bin/<name>.rs` a binary, `tests/<crate>/<name>.rs` at the root an integration test,
-  `examples/<name>.rs` an example, `benches/<name>.rs` a bench
-- dependencies are the `name::` paths, `use name` and `extern crate name` the
-  sources contain: another crate folder becomes a path dependency, a key of
-  `[workspace.dependencies]` an external one. A name used only under `tests/<crate>/`
-  or below `#[cfg(test)]` is a dev-dependency. Versions live in the root
-  manifest only: a new external crate goes there first, or the build names it.
-- `src/runtime/<crate>/manifest.toml`, when present, is appended verbatim: features
-  and optional dependencies go there as `[dependencies.<name>]` sub-tables.
-  Nothing in the framework needs one.
-- the generator is the app's build script: `cargo build` (the app is a
-  default member) runs it; `cargo build -p daemon` alone does not, `just gen`
-  does
-
-Cargo loads the manifests before any build script runs, so a change that
-alters one fails that build naming the rewritten files and passes on the
-next `cargo build`; the daemon retries by itself, because it watches
-`target/gen/`. A new crate is a new folder with a `lib.rs` or `main.rs` and two
-builds; a new binary is a file under `bin/` and two builds. Nothing else about
-the build changes: the crate graph is the same, so incremental rebuilds cost
-what they cost before.
-
-Three cases Cargo cannot start from: a fresh clone and the tree after `cargo clean`
-(no `target/gen/`), and a removed or moved source file that a generated
-manifest still names. `./setup.sh` and
-`./mcp.sh` run the generator before Cargo, so both recover on their own. By
-hand, from the repository root:
+Requires Rust/Cargo and a Unix host (macOS or Linux). `just` is optional.
+From a fresh checkout, without a setup step:
 
 ```sh
-mkdir -p target && rustc -O src/runtime/manifest/build.rs -o target/manifest && target/manifest
+cargo check --workspace --all-targets --locked
+cargo test --workspace --locked
+cargo run --release --bin app -- 3     # bounded demo workload
+just ci                               # format, clippy, tests
+just smoke                            # real MCP + daemon journey; no Docker or API key
 ```
+
+The workspace uses ordinary manifests at the root, `src/runtime/daemon/Cargo.toml`
+and `src/runtime/mcp/Cargo.toml`. Dependencies and targets are explicit; Cargo
+and rust-analyzer can load them before a build and after `cargo clean`.
+Add app dependencies to the root manifest, framework dependencies to the
+relevant crate, and shared versions to `[workspace.dependencies]`.
+
+Optional tools: `rustup component add rust-analyzer` for navigation and
+`ast-grep` for structural search. Docker/Valgrind and a Jev API key are only
+needed for the corresponding profiling paths; local ranking needs no key.
 
 ## Name the project
 
@@ -113,11 +89,11 @@ agent ──stdio/JSON-RPC──▶ mcp-launcher ──per request──▶ targ
    source edit. `daemon serve` in a terminal is the same loop without the
    idle exit; the socket is the lock, so only one runs per project.
 2. **Channels** (`src/runtime/daemon/channels.rs`): the executable calls
-   `daemon::channels::serve(daemon::APP_SOCKET)` once, then records
+   `daemon::channels::serve(&daemon::app_socket())` once, then records
    counters, latency histograms and values in-process. Any reader asks the
    socket for a snapshot. Channels are per-process; each swap restarts at zero.
 3. **MCP worker** (`src/runtime/mcp`): stateless. `mcp-launcher` (same
-   crate, started by `.mcp.json` through `cargo run`) keeps the stdio
+   crate, started by `.mcp.json` through `mcp.sh`) keeps the stdio
    connection to the agent open and starts the current worker binary for every
    request, so a rebuilt worker is live on the next call without reconnecting.
    The worker talks to the two sockets, runs `leaks` / valgrind, and sends
@@ -151,10 +127,6 @@ Defined in the root `Cargo.toml`; the choice follows what each build is for.
 the symbols the profilers report against and change the unwinding and heap
 paths being measured. Put size work into `distribution`.
 
-Sizes on macOS arm64 at this commit: `app` 730 KB release, 539 KB
-distribution; `mcp` 3.6 MB release (it carries `ureq` + rustls for
-Jev).
-
 ## Quickstart
 
 ```sh
@@ -183,7 +155,7 @@ never fix it.
    `channels::set("depth", 1.5)`. The executable serves them once at startup:
 
    ```rust
-   daemon::channels::serve(daemon::APP_SOCKET)?;
+   daemon::channels::serve(&daemon::app_socket())?;
    ```
 
    `daemon channels` (or the MCP `channels` tool) reads the snapshot live:
@@ -238,11 +210,7 @@ never fix it.
 The MCP server must run with this directory as cwd (that is how MCP servers
 launch); the framework's paths are project-root relative.
 
-- **pi** — `.pi/mcp.json` supplies `app` to pi’s built-in MCP support.
-  Start pi from this project root and trust this project when prompted. Prebuild
-  with `cargo build --release --locked -p mcp`, then verify with
-  `pi mcp list`. Tools are available through codemode as `mcp__app__<tool>`.
-  Run `/reload` in existing sessions after changing the configuration.
+- **pi** — register `./mcp.sh` as a stdio MCP server from the project root.
 - **Claude Code** — `.mcp.json` supplies `mcpServers.app`. First run
   `cargo build --release --locked -p mcp` to avoid a cold-build connection
   timeout, then `claude mcp get app` from this project root. If Pending
@@ -262,12 +230,12 @@ launch); the framework's paths are project-root relative.
   tool_timeout_sec = 1200
   ```
 
-This checkout also supplies project-local `.codex/config.toml`, which inherits
-the project working directory. Only Cargo must be on PATH.
-`cargo run` builds the launcher and execs into it; its first request builds the
-worker, so a worker build failure is answered on that request with the
-diagnostics (a lockfile mismatch stops the launcher itself before any reply:
-run `cargo build --release --locked -p mcp` to see why). The launcher
+This checkout also supplies project-local `.codex/config.toml`. Start Codex
+from the project root and trust the project to load it. See the
+[official OpenAI MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+`mcp.sh` builds the launcher and worker in one Cargo invocation, then executes
+the launcher without a redundant worker build. Build diagnostics go to stderr;
+stdout carries JSON-RPC only. The launcher
 keeps the MCP connection open. Each
 request uses a fresh stateless worker, so a successful `cargo build --release
 -p mcp` is picked up on the next request, with a tool-list change
@@ -295,9 +263,34 @@ Every tool also runs from the shell:
 | `events` | compiler events by default; `kind:all` or exact kind; forward paging via `cursor`/`next_cursor`; opt-in delivery |
 | `lsp` | rust-analyzer, owned by the daemon: `definition` / `references` / `hover` (file, line, col), `symbols` (query), `diagnostics` (cargo check), `status`, `rename` (new_name), `call_hierarchy` (direction), `code_actions`; edits are previews, raw LSP ranges use zero-based UTF-16 |
 | `ast_grep` | structural search or rewrite with ast-grep: a `pattern` (+ `rewrite`) or a YAML `rule`; dry run unless `apply` |
-| `usage` | every tool call, build and Jev ask is logged with the files, symbols and runs it touched; the reply lists the most used tools, the tools with failures and the fold's node and edge counts. `just viz` paints the log live in the terminal: tools, crates and models are columns with their names written downwards, every event is a row with now at the top, labelled by what it touched, its cell coloured by the call's speed against that stream's median (blue fast, green typical, red slow, white error), older calls fading; new events slide in at the top; arrows, hjkl or wasd move the cursor (row and cell lit, the status line names the event), g/G jump, q quits |
+| `audit` | read-only failure and latency evidence; `mode:local` uses no external service |
+| `usage` | frequent tools, failures and activity counts; `just viz` shows live local-time rows with selected-event details, and `--heatmap` selects the colour timeline |
 
 Status/reload/channels failures return MCP `isError`. Benchmark min/max and median absolute deviation describe sample variability, not confidence intervals. Warmups count toward the total timeout. Executable hashes identify the command binary; scripts, input files, and environment variables still need to be held constant. The usage summary lists frequent tools and tools with failures; idle graph nodes do not prove dead code.
+
+## Live activity
+
+`just viz` shows local time, outcome, duration and the operation. Its clock
+updates once a second even when no events arrive; `HISTORY (g follows)`
+means the cursor is browsing older events. Press `g` to follow new calls.
+Use `cargo run --release -p daemon --bin viz -- --once` for a snapshot or
+`--heatmap` for the colour timeline.
+
+The app MCP and daemon builds record directly. To include **all MCP servers
+called by Codex in this repository**, build once with `cargo build --release`,
+then review and trust the project's PreToolUse/PostToolUse entries in Codex
+`/hooks` and start/resume a session that loads them. This is the
+[Codex hook trust requirement](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks);
+installing a hook does not activate it automatically.
+
+`.codex/hooks.json` runs the small Rust `mcp-usage-hook` binary. It records
+server/tool name, session/call IDs, elapsed time and outcome in the same
+project log. Arguments and response bodies are omitted. The app MCP's own
+calls are not duplicated. Calls are recorded when completed; a missing
+pre-hook leaves duration unknown. Native shell/file calls and other projects
+are outside this MCP feed. Tests use isolated logs, so their calls do not
+appear in your project's viewer. `cargo run -q -p daemon -- dir` prints the
+log directory (`events.jsonl`); `DAEMON_DIR` overrides it.
 
 ## Repeatable checks
 
@@ -311,15 +304,15 @@ CHECK_LIVE_JEV=1 cargo test -p mcp --test integration -- --ignored --nocapture c
 ```
 
 The `check` test copies the workspace into an owned temporary directory and
-exercises all 15 tools over the persistent stdio MCP launcher.
+checks the advertised tool contract and exercises the tools over the persistent stdio MCP launcher.
 It asserts PID swaps, preservation of the app after a deliberate compile
 error, compiler notifications, native memory inspection (macOS), both Valgrind
 modes, comparison arithmetic, source context, ranking, and worker replacement
 without reconnecting. Linux checks the explicit unsupported-platform result
 for native memory tools. Default ranking uses a local Jev protocol fixture;
 `CHECK_LIVE_JEV=1` uses the external service. Docker must be running when native
-Valgrind is unavailable. The temporary checkout is removed; reusable build
-artifacts remain in `integration-target/` under this project's daemon dir.
+Valgrind is unavailable. The temporary checkout and its isolated build artifacts
+are removed after the test.
 
 ## Before/after profiles
 
@@ -365,7 +358,7 @@ wrapper once and configure it for all builds — Cargo fingerprints include the
 wrapper, so switching it on and off recompiles everything each time:
 
 ```sh
-cargo install --path target/gen/daemon --bin rustc-events
+cargo install --path src/runtime/daemon --bin rustc-events
 # then, in a .cargo/config.toml that is not checked in (or RUSTC_WRAPPER=rustc-events):
 # [build]
 # rustc-wrapper = "rustc-events"
@@ -425,9 +418,8 @@ or cancellation. SIGKILL and deliberately detached daemons cannot be cleaned by
 an in-process handler. Cleanup errors are reported rather than counted as success.
 
 If a fresh Codex session reports an initialization failure, run
-`cargo build --release --locked -p mcp` in that workspace. The launcher
-returns build diagnostics as an MCP error and permits a retry on the same
-connection. If Cargo reports an outdated lockfile after copying or changing
+`cargo build --release --locked -p mcp` in that workspace. The entry script
+prints startup build diagnostics to stderr; retry after correcting the build. If Cargo reports an outdated lockfile after copying or changing
 manifests, run `cargo build --release -p mcp` once, review `Cargo.lock`,
 then retry. Copy manifests and the matching lockfile together.
 

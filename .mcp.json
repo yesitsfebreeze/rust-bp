@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "boiler": {
+    "app": {
       "type": "stdio",
-      "command": "cargo",
-      "args": ["run", "--release", "--quiet", "-p", "boiler-mcp"],
+      "command": "./mcp.sh",
+      "args": [],
       "env": {}
     }
   }
