@@ -235,6 +235,15 @@ launch); the framework's paths are project-root relative.
 This checkout also supplies project-local `.codex/config.toml`. Start Codex
 from the project root and trust the project to load it. See the
 [official OpenAI MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+Skill filtering must be checked in the host, not inferred from this file.
+On Codex CLI 0.162.1, `config/read` with this repository's `cwd` reported the
+project's skill disables, but a fresh `skills/list` with `forceReload:true`
+still marked those skills enabled. A command-line override disabled the same
+skill. This is an observed host discrepancy, not a verified project filter.
+`SYSTEM.md` therefore defines task boundaries even when those skills appear.
+Do not add more disable entries and claim success without checking the result.
+
 `mcp.sh` builds the launcher and worker in one Cargo invocation, then executes
 the launcher without a redundant worker build. Build diagnostics go to stderr;
 stdout carries JSON-RPC only. The launcher
@@ -313,10 +322,13 @@ continues to show individual operations, without an extra aggregate event.
 
 ## Startup docs and audit escalation
 
-MCP initialization calls `docs {"topic":"startup"}` and returns its guidance in
-the server instructions. Agents should also read that topic at session startup.
-`docs {"query":"profiling"}` searches the built-in guides; all docs are offline
-and support batching.
+MCP initialization returns a compact quick start directly. It makes no tool
+call, writes no activity event, and requires no follow-up documentation fetch.
+Use `docs {"query":"profiling"}` or a specific topic only when a workflow needs
+explanation; all guides are offline and support batching. Full audit recovery
+instructions are available under `docs {"topic":"audit"}` when an alert occurs.
+Conversation and subjective tooling feedback need no startup calls. Repository
+workflow selection lives in `SYSTEM.md`; installed skills are not a checklist.
 
 Three failures of the same recorded operation, source, arguments and working
 directory within ten minutes, without a matching success, set

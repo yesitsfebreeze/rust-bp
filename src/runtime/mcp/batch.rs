@@ -6,7 +6,7 @@ pub const MAX_ITEMS: usize = 32;
 pub const MAX_CONCURRENCY: usize = 8;
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
-pub const DESCRIPTION: &str = " Accepts one argument object or {items: [argument objects], concurrency?: 1..8} (1..32 items, default concurrency 4). Results stay in input order with per-item content/error and failed/skipped counts. Read batches run concurrently. Batches containing mutations or profiling runs execute sequentially and stop on error; completed work is not rolled back. Each executed item is a separate visualizer event.";
+pub const DESCRIPTION: &str = " Also accepts {items:[args],concurrency:4}; 1..32 items, concurrency 1..8. Inspect every result and failed/skipped. Reads parallelize; mutations run in order, stop on error, and do not roll back. See docs topic:batching.";
 
 /// Keep the original properties visible to MCP hosts, and enforce the two
 /// disjoint forms. Item schemas cannot recursively contain batch envelopes.

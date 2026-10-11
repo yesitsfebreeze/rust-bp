@@ -184,9 +184,9 @@ impl Mcp {
 			init["capabilities"]["tools"]["listChanged"] == true,
 			"launcher advertises tool-change notifications",
 		);
-		assert!(init["instructions"].as_str().is_some_and(|text| text
-			.contains("Startup documentation")
-			&& text.contains("audit_required")));
+		assert!(init["instructions"]
+			.as_str()
+			.is_some_and(|text| text.contains("already loaded") && text.contains("audit_required")));
 		mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
 		mcp
 	}
@@ -445,7 +445,7 @@ fn check() {
 		docs["sections"][0]["text"]
 			.as_str()
 			.is_some_and(|text| text.contains("subagent")),
-		"startup docs explain audit repair delegation",
+		"startup docs link to audit repair delegation",
 	);
 	let state = wait_for(Duration::from_secs(90), || {
 		let s = mcp.daemon_status();

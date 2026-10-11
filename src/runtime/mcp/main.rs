@@ -495,7 +495,7 @@ fn tools() -> Vec<Tool> {
 	vec![
         (
             "docs",
-            "Offline how-to guides. Read at startup. Explains tools, batching, profiling, visualizer state and the audit_required subagent repair workflow; query searches topics.",
+            "Offline help for unfamiliar workflows; topic selects a guide and query searches guides. Quick start is already supplied at initialization. Read audit guidance when audit_required is true.",
             object(json!({"topic":{"type":"string","enum":["startup","tools","batching","audit","profiling","visualizer","all"]},
                 "query":{"type":"string"}})),
             mcp::docs::tool,
@@ -662,15 +662,12 @@ fn call(name: &str, arguments: &Value) -> Result<Result<String, String>, String>
 
 fn handle(method: &str, params: &Value) -> Result<Value, String> {
 	match method {
-		"initialize" => {
-			let startup = call("docs", &json!({"topic":"startup"}))??;
-			Ok(json!({
-				"protocolVersion": params.get("protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
-				"capabilities": {"tools": {}},
-				"serverInfo": {"name": "mcp", "version": "0.1.0"},
-				"instructions": format!("Startup documentation (loaded through docs): {startup}")
-			}))
-		}
+		"initialize" => Ok(json!({
+			"protocolVersion": params.get("protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
+			"capabilities": {"tools": {}},
+			"serverInfo": {"name": "mcp", "version": "0.1.0"},
+			"instructions": mcp::docs::STARTUP
+		})),
 		"tools/list" => Ok(json!({
 				"tools": tools().iter().map(|(name, description, schema, _)| json!({
 						"name": name, "description": format!("{description}{}", batch::DESCRIPTION), "inputSchema": batch::schema(schema.clone())

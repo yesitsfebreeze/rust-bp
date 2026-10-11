@@ -1,7 +1,7 @@
 //! Built-in, offline operating instructions. No external service or daemon needed.
 use serde_json::{json, Value};
 
-const STARTUP: &str = "Start by reading docs {topic:startup}; MCP initialization also loads this topic automatically. Work in the project root. Use status {start:false} to inspect without starting, reload {wait:true} to build and run, and lsp/ast_grep to navigate. Every tool accepts one object or an items batch. Watch audit_required in every response, including successful calls and batch responses. When true, run audit {mode:local}, then delegate the identified problem to a subagent using the audit workflow. Read docs {topic:audit} for that workflow. Never repeatedly retry a failing operation without investigating its evidence. Use docs {topic:tools}, docs {topic:batching}, docs {topic:profiling}, or docs {topic:visualizer} for details; query searches all topics.";
+pub const STARTUP: &str = "Rust workspace tools. Use only when the task needs them; conversation needs no startup calls. This quick start is already loaded; do not fetch it again. Inspect: status {start:false}. Build and run: reload {wait:true}. Navigate: lsp or ast_grep. Tools accept one object or an items batch; inspect each result. For unfamiliar workflows, docs {query:...} searches offline guides. On audit_required:true, run audit {mode:local}, then docs {topic:audit} for evidence-based subagent repair.";
 
 const TOOLS: &str = "docs: offline instructions; topic selects a guide, query searches guides. status: daemon/app readiness; start:false is read-only. reload: rebuild and swap; wait:true reports completion. stop: stop daemon and app. channels: live counters/timings, filter and top. lsp: method status, symbols(query), definition/references/hover(file,line,col), diagnostics(optional file), rename(new_name), call_hierarchy(direction), code_actions; coordinates are 1-based, returned edits are unapplied LSP UTF-16 ranges. ast_grep: structural pattern or YAML rule; paths defaults to src/tests, rewrite is a preview unless apply:true. events: compiler/tool activity; kind:all for all events, next_cursor for paging, subscribe_thread/unsubscribe change failure delivery. usage: activity graph summary. audit: read-only failure/slow-call diagnosis; mode:local is offline, since_ms/limit/top bound evidence. benchmark: named repeated native command with repeats/warmups/timeout_s/workload. valgrind_run: named command under callgrind or memcheck. memory_report: native process memory (pid optional), heap/backtraces. runs: list saved profiles with filter/tool/sort. show: read a saved name. rank: prioritize findings for name, mode:local avoids Jev. compare: before/after run names, requires matching workloads/environments. tools/list supplies exact schemas.";
 
@@ -50,9 +50,20 @@ pub fn tool(args: &Value) -> Result<String, String> {
 		})
 		.map(|(name, text)| json!({"topic":name,"text":text}))
 		.collect();
-	Ok(json!({"topic":topic,"sections":sections,"topics":topics.iter().map(|(name,_)| *name).collect::<Vec<_>>(),
-        "audit_threshold":daemon::health::FAILURE_THRESHOLD,"audit_window_ms":daemon::health::WINDOW_MS,
-        "audit_recovery":"Three failures since the last matching success within ten minutes require audit. Match recorded operation, source, inputs and cwd. Audit is read-only and does not clear alerts; rerun the failing operation successfully. A window expiring is not proof of repair.",
-        "repair_verification":"Give the subagent event IDs/log lines, inputs and expected behavior. Reproduce before editing, preserve intentional negative fixtures, fix the root cause within scope, run focused tests, rerun the exact operation, then audit with since_ms set to repair start. An empty audit window is not verification. Use one subagent per distinct problem and verify its result before marking resolved.",
-        "reference":"docs/reference.md"}).to_string())
+	let includes_audit = sections.iter().any(|section| section["topic"] == "audit");
+	let mut result = json!({"topic":topic,"sections":sections,
+		"topics":topics.iter().map(|(name,_)| *name).collect::<Vec<_>>(),
+		"reference":"docs/reference.md"});
+	if includes_audit {
+		let recovery = json!({
+		"audit_threshold":daemon::health::FAILURE_THRESHOLD,"audit_window_ms":daemon::health::WINDOW_MS,
+		"audit_recovery":"Three failures since the last matching success within ten minutes require audit. Match recorded operation, source, inputs and cwd. Audit is read-only and does not clear alerts; rerun the failing operation successfully. A window expiring is not proof of repair.",
+		"repair_verification":"Give the subagent event IDs/log lines, inputs and expected behavior. Reproduce before editing, preserve intentional negative fixtures, fix the root cause within scope, run focused tests, rerun the exact operation, then audit with since_ms set to repair start. An empty audit window is not verification. Use one subagent per distinct problem and verify its result before marking resolved.",
+		});
+		result
+			.as_object_mut()
+			.unwrap()
+			.extend(recovery.as_object().unwrap().clone());
+	}
+	Ok(result.to_string())
 }

@@ -231,17 +231,17 @@ fn mcp_and_cli_return_partial_results_and_record_each_item_once() {
 }
 
 #[test]
-fn startup_loads_docs_and_search_and_batches_work() {
+fn startup_is_read_only_and_docs_remain_available_on_demand() {
 	let fixture = Fixture::new();
 	let init = fixture.rpc("initialize", json!({"protocolVersion":"2025-06-18"}));
 	let instructions = init["instructions"].as_str().unwrap();
-	assert!(instructions.contains("Startup documentation"));
+	assert!(instructions.contains("already loaded"));
 	assert!(instructions.contains("audit_required"));
-	assert!(instructions.contains("subagent"));
-	let log = std::fs::read_to_string(fixture.0.join("events.jsonl")).unwrap();
-	let event: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-	assert_eq!(event["tool"], "docs");
-	assert_eq!(event["args"]["topic"], "startup");
+	assert!(instructions.len() < 700, "quick start must stay compact");
+	assert!(
+		!fixture.0.join("events.jsonl").exists(),
+		"initialization must not record synthetic tool activity"
+	);
 	let reply = fixture.rpc(
 		"tools/call",
 		json!({"name":"docs","arguments":{"items":[
@@ -253,12 +253,15 @@ fn startup_loads_docs_and_search_and_batches_work() {
 	assert_eq!(body["results"].as_array().unwrap().len(), 2);
 	let guide: Value =
 		serde_json::from_str(body["results"][0]["result"]["content"].as_str().unwrap()).unwrap();
+	assert!(guide["repair_verification"].as_str().is_some());
 	assert!(guide["sections"][0]["text"]
 		.as_str()
 		.unwrap()
 		.contains("subagent"));
 	let search: Value =
 		serde_json::from_str(body["results"][1]["result"]["content"].as_str().unwrap()).unwrap();
+	assert!(search.get("repair_verification").is_none());
+	assert!(search.get("audit_recovery").is_none());
 	assert!(search["sections"]
 		.as_array()
 		.unwrap()
