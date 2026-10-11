@@ -546,6 +546,7 @@ fn label_of(event: &Value) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
 	pub operation: String,
+	pub signature: String,
 	/// Recorded outcome, independent of whether duration was captured.
 	pub ok: Option<bool>,
 	pub duration_ms: Option<f64>,
@@ -560,6 +561,7 @@ pub struct Entry {
 /// newest first.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Timeline {
+	pub health: crate::health::Health,
 	pub columns: Vec<Column>,
 	pub entries: Vec<Entry>,
 }
@@ -570,6 +572,7 @@ pub struct Timeline {
 /// call's duration against its stream's median on a log2 scale (half the
 /// median → 0.25, double → 0.75).
 pub fn timeline(events: &[Value]) -> Timeline {
+	let health = crate::health::Health::from_events(events);
 	let mut events: Vec<&Value> = events
 		.iter()
 		.filter(|e| num(&e["time_ms"]).is_some())
@@ -627,6 +630,7 @@ pub fn timeline(events: &[Value]) -> Timeline {
 			cell,
 			things,
 			operation(e),
+			crate::health::signature(e),
 			duration_ms(e),
 			event_detail(e),
 			e["ok"]
@@ -653,8 +657,9 @@ pub fn timeline(events: &[Value]) -> Timeline {
 		.into_iter()
 		.rev()
 		.map(
-			|(stream, cell, things, operation, duration_ms, detail, ok)| Entry {
+			|(stream, cell, things, operation, signature, duration_ms, detail, ok)| Entry {
 				operation,
+				signature,
 				ok: if cell.err { Some(false) } else { ok },
 				duration_ms,
 				detail,
@@ -664,7 +669,11 @@ pub fn timeline(events: &[Value]) -> Timeline {
 			},
 		)
 		.collect();
-	Timeline { columns, entries }
+	Timeline {
+		health,
+		columns,
+		entries,
+	}
 }
 
 /// Human-readable operation shared by the terminal and the MCP audit.
@@ -757,14 +766,27 @@ pub fn live_status(t: &Timeline, now: u64, following: bool, width: usize) -> Str
 			)
 		})
 		.unwrap_or_else(|| "waiting for events".into());
-	fit(
+	let required = t.health.required(now).len();
+	let line = fit(
 		&format!(
-			"{mode} {} local | {age} | {} events | MCP + builds",
+			"{mode} {} local | errors {} / failed calls {} | audit_required {required} | {age}",
 			local_clock(now),
-			t.entries.len()
+			t.health.errors,
+			t.health.failed_calls
 		),
 		width,
-	)
+	);
+	if width == 0 {
+		return line;
+	}
+	let colour = if required > 0 {
+		31
+	} else if t.health.errors > 0 {
+		33
+	} else {
+		32
+	};
+	format!("\x1b[{colour}m{line}\x1b[0m")
 }
 
 /// Readable default view. The heatmap remains available with --heatmap.
@@ -778,15 +800,9 @@ pub fn render_activity(
 	if height == 0 {
 		return vec![];
 	}
-	let failures = t.entries.iter().filter(|e| e.cell.err).count();
+	let now = crate::health::now_ms();
 	let mut rows = vec![
-		fit(
-			&format!(
-				"ACTIVITY  {} events | {failures} failures | newest first",
-				t.entries.len()
-			),
-			width,
-		),
+		live_status(t, now, cursor == 0, width),
 		fit(
 			"LOCAL     RESULT   DURATION  OPERATION / TOUCHED FILES",
 			width,
@@ -800,8 +816,7 @@ pub fn render_activity(
 				.map(|ms| format!("{ms:.0}ms"))
 				.unwrap_or_else(|| "-".into());
 			format!(
-				"{}{} {:<7} {:>9}  {} | {}",
-				if i == cursor { ">" } else { " " },
+				"{} {:<7} {:>9}  {} | {}",
 				local_clock(e.cell.time_ms),
 				if e.cell.err {
 					"FAIL"
@@ -819,12 +834,45 @@ pub fn render_activity(
 		} else {
 			String::new()
 		};
-		rows.push(fit(&text, width));
+		let line = fit(&text, width);
+		if let Some(entry) = t.entries.get(i).filter(|_| width > 0) {
+			let colour = if entry.cell.err {
+				31
+			} else if entry.ok == Some(true) {
+				32
+			} else {
+				33
+			};
+			let head: String = line.chars().take(9).collect();
+			let state: String = line.chars().skip(9).take(7).collect();
+			let tail: String = line.chars().skip(16).collect();
+			let reverse = if i == cursor { "\x1b[7m" } else { "" };
+			rows.push(format!(
+				"{reverse}{head}\x1b[{colour}m{state}\x1b[39m{tail}\x1b[0m"
+			));
+		} else {
+			rows.push(line);
+		}
 	}
 	let selected = t.entries.get(cursor);
 	rows.push(fit(
 		&selected
-			.map(|e| format!("Selected: {}", e.operation))
+			.map(|e| {
+				let state = t.health.problems.get(&e.signature);
+				let (failures, calls, recent) = state
+					.map(|p| (p.failures, p.calls, p.recent_failures(now)))
+					.unwrap_or_default();
+				format!(
+					"Selected: {} | {failures}/{calls} failed | recent {recent}/{}{}",
+					e.operation,
+					crate::health::FAILURE_THRESHOLD,
+					if recent >= crate::health::FAILURE_THRESHOLD {
+						" audit_required"
+					} else {
+						""
+					}
+				)
+			})
 			.unwrap_or_default(),
 		width,
 	));

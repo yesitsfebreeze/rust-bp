@@ -11,7 +11,7 @@
 //! — is project-root relative.
 
 use daemon::{app_socket, channels, daemon_socket, hot, native, profiles, valgrind, wire};
-use mcp::{astgrep, events, jev, usage};
+use mcp::{astgrep, batch, events, jev, usage};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
@@ -494,6 +494,13 @@ fn tools() -> Vec<Tool> {
 		|properties: Value| json!({"type": "object", "properties": properties, "required": []});
 	vec![
         (
+            "docs",
+            "Offline how-to guides. Read at startup. Explains tools, batching, profiling, visualizer state and the audit_required subagent repair workflow; query searches topics.",
+            object(json!({"topic":{"type":"string","enum":["startup","tools","batching","audit","profiling","visualizer","all"]},
+                "query":{"type":"string"}})),
+            mcp::docs::tool,
+        ),
+        (
             "events",
             "Recent compiler events (kind defaults to compiler; use all or an exact event kind). Use next_cursor as cursor for lossless forward paging; without cursor returns latest events. subscribe_thread opts this workspace into delivering failures to that Codex session via codex queue; unsubscribe stops delivery. The launcher also streams MCP error notifications.",
             object(json!({"subscribe_thread":{"type":"string"}, "unsubscribe":{"type":"boolean"},
@@ -639,27 +646,34 @@ fn call(name: &str, arguments: &Value) -> Result<Result<String, String>, String>
 		.into_iter()
 		.find(|(tool, _, _, _)| *tool == name)
 		.ok_or_else(|| format!("no tool `{name}`"))?;
-	let started = Instant::now();
-	let result = run(arguments);
-	usage::record(
-		name,
-		arguments,
-		&result,
-		started.elapsed().as_millis() as u64,
-	);
-	Ok(result)
+	let executed = std::sync::atomic::AtomicUsize::new(0);
+	let result = batch::execute(name, arguments, |item| {
+		executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let started = Instant::now();
+		let result = run(item);
+		usage::record(name, item, &result, started.elapsed().as_millis() as u64);
+		result
+	});
+	if executed.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+		usage::record(name, arguments, &result, 0);
+	}
+	Ok(usage::feedback(result))
 }
 
 fn handle(method: &str, params: &Value) -> Result<Value, String> {
 	match method {
-		"initialize" => Ok(json!({
+		"initialize" => {
+			let startup = call("docs", &json!({"topic":"startup"}))??;
+			Ok(json!({
 				"protocolVersion": params.get("protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
 				"capabilities": {"tools": {}},
-				"serverInfo": {"name": "mcp", "version": "0.1.0"}
-		})),
+				"serverInfo": {"name": "mcp", "version": "0.1.0"},
+				"instructions": format!("Startup documentation (loaded through docs): {startup}")
+			}))
+		}
 		"tools/list" => Ok(json!({
 				"tools": tools().iter().map(|(name, description, schema, _)| json!({
-						"name": name, "description": description, "inputSchema": schema
+						"name": name, "description": format!("{description}{}", batch::DESCRIPTION), "inputSchema": batch::schema(schema.clone())
 				})).collect::<Vec<_>>()
 		})),
 		"tools/call" => {

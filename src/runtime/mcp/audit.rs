@@ -20,14 +20,7 @@ fn timestamp(e: &Value) -> Option<u64> {
 
 /// Separate tool methods/arguments, whole build commands, crate compiles and model questions.
 fn signature(e: &Value) -> String {
-	format!(
-		"{}|{}|{}|{}|{}",
-		usage::operation(e),
-		e["source"],
-		e["args"],
-		e["questions"],
-		e["cwd"]
-	)
+	daemon::health::signature(e)
 }
 
 fn evidence(e: &Value, line: usize) -> Value {
@@ -230,6 +223,10 @@ pub fn tool(args: &Value) -> Result<String, String> {
 		.map(|line| serde_json::from_str(line).unwrap_or(Value::Null))
 		.collect();
 	let mut report = report(&events, since, limit, top);
+	let health = daemon::health::Health::from_events(&events).report(daemon::health::now_ms());
+	report["audit_required"] = health["audit_required"].clone();
+	report["audit_state"] = health;
+	report["repair_policy"] = json!(daemon::health::REPAIR_INSTRUCTION);
 	report["log_path"] = json!(path);
 	report["invalid_events"] = json!(events.iter().filter(|e| timestamp(e).is_none()).count());
 	let configured = std::env::var("TYPESAFE_API_KEY").is_ok_and(|key| !key.trim().is_empty());

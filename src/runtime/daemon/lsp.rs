@@ -54,6 +54,8 @@ pub struct Client {
 	stdin: Arc<Mutex<std::process::ChildStdin>>,
 	link: Arc<Link>,
 	next_id: Mutex<u64>,
+	// Flycheck notifications share global progress state; never overlap them.
+	check: Mutex<()>,
 	root: PathBuf,
 }
 
@@ -93,6 +95,7 @@ impl Client {
 			stdin: Arc::new(Mutex::new(stdin)),
 			link: link.clone(),
 			next_id: Mutex::new(1),
+			check: Mutex::new(()),
 			root,
 		};
 		let reader_link = link.clone();
@@ -203,6 +206,7 @@ impl Client {
 				Ok(json!({"symbols": prefer_name_matches(symbols, query)}))
 			}
 			"diagnostics" => {
+				let _check = self.check.lock().unwrap();
 				let before = self.link.inbox.lock().unwrap().begins;
 				self.notify("rust-analyzer/runFlycheck", json!({"textDocument": null}))?;
 				self.wait_begin(before, Duration::from_secs(5));

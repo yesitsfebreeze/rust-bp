@@ -27,6 +27,36 @@ pub fn record(tool: &str, args: &Value, result: &Result<String, String>, ms: u64
 	let _ = publish("tool_call", data);
 }
 
+/// Attach global unresolved failure state after all batch items are recorded.
+/// Preserve the tool's success/error outcome and every original result.
+pub fn feedback(result: Result<String, String>) -> Result<String, String> {
+	let state = match daemon::health::load() {
+		Ok(health) => health.report(daemon::health::now_ms()),
+		Err(error) => json!({"audit_state_unavailable":error}),
+	};
+	if state["audit_required"] != true && state.get("audit_state_unavailable").is_none() {
+		return result;
+	}
+	let failed = result.is_err();
+	let text = result.unwrap_or_else(|error| error);
+	let mut reply = serde_json::from_str::<Value>(&text)
+		.ok()
+		.filter(Value::is_object)
+		.unwrap_or_else(|| json!({"content":text}));
+	if state["audit_required"] == true {
+		reply["audit_required"] = json!(true);
+		reply["audit_state"] = state;
+	} else {
+		reply["audit_state_unavailable"] = state["audit_state_unavailable"].clone();
+	}
+	let text = reply.to_string();
+	if failed {
+		Err(text)
+	} else {
+		Ok(text)
+	}
+}
+
 fn cap(text: &str) -> String {
 	let mut chars = text.chars();
 	let head: String = chars.by_ref().take(VALUE_CAP).collect();

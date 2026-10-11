@@ -329,12 +329,65 @@ fn activity_outcomes_do_not_depend_on_timing() {
 		let t = timeline(&[event.clone()]);
 		let rows = daemon::usage::render_activity(&t, 160, 6, 0, 0);
 		assert_eq!(
-			rows[2].split_whitespace().nth(1),
+			plain(&rows[2]).split_whitespace().nth(1),
 			Some(expected),
 			"{event}: {}",
 			rows[2]
 		);
 	}
+}
+
+#[test]
+fn activity_selection_reverses_only_active_row_and_keeps_error_totals() {
+	let now = daemon::health::now_ms();
+	let mut events: Vec<_> = (0..3)
+		.map(|n| {
+			json!({
+					"kind":"tool_call","tool":"lsp","args":{"method":"hover"},
+					"ok":false,"time_ms":now-10+n,"id":n.to_string()
+			})
+		})
+		.collect();
+	events.push(json!({"kind":"tool_call","tool":"docs","ok":true,"time_ms":now}));
+	let t = timeline(&events);
+	let rows = daemon::usage::render_activity(&t, 140, 10, 0, 1);
+	assert!(!rows[2].contains("\x1b[7m"));
+	assert!(rows[3].starts_with("\x1b[7m"));
+	assert!(rows[3].ends_with("\x1b[0m"));
+	assert!(rows[2].contains("\x1b[32mOK"));
+	assert!(rows[3].contains("\x1b[31mFAIL"));
+	assert!(rows[0].contains("errors 3 / failed calls 3"));
+	assert!(rows[0].contains("audit_required 1"));
+	assert!(rows[0].starts_with("\x1b[31m"));
+	assert!(rows[7].contains("3/3 failed"));
+	assert!(rows.iter().all(|row| plain(row).chars().count() == 140));
+	let expired = daemon::usage::live_status(&t, now + daemon::health::WINDOW_MS + 1, true, 140);
+	assert!(expired.contains("audit_required 0"));
+	assert!(expired.contains("errors 3 / failed calls 3"));
+	assert!(expired.starts_with("\x1b[33m"));
+
+	// viz replaces the first row with the live clock; counters must survive.
+	let dir = std::env::temp_dir().join(format!("viz-health-{}", std::process::id()));
+	std::fs::create_dir(&dir).unwrap();
+	std::fs::write(
+		dir.join("events.jsonl"),
+		events.iter().map(|e| format!("{e}\n")).collect::<String>(),
+	)
+	.unwrap();
+	let output = std::process::Command::new(env!("CARGO_BIN_EXE_viz"))
+		.args(["--once", "--width", "140", "--height", "10"])
+		.env("DAEMON_DIR", &dir)
+		.output()
+		.unwrap();
+	std::fs::remove_dir_all(dir).unwrap();
+	assert!(output.status.success());
+	let text = String::from_utf8(output.stdout).unwrap();
+	assert!(text
+		.lines()
+		.next()
+		.unwrap()
+		.contains("errors 3 / failed calls 3"));
+	assert!(text.lines().next().unwrap().contains("audit_required 1"));
 }
 
 #[test]
@@ -375,7 +428,7 @@ fn activity_explains_builds_errors_and_handles_small_terminals() {
 	]);
 	let rows = daemon::usage::render_activity(&t, 140, 10, 0, 1);
 	assert_eq!(rows.len(), 10);
-	assert!(rows.iter().all(|r| r.chars().count() == 140));
+	assert!(rows.iter().all(|r| plain(r).chars().count() == 140));
 	assert!(rows
 		.iter()
 		.any(|r| r.contains("Build command: cargo build -p app")));
@@ -384,7 +437,7 @@ fn activity_explains_builds_errors_and_handles_small_terminals() {
 	assert!(rows.iter().any(|r| r.contains("FAIL")));
 	let error_rows = daemon::usage::render_activity(&t, 140, 10, 0, 0);
 	assert!(error_rows.iter().any(|r| r.contains("socket unavailable")));
-	assert!(!error_rows.iter().any(|r| r.contains('\u{001b}')));
+	assert!(!error_rows.iter().any(|r| r.contains("\x1b[2J")));
 	for height in 0..6 {
 		let rows = daemon::usage::render_activity(&t, 0, height, 0, 0);
 		assert_eq!(rows.len(), height);

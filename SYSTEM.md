@@ -1,5 +1,17 @@
 # Rust development
 
+- At session startup call the MCP `docs` tool with `{"topic":"startup"}`
+  (shell fallback: `just call docs '{"topic":"startup"}'`). MCP initialization
+  also loads these instructions automatically. Use `docs` topics or `query`
+  to find tool workflows.
+- When a response contains `audit_required:true`, run `audit {"mode":"local"}`
+  and delegate the identified problem to a subagent. Give it the event evidence,
+  expected behavior and a bounded repair scope. Avoid duplicate workers for
+  the same problem; preserve intentional failure fixtures. Have it reproduce,
+  fix the cause, rerun the matching operation, and audit since the repair start.
+  Verify its result before marking the problem resolved. If subagents are
+  unavailable, report that and follow the same workflow directly.
+
 - The app is `src/main.rs` and `src/bin/`. The reusable harness is
   `src/runtime/daemon/` and `src/runtime/mcp/`, with standard Cargo manifests.
 - Use GitFS for repository reads, searches and edits when available. Batch

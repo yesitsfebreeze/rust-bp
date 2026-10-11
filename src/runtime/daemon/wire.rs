@@ -5,6 +5,7 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Bind `path`, refusing when another process still answers there, and
@@ -27,18 +28,43 @@ pub fn serve_loop(
 	listener: UnixListener,
 	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
 ) {
-	std::thread::spawn(move || {
-		for conn in listener.incoming() {
-			let handler = &handler;
-			let Ok(mut conn) = conn else { continue };
-			let mut reader = BufReader::new(conn.try_clone().expect("clone socket"));
-			let mut line = String::new();
-			let _ = reader.read_line(&mut line);
-			let reply = serde_json::from_str::<Value>(line.trim()).unwrap_or_else(|_| json!({}));
-			let reply = handler(reply);
-			let _ = conn.write_all(format!("{reply}\n").as_bytes());
-		}
-	});
+	serve_workers(listener, handler, 1);
+}
+
+/// Bounded control-socket workers let independent LSP requests overlap without
+/// spawning an unbounded thread per connection. Channel sockets remain serial.
+pub fn serve_concurrent(
+	listener: UnixListener,
+	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
+) {
+	serve_workers(listener, handler, 8);
+}
+
+fn serve_workers(
+	listener: UnixListener,
+	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
+	workers: usize,
+) {
+	let handler = Arc::new(handler);
+	for _ in 0..workers {
+		let listener = listener.try_clone().expect("clone listener");
+		let handler = handler.clone();
+		std::thread::spawn(move || {
+			for conn in listener.incoming() {
+				let Ok(mut conn) = conn else { continue };
+				let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+				let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+				let mut reader = BufReader::new(conn.try_clone().expect("clone socket"));
+				let mut line = String::new();
+				if reader.read_line(&mut line).unwrap_or(0) == 0 {
+					continue;
+				}
+				let request = serde_json::from_str::<Value>(line.trim()).unwrap_or_else(|_| json!({}));
+				let reply = handler(request);
+				let _ = conn.write_all(format!("{reply}\n").as_bytes());
+			}
+		});
+	}
 }
 
 /// One request over the wire; the reply is the parsed reply line.

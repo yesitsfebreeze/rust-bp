@@ -5,6 +5,8 @@
 
 pub mod astgrep;
 pub mod audit;
+pub mod batch;
+pub mod docs;
 pub mod events;
 pub mod jev;
 pub mod usage;

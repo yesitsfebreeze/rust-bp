@@ -13,6 +13,10 @@ name = "mcp"
 path = "main.rs"
 
 [[test]]
+name = "batch"
+path = "../../../tests/mcp/batch.rs"
+
+[[test]]
 name = "astgrep"
 path = "../../../tests/mcp/astgrep.rs"
 

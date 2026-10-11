@@ -12,6 +12,7 @@
 
 pub mod channels;
 pub mod events;
+pub mod health;
 pub mod hot;
 pub mod lsp;
 pub mod native;

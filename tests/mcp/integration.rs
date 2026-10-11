@@ -184,6 +184,9 @@ impl Mcp {
 			init["capabilities"]["tools"]["listChanged"] == true,
 			"launcher advertises tool-change notifications",
 		);
+		assert!(init["instructions"].as_str().is_some_and(|text| text
+			.contains("Startup documentation")
+			&& text.contains("audit_required")));
 		mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
 		mcp
 	}
@@ -414,6 +417,7 @@ fn check() {
 		.map(|t| t["name"].as_str().unwrap().to_string())
 		.collect();
 	let expected: BTreeSet<String> = [
+		"docs",
 		"events",
 		"lsp",
 		"ast_grep",
@@ -436,6 +440,13 @@ fn check() {
 	.collect();
 	assert_eq!(tools, expected, "MCP tool contract");
 	pass(true, "discovered the complete MCP tool contract");
+	let docs = mcp.call_json("docs", json!({"topic":"startup"}));
+	pass(
+		docs["sections"][0]["text"]
+			.as_str()
+			.is_some_and(|text| text.contains("subagent")),
+		"startup docs explain audit repair delegation",
+	);
 	let state = wait_for(Duration::from_secs(90), || {
 		let s = mcp.daemon_status();
 		s["child_pid"].as_u64().map(|_| s)
@@ -482,6 +493,30 @@ fn check() {
 				.is_some_and(|s| !s.is_empty()),
 			"LSP finds workspace symbol",
 		);
+		let batch = mcp.call_json(
+			"lsp",
+			json!({"items":[
+			{"method":"symbols","query":"parse_work"},
+			{"method":"symbols","query":"serve"},
+			{"method":"status"}
+		],"concurrency":3}),
+		);
+		pass(
+			batch["failed"] == 0
+				&& batch["results"]
+					.as_array()
+					.is_some_and(|items| items.len() == 3),
+			"LSP batch returns all three items",
+		);
+		for item in batch["results"].as_array().unwrap().iter().take(2) {
+			let reply: Value = serde_json::from_str(item["result"]["content"].as_str().unwrap()).unwrap();
+			pass(
+				reply["symbols"]
+					.as_array()
+					.is_some_and(|symbols| !symbols.is_empty()),
+				"LSP batch preserves symbol results",
+			);
+		}
 	}
 
 	wait_for(Duration::from_secs(90), || {

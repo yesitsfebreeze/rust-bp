@@ -154,6 +154,12 @@ pub fn ensure_running(launcher: impl FnOnce() -> Command) -> Result<Value, Strin
 	if let Ok(reply) = status() {
 		return Ok(reply);
 	}
+	// Parallel tool items must not launch competing daemons from this process.
+	static START: Mutex<()> = Mutex::new(());
+	let _start = START.lock().unwrap();
+	if let Ok(reply) = status() {
+		return Ok(reply);
+	}
 	let pid = spawn_detached(&mut launcher())?;
 	// Cargo may compile the daemon first; the socket binds before the
 	// first app build, so a plain start answers within a second.
@@ -232,11 +238,9 @@ impl Daemon {
 		let daemon = self.clone_shallow();
 		let idle_limit = self.idle;
 		// One rust-analyzer per daemon, started on the first `lsp` request.
-		// Ceiling: the socket loop is single-threaded, so an `lsp` question
-		// (up to lsp::REQUEST_TIMEOUT, `diagnostics` up to CHECK_TIMEOUT)
-		// delays a concurrent `status`; move `lsp` to its own socket if that bites.
-		let analyzer: Mutex<Option<lsp::Client>> = Mutex::new(None);
-		wire::serve_loop(listener, move |req| {
+		// Hold the slot only for initialization, never while waiting for replies.
+		let analyzer: Mutex<Option<Arc<lsp::Client>>> = Mutex::new(None);
+		wire::serve_concurrent(listener, move |req| {
 			let op = req["op"].as_str().unwrap_or("");
 			*control.last_contact.lock().unwrap() = Instant::now();
 			match op {
@@ -259,7 +263,7 @@ impl Daemon {
 							"watch": daemon.watch.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
 							"app_socket": crate::app_socket(),
 							"daemon_dir": crate::dir().display().to_string(),
-							"lsp": analyzer.lock().unwrap().as_ref().map(lsp::Client::status),
+							"lsp": analyzer.try_lock().ok().and_then(|slot| slot.as_ref().map(|client| client.status())),
 					})
 				}
 				"lsp" => {
@@ -271,12 +275,14 @@ impl Daemon {
 									"daemon: started rust-analyzer, pid {}",
 									client.status()["pid"]
 								);
-								*slot = Some(client);
+								*slot = Some(Arc::new(client));
 							}
 							Err(error) => return json!({"op": "lsp", "ok": false, "error": error}),
 						}
 					}
-					match slot.as_ref().unwrap().ask(&req) {
+					let client = slot.as_ref().unwrap().clone();
+					drop(slot);
+					match client.ask(&req) {
 						Ok(mut reply) => {
 							reply["op"] = json!("lsp");
 							reply["ok"] = json!(true);
