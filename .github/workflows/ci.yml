@@ -29,3 +29,12 @@ jobs:
       - run: cargo check -p reload --no-default-features --locked
       - run: just ci
       - run: just smoke
+      - name: Install native profiling tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          npm install --global @ast-grep/cli
+      - name: Exercise every MCP tool
+        if: runner.os == 'Linux'
+        run: just e2e

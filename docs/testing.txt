@@ -23,6 +23,7 @@ For the complete profiling journey:
 It runs native benchmarks and both Valgrind modes, checks comparisons, source
 context and rankings, and uses a local Jev protocol fixture by default.
 Install native Valgrind or start Docker and build the profiler image first.
+Linux CI also runs this journey with native Valgrind and ast-grep.
 CHECK_LIVE_JEV=1 switches to the external service and requires TYPESAFE_API_KEY.
 just regressions exercises Docker timeout/cancellation cleanup on Unix.
 
