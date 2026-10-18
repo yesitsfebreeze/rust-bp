@@ -1124,19 +1124,9 @@ pub fn render(
 mod tests {
 	use crate as daemon;
 	fn viz_command() -> std::process::Command {
-		let mut command = std::process::Command::new("cargo");
-		command.args([
-			"run",
-			"--quiet",
-			"--locked",
-			"--manifest-path",
-			concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
-			"--bin",
-			"viz",
-			"--",
-		]);
-		command
+		crate::test_command("viz")
 	}
+
 	// The usage fold, the diagnostic file parser, the skeleton scan and the
 	// terminal stream picture.
 

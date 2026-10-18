@@ -842,6 +842,8 @@ mod audit_cli_tests {
 		use std::io::{Read, Write};
 		use std::net::TcpListener;
 		use std::time::{Duration, Instant};
+		// Compilation must complete before the HTTP fixture starts its deadline.
+		let _ = super::test_command();
 		let dir = temp("audit");
 		let seed = json!({"id":"broken-build","kind":"compile_failed","time_ms":1,
 		"crate":"workspace","build":"cargo build -p app","duration_ms":200,
@@ -2132,13 +2134,16 @@ fn parse_work(round: u64) -> usize {
 						"caller/callee evidence retained",
 					);
 				} else {
-					pass(
-						record["allocations"]["allocs"].as_u64().unwrap_or(0) > 0
-							&& record["errors_total"].as_u64() == Some(0),
-						"allocation counts recorded with no memory errors",
-					);
 					let raw =
 						std::fs::read_to_string(daemon_dir.join(format!("valgrind/{name}.log"))).unwrap();
+					assert!(
+						record["allocations"]["allocs"].as_u64().unwrap_or(0) > 0
+							&& record["errors_total"].as_u64() == Some(0),
+						"allocation counts {:?}, errors {:?}\n{raw}",
+						record["allocations"],
+						record["errors_total"]
+					);
+					pass(true, "allocation counts recorded with no memory errors");
 					let total: u64 = raw
 						.lines()
 						.find_map(|l| l.split("ERROR SUMMARY:").nth(1))
@@ -2366,16 +2371,5 @@ fn parse_work(round: u64) -> usize {
 
 #[cfg(test)]
 fn test_command() -> std::process::Command {
-	let mut command = std::process::Command::new("cargo");
-	command.args([
-		"run",
-		"--quiet",
-		"--locked",
-		"--manifest-path",
-		concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
-		"--bin",
-		"daemon",
-		"--",
-	]);
-	command
+	crate::test_command("daemon")
 }

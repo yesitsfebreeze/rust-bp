@@ -91,6 +91,48 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 	})
 }
 
+/// Build CLI fixtures once before their timed interactions begin. Resolve Cargo's
+/// reported artifacts so target directories and executable suffixes stay portable.
+#[cfg(test)]
+pub(crate) fn test_command(binary: &str) -> std::process::Command {
+	use std::{collections::BTreeMap, path::PathBuf, sync::OnceLock};
+	static BINARIES: OnceLock<BTreeMap<String, PathBuf>> = OnceLock::new();
+	let binaries = BINARIES.get_or_init(|| {
+		let output = std::process::Command::new("cargo")
+			.args([
+				"build",
+				"--quiet",
+				"--locked",
+				"--manifest-path",
+				concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+				"--bins",
+				"--message-format=json-render-diagnostics",
+			])
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"CLI fixture build: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		String::from_utf8_lossy(&output.stdout)
+			.lines()
+			.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+			.filter_map(|artifact| {
+				Some((
+					artifact["target"]["name"].as_str()?.to_string(),
+					PathBuf::from(artifact["executable"].as_str()?),
+				))
+			})
+			.collect()
+	});
+	std::process::Command::new(
+		binaries
+			.get(binary)
+			.expect("Cargo reported the fixture binary"),
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use crate as daemon;
