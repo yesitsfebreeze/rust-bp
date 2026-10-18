@@ -12,7 +12,7 @@ default:
 # Build; `just setup <name>` renames the demo app.
 [group('build')]
 setup *name:
-    ./setup.sh "$@"
+    ./tools/setup.sh "$@"
 
 # Release build: what the daemon swaps and the profilers inspect.
 [group('build')]
@@ -104,4 +104,4 @@ viz:
 # Build the Linux valgrind image the container fallback uses.
 [group('run')]
 valgrind-image:
-    docker build -f valgrind.Dockerfile -t valgrind-v2 .   # daemon::valgrind::IMAGE
+    docker build -f tools/valgrind.Dockerfile -t valgrind-v2 .   # daemon::valgrind::IMAGE

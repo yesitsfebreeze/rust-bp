@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the workspace, optionally renaming the app: bash setup.sh [name].
+# Build the workspace, optionally renaming the app: bash tools/setup.sh [name].
 # Needs Bash, Perl and Cargo. No agent configuration is read or changed.
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 new="${1:-}"
 if [[ -z "$new" ]]; then
@@ -10,17 +10,17 @@ if [[ -z "$new" ]]; then
   exit 0
 fi
 if [[ ! "$new" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
-  echo "usage: bash setup.sh [name] (a-z 0-9 _ -, starting with a letter)" >&2
+  echo "usage: bash tools/setup.sh [name] (a-z 0-9 _ -, starting with a letter)" >&2
   exit 2
 fi
 case "$new" in
   daemon|rustc-events|viz|reload|counter)
-    echo "setup.sh: '$new' is taken by a runtime target" >&2
+    echo "tools/setup.sh: '$new' is taken by a runtime target" >&2
     exit 2 ;;
 esac
 cur=$(perl -ne 'if (m{"\./target/release/([A-Za-z0-9_-]+)"}) { print $1; exit }' src/runtime/daemon/hot.rs)
 if [[ -z "$cur" ]]; then
-  echo "setup.sh: cannot read app path from src/runtime/daemon/hot.rs" >&2
+  echo "tools/setup.sh: cannot read app path from src/runtime/daemon/hot.rs" >&2
   exit 1
 fi
 if [[ "$new" != "$cur" ]]; then
@@ -39,4 +39,4 @@ if [[ "$new" != "$cur" ]]; then
 fi
 # Renaming changes Cargo.lock. Build app, module and runtime together.
 cargo build --release --workspace
-echo "App: $new. Register target/release/daemon (daemon.exe on Windows); see install.txt."
+echo "App: $new. Register target/release/daemon (daemon.exe on Windows); see docs/install.txt."

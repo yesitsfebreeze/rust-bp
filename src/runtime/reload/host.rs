@@ -407,7 +407,7 @@ pub extern "C" fn module_api() -> *const abi::ModuleApi {
 		let mut host = Host::new().unwrap();
 		host.load("counter", &library, &[]).unwrap();
 		assert_eq!(count(&mut host, "tick"), 1);
-		daemon::channels::serve(&daemon::app_socket()).unwrap();
+		let _channels = daemon::channels::serve(&daemon::app_socket()).unwrap();
 		let socket = daemon::app_socket();
 		let request = std::thread::spawn(move || {
 			daemon::wire::ask_within(

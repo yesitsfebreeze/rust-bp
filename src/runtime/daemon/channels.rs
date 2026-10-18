@@ -260,13 +260,11 @@ pub fn on_persist(hook: impl Fn(&str) -> Value + Send + Sync + 'static) {
 	*PERSIST.lock().unwrap() = Some(std::sync::Arc::new(hook));
 }
 
-static SERVER: Mutex<Option<wire::Server>> = Mutex::new(None);
-
-/// Serve the channel snapshots at `path` (call once from the executable);
-/// `persist` requests go to the [`on_persist`] hook.
-pub fn serve(path: &str) -> Result<(), String> {
+/// Serve channel snapshots and persist requests. Retain the returned guard
+/// for the app lifetime; dropping it closes the socket and joins its threads.
+pub fn serve(path: &str) -> Result<wire::Server, String> {
 	let listener = wire::bind(path).map_err(|e| format!("serve {path}: {e}"))?;
-	*SERVER.lock().unwrap() = Some(wire::serve_loop(listener, |request| {
+	Ok(wire::serve_loop(listener, |request| {
 		if request["op"] == "persist" || request["op"] == "resume" {
 			let hook = PERSIST.lock().unwrap().clone();
 			return match hook {
@@ -275,8 +273,7 @@ pub fn serve(path: &str) -> Result<(), String> {
 			};
 		}
 		snapshot()
-	}));
-	Ok(())
+	}))
 }
 
 /// Read a snapshot from the executable's channel socket.

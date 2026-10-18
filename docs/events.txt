@@ -30,5 +30,5 @@ Commands own process trees and clean up on completion, timeout and cancellation.
 Docker jobs have unique names and remove their containers. Cleanup failures are
 reported; abrupt process termination cannot execute an in-process cleanup handler.
 For startup problems, check the registered runtime path, cwd and stderr, following
-[install.txt](../install.txt). See [testing](testing.txt) for isolated failure tests.
+[install.txt](install.txt). See [testing](testing.txt) for isolated failure tests.
 

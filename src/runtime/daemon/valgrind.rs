@@ -428,14 +428,14 @@ fn ensure_image() -> Result<(), String> {
 		"docker".to_string(),
 		"build".to_string(),
 		"-f".to_string(),
-		"valgrind.Dockerfile".to_string(),
+		"tools/valgrind.Dockerfile".to_string(),
 		"-t".to_string(),
 		IMAGE.to_string(),
 		".".to_string(),
 	];
 	util::run_with_timeout(&build, Duration::from_secs(900), 2000)
 		.map(|_| ())
-		.map_err(|e| format!("cannot build image {IMAGE} from valgrind.Dockerfile: {e}"))
+		.map_err(|e| format!("cannot build image {IMAGE} from tools/valgrind.Dockerfile: {e}"))
 }
 
 /// Quote one argv word for the container's `sh -c`.

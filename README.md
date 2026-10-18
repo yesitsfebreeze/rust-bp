@@ -32,16 +32,16 @@ just serve
 Edit `STEP` in `src/modules/counter/lib.rs`, then inspect `just call channels`:
 the count continues with the new step and the process stays alive. Edit
 `src/main.rs` to rebuild the app; its tick count and the module count survive
-the restart. To name your project, run `bash setup.sh my-project`.
+the restart. To name your project, run `bash tools/setup.sh my-project`.
 
 Your app lives in `src/main.rs` and `src/bin/`; reusable runtime code lives in
 `src/runtime/`. Tests live in their implementation files.
 
 ## Connect your agent
 
-Follow [install.txt](install.txt): build `daemon`, register its absolute path
+Follow [install.txt](docs/install.txt): build `daemon`, register its absolute path
 with argument `mcp` and the project root as its working directory, then load
-[SYSTEM.md](SYSTEM.md) as project instructions. MCP is built into the runtime;
+[SYSTEM.md](tools/SYSTEM.md) as project instructions. MCP is built into the runtime;
 it starts supervision on demand and reuses one language-server index.
 `stop` stops the app while MCP stays connected for the next `reload`.
 Disconnect and rebuild to update the runtime executable itself.

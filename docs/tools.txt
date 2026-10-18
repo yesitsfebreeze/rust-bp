@@ -75,7 +75,7 @@ Use `docs {"query":"profiling"}` or a specific topic only when a workflow needs
 explanation; all guides are offline and support batching. Full audit recovery
 instructions are available under `docs {"topic":"audit"}` when an alert occurs.
 Conversation and subjective tooling feedback need no startup calls. Repository
-workflow selection lives in `SYSTEM.md`; installed skills are not a checklist.
+workflow selection lives in `tools/SYSTEM.md`; installed skills are not a checklist.
 
 Three failures of the same recorded operation, source, arguments and working
 directory within ten minutes, without a matching success, set

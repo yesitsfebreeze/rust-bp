@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
-const SERVE_HINT: &str = "the executable serves its channels by calling daemon::channels::serve(&daemon::app_socket()) once at startup";
+const SERVE_HINT: &str = "the executable serves its channels by calling daemon::channels::serve(&daemon::app_socket()) once at startup and retaining the returned guard for its lifetime";
 
 /// Persistent MCP runs supervision in this process. One-shot CLI calls
 /// reuse or start a detached supervisor from this same executable.
@@ -1177,9 +1177,7 @@ use std::time::Duration;
 
 fn main() {
 	let iterations: Option<u64> = std::env::args().nth(1).and_then(|arg| arg.parse().ok());
-	if let Err(error) = daemon::channels::serve(&daemon::app_socket()) {
-		eprintln!("app: {error}");
-	}
+	let _channels = daemon::channels::serve(&daemon::app_socket()).expect("serve workload channels");
 	let mut done = 0;
 	loop {
 		if let Some(limit) = iterations {
@@ -1749,7 +1747,8 @@ fn parse_work(round: u64) -> usize {
 		// The complete build closure must sit inside the single Docker /repo mount.
 		copy_dir(&root.join("src"), &directory.join("src"));
 		std::fs::write(directory.join("src/main.rs"), WORKLOAD).unwrap();
-		for name in ["Cargo.toml", "Cargo.lock", "valgrind.Dockerfile"] {
+		std::fs::create_dir_all(directory.join("tools")).unwrap();
+		for name in ["Cargo.toml", "Cargo.lock", "tools/valgrind.Dockerfile"] {
 			std::fs::copy(root.join(name), directory.join(name)).unwrap();
 		}
 	}

@@ -13,7 +13,7 @@ Install the runtime MCP
    cargo build --release --locked -p daemon --bin daemon
 
    The runtime builds the app/modules when requested. Optional project rename:
-   bash setup.sh my-project
+   bash tools/setup.sh my-project
 
 3. Register ONE stdio MCP server using the client's supported configuration:
 
@@ -29,9 +29,9 @@ Install the runtime MCP
    Use an argument array, not a shell command string. No launcher script or
    separate MCP executable is needed.
 
-4. Load SYSTEM.md through the agent's supported project-instruction mechanism.
+4. Load tools/SYSTEM.md through the agent's supported project-instruction mechanism.
    If it requires a particular entry filename, create a local reference to
-   SYSTEM.md. Keep project rules in SYSTEM.md as the single source.
+   tools/SYSTEM.md. Keep project rules in tools/SYSTEM.md as the single source.
 
 5. Connect, initialize MCP and list tools. Call:
 
@@ -49,7 +49,7 @@ Install the runtime MCP
 
 Optional profiling:
    Install native Valgrind on Linux, or install/start Docker and build the image:
-   docker build -f valgrind.Dockerfile -t valgrind-v2 .
+   docker build -f tools/valgrind.Dockerfile -t valgrind-v2 .
    Valgrind runs a separate, bounded workload; it does not attach to the live app.
    memory_report reads live process counters on Windows/Linux/macOS; macOS also
    offers leaks/heap. channels reads the app's instrumented values and timings.

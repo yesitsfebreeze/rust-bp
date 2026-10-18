@@ -1,6 +1,6 @@
 # Working in this project
 
-Read install.txt when setting up the runtime. Use llms.txt to find only the
+Read docs/install.txt when setting up the runtime. Use llms.txt to find only the
 documentation relevant to the task. Answer conversation from available context;
 tool calls, startup, task records and documentation searches need a reason.
 
@@ -9,6 +9,11 @@ change and verify it. Follow-up questions steer ongoing work unless it is
 cancelled. Ask only when missing information or authority blocks the next step.
 Report observed results and remaining limitations without inventing evidence.
 
+Create temporary files and scratch work under tools/tmp/ (relative to the
+project root), creating that directory when needed. Keep temporary files out
+of commits. Remove files you no longer need; tools/tmp/ can be cleaned periodically
+after checking that no active task still uses them.
+
 ## Runtime workflow
 
 The app starts in src/main.rs; reloadable modules live in src/modules/.
@@ -16,8 +21,8 @@ Reusable runtime code is in src/runtime/daemon/ and src/runtime/reload/.
 Keep each unit's tests in its implementation file under #[cfg(test)].
 Embed test fixtures beside their tests and write temporary files only when needed.
 
-Register the runtime executable as the stdio MCP server described in install.txt.
-Load this file using the agent's supported project-instruction mechanism.
+Register the runtime executable as the stdio MCP server described in docs/install.txt.
+Load tools/SYSTEM.md using the agent's supported project-instruction mechanism.
 MCP initialization supplies the quick start; do not fetch it again.
 Use status {start:false} to inspect without starting the app.
 Use reload {wait:true} to build/run and confirm completion.

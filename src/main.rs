@@ -8,7 +8,7 @@ fn main() -> Result<(), String> {
 		None => 0,
 	};
 	daemon::ensure_dir().map_err(|e| e.to_string())?;
-	daemon::channels::serve(&daemon::app_socket())?;
+	let _channels = daemon::channels::serve(&daemon::app_socket())?;
 	while !daemon::util::cancelled() {
 		if host.persist_requested() {
 			if let Err(error) = host.persist(&[("ticks", ticks.to_le_bytes().to_vec())]) {
@@ -136,7 +136,8 @@ mod tests {
 			Fixture(std::env::temp_dir().join(format!("cargo-rename-{}", std::process::id())));
 		std::fs::create_dir(&fixture.0).unwrap();
 		copy_tree(&root.join("src"), &fixture.0.join("src"));
-		for name in ["Cargo.toml", "Cargo.lock", "README.md", "setup.sh"] {
+		std::fs::create_dir_all(fixture.0.join("tools")).unwrap();
+		for name in ["Cargo.toml", "Cargo.lock", "README.md", "tools/setup.sh"] {
 			std::fs::copy(root.join(name), fixture.0.join(name)).unwrap();
 		}
 		// Git's normal Windows checkout may use CRLF; setup must rename it too.
@@ -146,7 +147,7 @@ mod tests {
 			.replace("\r\n", "\n");
 		std::fs::write(&manifest, text.replace('\n', "\r\n")).unwrap();
 		for name in ["renamed-demo", "renamed-again"] {
-			run(&fixture.0, &["bash", "setup.sh", name]);
+			run(&fixture.0, &["bash", "tools/setup.sh", name]);
 			assert!(fixture
 				.0
 				.join(format!(

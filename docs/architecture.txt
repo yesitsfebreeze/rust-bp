@@ -26,7 +26,8 @@ app goes to daemon.log so it cannot corrupt JSON-RPC stdout. Runtime executable
 changes require rebuilding and reconnecting; app and module changes reload
 through the supervisor. On Windows, disconnect before rebuilding the runtime.
 
-The starter calls daemon::channels::serve once, ticks a stateful module and
+The starter retains the guard from daemon::channels::serve for its lifetime,
+so a normal exit closes the listener and joins its threads. It ticks a module and
 answers checkpoint requests. Module-only edits keep the app process; app edits
 checkpoint app/module state before restarting. See [reload](reload.txt).
 Channels record counters, timing histograms and last values in the app process.

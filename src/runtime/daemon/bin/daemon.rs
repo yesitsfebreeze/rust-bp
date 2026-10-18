@@ -114,7 +114,7 @@ fn main() {
 				Ok(snapshot) => println!("{}", channels::render_table(&snapshot)),
 				Err(error) => {
 					println!("{error}");
-					println!("the executable serves its channels by calling daemon::channels::serve(&daemon::app_socket()) once at startup; right after a start the first build may still be running");
+					println!("the executable serves its channels by calling daemon::channels::serve(&daemon::app_socket()) once at startup and retaining the returned guard; right after a start the first build may still be running");
 				}
 			}
 		}

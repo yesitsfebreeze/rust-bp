@@ -5,8 +5,8 @@
 The app starts in src/main.rs; reusable runtime code lives in src/runtime/.
 Tests live beside implementation. Load only the guides relevant to the task.
 
-- [Install](install.txt): Prerequisites, one executable to register, connection checks.
-- [System instructions](SYSTEM.md): Development workflow, ownership and verification.
+- [Install](docs/install.txt): Prerequisites, one executable to register, connection checks.
+- [System instructions](tools/SYSTEM.md): Development workflow, ownership and verification.
 - [Getting started](docs/getting-started.txt): Layout, commands and project naming.
 - [Architecture](docs/architecture.txt): Runtime, app, LSP, channels and build profiles.
 - [Stateful reload](docs/reload.txt): Module ABI, app checkpoints and failure behavior.

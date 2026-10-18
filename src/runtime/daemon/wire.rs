@@ -48,6 +48,7 @@ pub fn serve_concurrent(
 
 /// Owns the listener and workers. Dropping it closes the endpoint and releases
 /// the handler's resources, including any language-server process.
+#[must_use = "retain the server guard until its listener should stop"]
 pub struct Server {
 	stop: Arc<AtomicBool>,
 	threads: Vec<std::thread::JoinHandle<()>>,

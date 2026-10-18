@@ -1,7 +1,7 @@
 # Getting started
 
-Read [install.txt](../install.txt) to build and register the runtime MCP.
-Read [SYSTEM.md](../SYSTEM.md) for the development workflow.
+Read [install.txt](install.txt) to build and register the runtime MCP.
+Read [SYSTEM.md](../tools/SYSTEM.md) for the development workflow.
 
 ## Layout
 
@@ -15,8 +15,11 @@ Read [SYSTEM.md](../SYSTEM.md) for the development workflow.
       bin/viz.rs           optional terminal activity viewer
     src/runtime/reload/    module ABI, library swaps and app checkpoints
     justfile               build, check and run recipes
-    setup.sh               optional project rename and workspace build
-    valgrind.Dockerfile    Linux profiler image
+    tools/setup.sh         optional project rename and workspace build
+    tools/valgrind.Dockerfile  Linux profiler image
+
+Put temporary files and scratch work in tools/tmp/. It is ignored by Git and can
+be cleaned periodically after checking that no active task still uses the files.
 
 Tests and fixtures live inside their implementation files under #[cfg(test)].
 All crates have ordinary Cargo manifests; no bootstrap is needed for discovery.
@@ -33,7 +36,7 @@ MCP starts its supervisor automatically; serve is the standalone terminal option
 Edit src/modules/counter/lib.rs to swap code while keeping the app alive.
 Edit src/main.rs to restart with app/module state restored. See [reload](reload.txt).
 
-To rename the app, run bash setup.sh <name>. It updates the app package, runtime
+To rename the app, run bash tools/setup.sh <name>. It updates the app package, runtime
 paths, embedded integration checks and README, then builds the workspace and
 updates Cargo.lock. It can be run again to rename again. Runtime target names
 stay unchanged, so MCP registration still points at daemon. No client settings
