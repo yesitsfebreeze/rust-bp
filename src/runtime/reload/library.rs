@@ -37,7 +37,9 @@ impl Loaded {
 				.get(ENTRY)
 				.map_err(|e| format!("{}: no module_api: {e}", source.display()))?;
 			let api = entry();
-			if api.is_null() || (*api).abi != ABI_VERSION {
+			// Read only the version header until the ABI and alignment match.
+			// An older/rejected library need not provide today's full struct.
+			if api.is_null() || !api.is_aligned() || api.cast::<u32>().read() != ABI_VERSION {
 				return Err(format!(
 					"{}: module ABI differs from the host's ({ABI_VERSION})",
 					source.display()

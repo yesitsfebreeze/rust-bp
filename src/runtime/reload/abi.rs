@@ -68,7 +68,7 @@ pub struct ModuleApi {
 	pub free: unsafe extern "C" fn(bytes: Bytes),
 }
 
-/// What a module crate implements; [`export_module!`] exports it.
+/// What a module crate implements; [`crate::export_module!`] exports it.
 pub trait Module: Sized {
 	fn create(config: &[u8]) -> Result<Self, String>;
 	fn call(&mut self, method: &str, args: &[u8]) -> Vec<u8>;

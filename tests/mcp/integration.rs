@@ -698,6 +698,7 @@ fn check() {
 		pids.iter().all(|pid| !process_running(*pid)).then_some(())
 	});
 	pass(true, "all observed app PIDs are gone after stop");
+	verify_worker_rebuild(&directory, &env, &mut mcp);
 	if lifecycle_only {
 		let status = mcp.close().expect("launcher exits on EOF");
 		pass(status.success(), "lifecycle MCP closes successfully on EOF");
@@ -875,6 +876,20 @@ fn check() {
 		pass(evidence, "ranking receives source and call-graph evidence");
 	}
 
+	pass(mcp.calls == tools, "every advertised MCP tool exercised");
+	println!("ALL INTEGRATION CHECKS PASSED");
+	let _ = mcp.close();
+	let pids = mcp.app_pids.clone();
+	drop(mcp);
+	drop(daemon);
+	drop(enclosure);
+	pass(
+		pids.iter().all(|pid| !process_running(*pid)),
+		"cleanup left no observed app processes",
+	);
+}
+
+fn verify_worker_rebuild(directory: &Path, env: &Env, mcp: &mut Mcp) {
 	// Real worker rebuild under the SAME launcher process and client pipe.
 	let launcher_pid = mcp.process.0.id();
 	let worker_source = directory.join("src/runtime/mcp/main.rs");
@@ -892,7 +907,7 @@ fn check() {
 	)
 	.unwrap();
 	env.run(
-		&directory,
+		directory,
 		&["cargo", "build", "--release", "--locked", "-p", "mcp"],
 	);
 	let listed = mcp.rpc("tools/list", json!({}));
@@ -906,17 +921,6 @@ fn check() {
 			.iter()
 			.any(|n| n["method"] == "notifications/tools/list_changed"),
 		"worker replacement sends tool-list notification",
-	);
-	pass(mcp.calls == tools, "every advertised MCP tool exercised");
-	println!("ALL INTEGRATION CHECKS PASSED");
-	let _ = mcp.close();
-	let pids = mcp.app_pids.clone();
-	drop(mcp);
-	drop(daemon);
-	drop(enclosure);
-	pass(
-		pids.iter().all(|pid| !process_running(*pid)),
-		"cleanup left no observed app processes",
 	);
 }
 
