@@ -454,16 +454,28 @@ pub fn read_frame(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
 }
 
 pub fn uri_for(path: &Path) -> String {
-	format!("file://{}", path.display())
+	url::Url::from_file_path(path)
+		.expect("LSP paths are absolute")
+		.into()
 }
 
 /// `src/x.rs` for a uri under `root`, the plain path otherwise.
 pub fn relative(uri: &str, root: &Path) -> String {
-	let path = uri.strip_prefix("file://").unwrap_or(uri);
-	Path::new(path)
+	let Some(path) = url::Url::parse(uri)
+		.ok()
+		.and_then(|url| url.to_file_path().ok())
+	else {
+		return uri.into();
+	};
+	// URL conversion normalizes Windows verbatim paths (\\?\C:\...) too.
+	let root = url::Url::from_file_path(root)
+		.ok()
+		.and_then(|url| url.to_file_path().ok())
+		.unwrap_or_else(|| root.to_path_buf());
+	path
 		.strip_prefix(root)
-		.map(|p| p.display().to_string())
-		.unwrap_or_else(|_| path.to_string())
+		.map(|p| p.to_string_lossy().replace('\\', "/"))
+		.unwrap_or_else(|_| path.display().to_string())
 }
 
 /// One `Location` or `LocationLink` as `{file, line, col}` (1-based).

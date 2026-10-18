@@ -76,8 +76,18 @@ fn process_running(pid: u64) -> bool {
 
 fn on_path(program: &str) -> bool {
 	std::env::var_os("PATH")
-		.map(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+		.map(|path| {
+			std::env::split_paths(&path).any(|dir| {
+				dir
+					.join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
+					.is_file()
+			})
+		})
 		.unwrap_or(false)
+		&& Command::new(program)
+			.arg("--version")
+			.output()
+			.is_ok_and(|out| out.status.success())
 }
 
 fn read_json(path: &Path) -> Value {

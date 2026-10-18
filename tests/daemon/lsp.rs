@@ -22,10 +22,29 @@ fn frames_round_trip_and_end_at_eof() {
 
 #[test]
 fn paths_relativize_under_the_root_only() {
-	let root = Path::new("/w/p");
-	assert_eq!(uri_for(root), "file:///w/p");
-	assert_eq!(relative("file:///w/p/src/a.rs", root), "src/a.rs");
-	assert_eq!(relative("file:///usr/lib/x.rs", root), "/usr/lib/x.rs");
+	let root = if cfg!(windows) {
+		Path::new(r"C:\w\p")
+	} else {
+		Path::new("/w/p")
+	};
+	let uri = uri_for(root);
+	assert_eq!(
+		uri,
+		if cfg!(windows) {
+			"file:///C:/w/p"
+		} else {
+			"file:///w/p"
+		}
+	);
+	assert_eq!(relative(&format!("{uri}/src/a.rs"), root), "src/a.rs");
+	let file = root.join("src/a b#ü.rs");
+	assert!(uri_for(&file).ends_with("/src/a%20b%23%C3%BC.rs"));
+	assert_eq!(relative(&uri_for(&file), root), "src/a b#ü.rs");
+	let outside = root.parent().unwrap().join("outside.rs");
+	assert_eq!(
+		relative(&uri_for(&outside), root),
+		outside.display().to_string()
+	);
 }
 
 /// Needs `rust-analyzer` on PATH and indexes this workspace (10–60 s):

@@ -48,7 +48,7 @@ q=$(perl -e 'print quotemeta shift' "$cur")
 kq=$(perl -e 'print quotemeta shift' "$key")
 
 # The package (root Cargo.toml) and with it the bin; then every path and `-p` that names it.
-perl -pi -e "s{^name = \"$q\"\$}{name = \"$new\"} if !\$done && (\$done = /^name = \"$q\"\$/)" Cargo.toml
+perl -pi -e "s{^name = \"$q\"(?=\\r?\$)}{name = \"$new\"} if !\$done && (\$done = /^name = \"$q\"\\r?\$/)" Cargo.toml
 for f in src/runtime/daemon/hot.rs src/runtime/daemon/bin/daemon.rs src/runtime/daemon/profiles.rs \
          src/runtime/mcp/main.rs tests/mcp/integration.rs README.md; do
   sub "$f" "release/$q\\b" "release/$new"   # ./target/release/ and <daemon dir>/target-linux/release/

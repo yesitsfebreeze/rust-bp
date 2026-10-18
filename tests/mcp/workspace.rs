@@ -115,6 +115,12 @@ fn setup_can_rename_and_rebuild_the_stateful_workspace_twice() {
 	] {
 		std::fs::copy(root.join(name), fixture.0.join(name)).unwrap();
 	}
+	// Git's normal Windows checkout may use CRLF; setup must rename it too.
+	let manifest = fixture.0.join("Cargo.toml");
+	let text = std::fs::read_to_string(&manifest)
+		.unwrap()
+		.replace("\r\n", "\n");
+	std::fs::write(&manifest, text.replace('\n', "\r\n")).unwrap();
 	for name in ["renamed-demo", "renamed-again"] {
 		run(&fixture.0, &["bash", "setup.sh", name]);
 		assert!(fixture

@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-analyzer
       - uses: extractions/setup-just@v3
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check -p reload --no-default-features --locked

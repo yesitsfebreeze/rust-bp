@@ -79,6 +79,7 @@ path = "../../../tests/daemon/mcp_usage_hook.rs"
 [dependencies]
 serde_json.workspace = true
 signal-hook.workspace = true
+url = "2"
 
 # OS calls live in platform.rs: POSIX on Linux/macOS, Win32 on Windows.
 [target.'cfg(unix)'.dependencies]
