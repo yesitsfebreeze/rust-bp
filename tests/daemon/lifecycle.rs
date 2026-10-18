@@ -46,6 +46,15 @@ fn running(pid: i32) -> bool {
 	let state = String::from_utf8_lossy(&output.stdout);
 	!state.trim().is_empty() && !state.trim().starts_with('Z')
 }
+// Git Bash's $! is an MSYS pid, not the native pid OpenProcess queries.
+fn record_pid(path: &std::path::Path) -> String {
+	let command = if cfg!(windows) {
+		"cat /proc/$!/winpid"
+	} else {
+		"echo $!"
+	};
+	format!("{command} > '{}'", path.display())
+}
 struct Fixture(Child);
 impl Drop for Fixture {
 	fn drop(&mut self) {
@@ -88,12 +97,12 @@ fn daemon_fixture() {
         build_command: vec![
             "sh".into(),
             "-c".into(),
-            "cat watched > built; echo build >> builds; sleep ${LIFECYCLE_TEST_BUILD_DELAY:-0.4} & echo $! > build-descendant; wait".into(),
+            format!("cat watched > built; echo build >> builds; sleep ${{LIFECYCLE_TEST_BUILD_DELAY:-0.4}} & {}; wait", record_pid(std::path::Path::new("build-descendant"))),
         ],
         child_command: vec![
             "sh".into(),
             "-c".into(),
-            "sleep 120 & echo $! > descendant; wait".into(),
+            format!("sleep 120 & {}; wait", record_pid(std::path::Path::new("descendant"))),
         ],
         watch: vec![root.join("watched")],
         poll: Duration::from_millis(20),
@@ -181,10 +190,7 @@ fn sigterm_cleans_daemon_descendants() {
 #[test]
 fn command_deadline_includes_inherited_pipes_and_kills_descendants() {
 	let temp = Temp::new("pipes");
-	let script = format!(
-		"sleep 120 & echo $! > '{}'; exit 0",
-		temp.0.join("pid").display()
-	);
+	let script = format!("sleep 120 & {}; exit 0", record_pid(&temp.0.join("pid")));
 	let started = Instant::now();
 	let result = util::run_with_timeout(
 		&["sh".into(), "-c".into(), script],
@@ -202,7 +208,7 @@ fn benchmark_timeout_cleans_process_group() {
 	let temp = Temp::new("benchmark");
 	let result = daemon::profiles::benchmark(
 		&json!({"name":"lifecycle-timeout", "command":["sh", "-c",
-        format!("sleep 120 & echo $! > '{}'; wait", temp.0.join("pid").display())],"repeats":2,"timeout_s":1}),
+        format!("sleep 120 & {}; wait", record_pid(&temp.0.join("pid")))],"repeats":2,"timeout_s":1}),
 	);
 	assert!(result.unwrap_err().contains("timed out"));
 	let pid = temp.text("pid").trim().parse().unwrap();

@@ -525,6 +525,11 @@ fn check() {
 		);
 	}
 	if on_path("rust-analyzer") {
+		wait_for(Duration::from_secs(180), || {
+			let state = mcp.call_json("lsp", json!({"method":"status"}));
+			assert!(state["dead"].is_null(), "rust-analyzer exited: {state}");
+			(state["ready"] == true).then_some(())
+		});
 		pass(
 			mcp.call_json("lsp", json!({"method":"symbols","query":"parse_work"}))["symbols"]
 				.as_array()
