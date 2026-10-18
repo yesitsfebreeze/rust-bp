@@ -15,10 +15,10 @@ pub mod events;
 pub mod health;
 pub mod hot;
 pub mod lsp;
+pub mod mcp;
 pub mod native;
 pub mod platform;
 pub mod profiles;
-pub mod staging;
 pub mod usage;
 pub mod util;
 pub mod valgrind;
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 /// set, else `<OS temp dir>/sv-<hash of the canonical project root>`. The
 /// name is short on purpose: a Unix socket path may not exceed 104 bytes
 /// on macOS, and `$TMPDIR` there is already ~50. Deterministic, so the
-/// daemon, the executable, the MCP worker and the compiler wrapper
+/// runtime, the executable and the compiler wrapper
 /// meet in the same place without passing it around.
 pub fn dir() -> PathBuf {
 	match std::env::var_os("DAEMON_DIR") {
@@ -89,4 +89,28 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 	bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
 		(h ^ *b as u64).wrapping_mul(0x100_0000_01b3)
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use crate as daemon;
+	use daemon::{dir_for, project_root};
+
+	#[test]
+	fn daemon_dir_is_stable_short_and_per_project() {
+		let here = project_root();
+		assert!(here.join("Cargo.toml").is_file());
+		assert!(std::fs::read_to_string(here.join("Cargo.toml"))
+			.unwrap()
+			.contains("[workspace]"));
+		let a = dir_for(&here);
+		assert_eq!(a, dir_for(&here));
+		assert_ne!(a, dir_for(&std::env::temp_dir()));
+		assert!(a.starts_with(std::env::temp_dir()));
+		assert!(
+			a.join("daemon.sock").as_os_str().len() < 104,
+			"socket path too long for macOS: {}",
+			a.display()
+		);
+	}
 }

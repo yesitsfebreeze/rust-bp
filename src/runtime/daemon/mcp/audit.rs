@@ -1,13 +1,14 @@
 //! Evidence-first audit of the same event log that powers viz.
 //! Jev judgments annotate findings; they never authorize edits or hide evidence.
 //!
-//! Shell: cargo run -p mcp -- --call audit '{"mode":"local"}'
+//! Shell: cargo run -p daemon -- --call audit '{"mode":"local"}'
 //! MCP: audit {"mode":"auto","since_ms":0,"limit":2000,"top":10}
 //! auto uses TYPESAFE_API_KEY / JEV_URL when configured and falls back to local
 //! evidence on service or schema failure. Explicit jev mode surfaces that error.
 //! To repair: inspect event IDs/log lines, reproduce the matching operation,
 //! change its cause, rerun it, then audit since the repair's Unix millisecond
 //! timestamp. A clean audit with no events is not verification of a fix.
+use crate as daemon;
 use daemon::usage;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -236,7 +237,7 @@ pub fn tool(args: &Value) -> Result<String, String> {
 		);
 	}
 	if mode != "local" && configured && report["findings_total"] != 0 {
-		let assessment = crate::jev::ask(&report, &questions(&report))
+		let assessment = super::jev::ask(&report, &questions(&report))
 			.and_then(|answers| apply_answers(&mut report, &answers));
 		if let Err(error) = assessment {
 			if mode == "jev" {

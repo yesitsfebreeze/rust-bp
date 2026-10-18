@@ -97,6 +97,86 @@ impl Group {
 	}
 }
 
+/// Resident memory and platform-specific counters, in bytes. These are
+/// process accounting values, not a leak detector.
+pub fn memory_usage(pid: u32) -> Result<serde_json::Value, String> {
+	#[cfg(windows)]
+	{
+		use windows_sys::Win32::{
+			Foundation::CloseHandle,
+			System::{
+				ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX},
+				Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+			},
+		};
+		// SAFETY: the handle is checked and closed on every path; the counters
+		// buffer has the size and alignment required by GetProcessMemoryInfo.
+		unsafe {
+			let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+			if handle.is_null() {
+				return Err(io::Error::last_os_error().to_string());
+			}
+			let mut counters: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+			counters.cb = std::mem::size_of_val(&counters) as u32;
+			let ok = GetProcessMemoryInfo(handle, &mut counters as *mut _ as _, counters.cb);
+			let error = io::Error::last_os_error();
+			CloseHandle(handle);
+			if ok == 0 {
+				return Err(error.to_string());
+			}
+			Ok(serde_json::json!({"source":"GetProcessMemoryInfo",
+				"resident_bytes":counters.WorkingSetSize,
+				"peak_resident_bytes":counters.PeakWorkingSetSize,
+				"private_bytes":counters.PrivateUsage}))
+		}
+	}
+	#[cfg(target_os = "linux")]
+	{
+		let text = std::fs::read_to_string(format!("/proc/{pid}/status")).map_err(|e| e.to_string())?;
+		let bytes = |key: &str| {
+			text.lines().find_map(|line| {
+				line
+					.strip_prefix(key)?
+					.split_whitespace()
+					.next()?
+					.parse::<u64>()
+					.ok()?
+					.checked_mul(1024)
+			})
+		};
+		let resident = bytes("VmRSS:").ok_or("process has no resident memory (it may have exited)")?;
+		Ok(
+			serde_json::json!({"source":"/proc/pid/status", "resident_bytes":resident,
+			"peak_resident_bytes":bytes("VmHWM:"), "virtual_bytes":bytes("VmSize:")}),
+		)
+	}
+	#[cfg(target_os = "macos")]
+	{
+		let text = crate::util::run_with_timeout(
+			&[
+				"ps".into(),
+				"-o".into(),
+				"rss=,vsz=".into(),
+				"-p".into(),
+				pid.to_string(),
+			],
+			std::time::Duration::from_secs(5),
+			4096,
+		)?;
+		let values: Vec<u64> = text
+			.split_whitespace()
+			.filter_map(|v| v.parse().ok())
+			.collect();
+		if values.len() != 2 {
+			return Err("process has no memory counters".into());
+		}
+		Ok(
+			serde_json::json!({"source":"ps", "resident_bytes":values[0] * 1024,
+			"virtual_bytes":values[1] * 1024}),
+		)
+	}
+}
+
 // ---- detached daemons ----
 
 /// Start `command` outside our session / console, so it outlives the

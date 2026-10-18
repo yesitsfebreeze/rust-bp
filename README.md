@@ -7,8 +7,9 @@
 [![Stars](https://img.shields.io/github/stars/yesitsfebreeze/rust-bp?style=social)](https://github.com/yesitsfebreeze/rust-bp/stargazers)
 
 Start with `src/main.rs` and the small counter module in `src/modules/counter/`.
-The app keeps ticking while rebuilt modules swap in. The harness in
-`src/runtime/` gives your agent one MCP server to run, inspect and profile it.
+The app keeps ticking while rebuilt modules swap in. The runtime in
+`src/runtime/` includes MCP, so one executable handles supervision, code
+intelligence, live memory and profiling.
 
 - **Reload with state.** Module edits keep the process and module state. App edits restart with both app and module state restored. Failed builds or state transfers keep the working generation.
 - **Measure real work.** Read live counters and timings, inspect memory, and compare profiles before and after a change.
@@ -33,16 +34,17 @@ the count continues with the new step and the process stays alive. Edit
 `src/main.rs` to rebuild the app; its tick count and the module count survive
 the restart. To name your project, run `bash setup.sh my-project`.
 
-Your app lives in `src/main.rs` and `src/bin/`; the reusable daemon and MCP
-crates live in `src/runtime/`. All use ordinary Cargo manifests.
+Your app lives in `src/main.rs` and `src/bin/`; reusable runtime code lives in
+`src/runtime/`. Tests live in their implementation files.
 
 ## Connect your agent
 
-The checkout includes configuration for Claude Code and Codex. Start your
-agent from the project root and approve or trust the project configuration.
-For another MCP host, register `./mcp.sh` as a stdio server with this
-directory as its working directory. On Windows, use
-`powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./mcp.ps1`.
+Follow [install.txt](install.txt): build `daemon`, register its absolute path
+with argument `mcp` and the project root as its working directory, then load
+[SYSTEM.md](SYSTEM.md) as project instructions. MCP is built into the runtime;
+it starts supervision on demand and reuses one language-server index.
+`stop` stops the app while MCP stays connected for the next `reload`.
+Disconnect and rebuild to update the runtime executable itself.
 
 Try:
 

@@ -5,7 +5,10 @@
 use crate::platform::{LocalListener as UnixListener, LocalStream as UnixStream};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
+use std::sync::{
+	atomic::{AtomicBool, Ordering},
+	Arc,
+};
 use std::time::Duration;
 
 /// Bind `path`, refusing when another process still answers there, and
@@ -20,17 +23,18 @@ pub fn bind(path: &str) -> std::io::Result<UnixListener> {
 	let _ = std::fs::remove_file(path);
 	let listener = UnixListener::bind(path)?;
 	crate::platform::not_inherited(&listener);
+	listener.set_nonblocking(true)?;
 	Ok(listener)
 }
 
-/// Serve one connection per thread-less loop: read a request line, answer
+/// Serve connections serially: read a request line, answer
 /// with `handler`'s reply. An unreadable or unparseable line answers the
 /// handler with `{}`.
 pub fn serve_loop(
 	listener: UnixListener,
 	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
-) {
-	serve_workers(listener, handler, 1);
+) -> Server {
+	serve_workers(listener, handler, 1)
 }
 
 /// Bounded control-socket workers let independent LSP requests overlap without
@@ -38,41 +42,72 @@ pub fn serve_loop(
 pub fn serve_concurrent(
 	listener: UnixListener,
 	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
-) {
-	serve_workers(listener, handler, 8);
+) -> Server {
+	serve_workers(listener, handler, 8)
+}
+
+/// Owns the listener and workers. Dropping it closes the endpoint and releases
+/// the handler's resources, including any language-server process.
+pub struct Server {
+	stop: Arc<AtomicBool>,
+	threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Server {
+	fn drop(&mut self) {
+		self.stop.store(true, Ordering::Relaxed);
+		for thread in self.threads.drain(..) {
+			let _ = thread.join();
+		}
+	}
 }
 
 fn serve_workers(
 	listener: UnixListener,
 	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
 	workers: usize,
-) {
-	// One thread accepts and a fixed pool answers: several threads blocking
-	// in accept on clones of one socket is not supported everywhere (Winsock
-	// AF_UNIX), while a single acceptor behaves the same on every OS.
+) -> Server {
+	// One acceptor works on Winsock too; bounded queues limit idle clients.
 	let handler = Arc::new(handler);
+	let stop = Arc::new(AtomicBool::new(false));
+	let mut threads = Vec::new();
 	let (send, receive) = std::sync::mpsc::sync_channel::<UnixStream>(workers * 4);
 	let receive = Arc::new(std::sync::Mutex::new(receive));
 	for _ in 0..workers {
 		let receive = receive.clone();
 		let handler = handler.clone();
-		std::thread::spawn(move || loop {
-			let next = receive.lock().unwrap().recv();
-			match next {
-				Ok(conn) => answer(conn, &*handler),
+		let stop = stop.clone();
+		threads.push(std::thread::spawn(move || {
+			while !stop.load(Ordering::Relaxed) {
+				let next = receive.lock().unwrap().recv();
+				match next {
+					Ok(conn) if !stop.load(Ordering::Relaxed) => answer(conn, &*handler),
+					_ => break,
+				}
+			}
+		}));
+	}
+	let stopping = stop.clone();
+	threads.push(std::thread::spawn(move || {
+		while !stopping.load(Ordering::Relaxed) {
+			match listener.accept() {
+				Ok((conn, _)) => {
+					crate::platform::not_inherited(&conn);
+					// Winsock inherits the listener mode; request reads must block.
+					if conn.set_nonblocking(false).is_err() {
+						continue;
+					}
+					// A saturated pool rejects the connection instead of blocking shutdown.
+					let _ = send.try_send(conn);
+				}
+				Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+					std::thread::sleep(Duration::from_millis(20));
+				}
 				Err(_) => break,
 			}
-		});
-	}
-	std::thread::spawn(move || {
-		for conn in listener.incoming() {
-			let Ok(conn) = conn else { continue };
-			crate::platform::not_inherited(&conn);
-			if send.send(conn).is_err() {
-				break;
-			}
 		}
-	});
+	}));
+	Server { stop, threads }
 }
 
 fn answer(mut conn: UnixStream, handler: &(impl Fn(Value) -> Value + ?Sized)) {
@@ -119,5 +154,65 @@ pub fn ask_or_guide(path: &str, request: Value, start_hint: &str) -> String {
 	match ask(path, request) {
 		Ok(reply) => serde_json::to_string_pretty(&reply).unwrap_or_default(),
 		Err(_) => format!("no socket answers at {path} — {start_hint}"),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate as daemon;
+	use serde_json::json;
+	use std::sync::{Condvar, Mutex};
+	use std::time::Duration;
+	struct Fixture(std::path::PathBuf);
+	impl Fixture {
+		fn new() -> Self {
+			let dir = std::env::temp_dir().join(format!("wire-{}", crate::events::fresh_id()));
+			std::fs::create_dir(&dir).unwrap();
+			Self(dir)
+		}
+	}
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+	#[test]
+	fn daemon_socket_services_concurrent_requests() {
+		let fixture = Fixture::new();
+		// Keep socket paths below macOS's 104-byte limit.
+		let path = fixture.0.join("d.sock").to_string_lossy().into_owned();
+		let listener = daemon::wire::bind(&path).unwrap();
+		let gate = (Mutex::new(0), Condvar::new());
+		let server = daemon::wire::serve_concurrent(listener, move |request| {
+			let mut arrived = gate.0.lock().unwrap();
+			*arrived += 1;
+			gate.1.notify_all();
+			let (arrived, _) = gate
+				.1
+				.wait_timeout_while(arrived, Duration::from_secs(3), |n| *n < 3)
+				.unwrap();
+			json!({"overlapped":*arrived >= 3,"n":request["n"]})
+		});
+		std::thread::scope(|scope| {
+			let calls: Vec<_> = (0..3)
+				.map(|n| {
+					let path = &path;
+					scope.spawn(move || daemon::wire::ask(path, json!({"n":n})).unwrap())
+				})
+				.collect();
+			for (n, call) in calls.into_iter().enumerate() {
+				let reply = call.join().unwrap();
+				assert_eq!(reply["n"], n);
+				assert_eq!(reply["overlapped"], true);
+			}
+		});
+		drop(server);
+		assert!(daemon::wire::ask(&path, json!({})).is_err());
+		let listener = daemon::wire::bind(&path).unwrap();
+		let _restarted = daemon::wire::serve_concurrent(listener, |_| json!({"restarted":true}));
+		assert_eq!(
+			daemon::wire::ask(&path, json!({})).unwrap()["restarted"],
+			true
+		);
 	}
 }

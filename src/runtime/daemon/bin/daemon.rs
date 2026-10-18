@@ -24,7 +24,11 @@ fn ask(op: &str) -> String {
 
 fn usage() -> i32 {
 	println!(
-		"daemon — the hot-reload + profiler daemon\n\n\
+		"daemon — the hot-reload + profiler runtime\n\n\
+         \x20 daemon mcp (also the default with no arguments)\n\
+         \x20     serve MCP on stdio and own supervision in this process\n\
+         \x20 daemon --call <tool> '<json>'\n\
+         \x20     call one tool from the shell\n\
          \x20 daemon serve [--detach] [--idle 30m|0] [-- <child command>]\n\
          \x20     watch the sources, rebuild, swap the executable\n\
          \x20     (default child: ./target/release/app); --detach runs it as a\n\
@@ -45,6 +49,9 @@ fn usage() -> i32 {
 fn main() {
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	match args.first().map(String::as_str) {
+		None => std::process::exit(daemon::mcp::run(&[])),
+		Some("mcp") => std::process::exit(daemon::mcp::run(&args[1..])),
+		Some("--call") => std::process::exit(daemon::mcp::run(&args)),
 		Some("serve") => {
 			let (flags, child): (&[String], &[String]) = match args.iter().position(|a| a == "--") {
 				Some(at) => (&args[1..at], &args[at + 1..]),

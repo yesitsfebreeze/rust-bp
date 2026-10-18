@@ -1,8 +1,41 @@
 //! Small process helpers shared by the daemon and the valgrind runner.
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// An owned executable copy keeps Cargo's output writable on Windows.
+/// Give it to the process tree so it is removed only after the process exits.
+pub struct Executable(PathBuf);
+
+impl Executable {
+	pub fn copy(source: &Path, directory: &Path) -> std::io::Result<Self> {
+		use std::sync::atomic::{AtomicU64, Ordering};
+		static NEXT: AtomicU64 = AtomicU64::new(0);
+		std::fs::create_dir_all(directory)?;
+		let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+		let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+		let copy = Self(directory.join(format!(
+			"{stem}-{}-{serial}{}",
+			std::process::id(),
+			std::env::consts::EXE_SUFFIX
+		)));
+		// Own the destination before copying so a failed copy is cleaned too.
+		std::fs::copy(source, &copy.0)?;
+		Ok(copy)
+	}
+
+	pub fn path(&self) -> &Path {
+		&self.0
+	}
+}
+
+impl Drop for Executable {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_file(&self.0);
+	}
+}
 
 /// A process tree owned by this operation (process group on Unix, Job Object
 /// on Windows: [`crate::platform::Group`]). Drop cleans descendants even when
@@ -10,7 +43,7 @@ use std::time::{Duration, Instant};
 pub struct ProcessTree(
 	pub std::process::Child,
 	crate::platform::Group,
-	Option<crate::staging::Executable>,
+	Option<Executable>,
 );
 impl ProcessTree {
 	pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
@@ -19,7 +52,7 @@ impl ProcessTree {
 	}
 
 	/// Remove a staged executable only after this process has exited.
-	pub fn keep_executable(&mut self, executable: Option<crate::staging::Executable>) {
+	pub fn keep_executable(&mut self, executable: Option<Executable>) {
 		self.2 = executable;
 	}
 	/// Ask the tree to stop and wait up to `grace` for the leader to exit, so
@@ -195,4 +228,43 @@ fn run_bounded(
 /// Run `command`, return only whether it succeeded (used to probe docker).
 pub fn succeeds(command: &[String]) -> bool {
 	run_with_timeout(command, Duration::from_secs(10), 0).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+	use crate as daemon;
+	use daemon::util::run_with_timeout;
+	use std::time::Duration;
+
+	#[test]
+	fn deadline_keeps_bounded_diagnostic_output() {
+		let error = run_with_timeout(
+			&[
+				"sh".into(),
+				"-c".into(),
+				"printf timeout-marker >&2; sleep 10".into(),
+			],
+			Duration::from_secs(1),
+			64,
+		)
+		.unwrap_err();
+		assert!(error.contains("timed out"), "{error}");
+		assert!(error.contains("timeout-marker"), "{error}");
+		assert!(error.len() < 100, "{error}");
+	}
+
+	#[test]
+	fn verbose_child_cannot_fill_pipes_and_hang() {
+		let result = run_with_timeout(
+			&[
+				"sh".into(),
+				"-c".into(),
+				"i=0; while [ $i -lt 10000 ]; do echo stdout; echo stderr >&2; i=$((i+1)); done".into(),
+			],
+			Duration::from_secs(5),
+			100,
+		)
+		.unwrap();
+		assert_eq!(result.len(), 100);
+	}
 }

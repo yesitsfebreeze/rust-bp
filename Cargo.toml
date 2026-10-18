@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 # Ordinary Cargo manifests: the workspace loads before any build has run.
-members = ["src/runtime/daemon", "src/runtime/mcp", "src/runtime/reload", "src/modules/counter"]
+members = ["src/runtime/daemon", "src/runtime/reload", "src/modules/counter"]
 default-members = [".", "src/modules/counter"]
 
 [workspace.package]

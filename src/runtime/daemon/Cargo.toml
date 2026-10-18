@@ -8,54 +8,6 @@ default-run = "daemon"
 [lib]
 path = "lib.rs"
 
-[[test]]
-name = "channels"
-path = "../../../tests/daemon/channels.rs"
-
-[[test]]
-name = "dir"
-path = "../../../tests/daemon/dir.rs"
-
-[[test]]
-name = "events"
-path = "../../../tests/daemon/events.rs"
-
-[[test]]
-name = "hot"
-path = "../../../tests/daemon/hot.rs"
-
-[[test]]
-name = "lifecycle"
-path = "../../../tests/daemon/lifecycle.rs"
-
-[[test]]
-name = "lsp"
-path = "../../../tests/daemon/lsp.rs"
-
-[[test]]
-name = "native"
-path = "../../../tests/daemon/native.rs"
-
-[[test]]
-name = "profiles"
-path = "../../../tests/daemon/profiles.rs"
-
-[[test]]
-name = "usage"
-path = "../../../tests/daemon/usage.rs"
-
-[[test]]
-name = "util"
-path = "../../../tests/daemon/util.rs"
-
-[[test]]
-name = "valgrind"
-path = "../../../tests/daemon/valgrind.rs"
-
-[[test]]
-name = "watch"
-path = "../../../tests/daemon/watch.rs"
-
 [[bin]]
 name = "daemon"
 path = "bin/daemon.rs"
@@ -68,16 +20,9 @@ path = "bin/rustc-events.rs"
 name = "viz"
 path = "bin/viz.rs"
 
-[[bin]]
-name = "mcp-usage-hook"
-path = "bin/mcp-usage-hook.rs"
-
-[[test]]
-name = "mcp_usage_hook"
-path = "../../../tests/daemon/mcp_usage_hook.rs"
-
 [dependencies]
 serde_json.workspace = true
+ureq.workspace = true
 signal-hook.workspace = true
 url = "2"
 
@@ -87,4 +32,4 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Time"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Time"] }

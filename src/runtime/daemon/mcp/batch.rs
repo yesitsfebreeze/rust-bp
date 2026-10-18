@@ -34,10 +34,8 @@ pub fn sequential(tool: &str, args: &Value) -> bool {
 	match tool {
 		"lsp" => args["method"] == "diagnostics",
 		"ast_grep" => args["apply"] == true,
-		"events" => args.get("subscribe_thread").is_some() || args["unsubscribe"] == true,
-		"docs" | "audit" | "usage" | "compare" | "status" | "channels" | "runs" | "show" | "rank" => {
-			false
-		}
+		"events" | "docs" | "audit" | "usage" | "compare" | "status" | "channels" | "runs" | "show"
+		| "rank" => false,
 		"reload" | "stop" | "benchmark" | "valgrind_run" | "memory_report" => true,
 		_ => true,
 	}
@@ -138,5 +136,124 @@ pub fn execute(
 		Err(text)
 	} else {
 		Ok(text)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::mcp::batch;
+	use serde_json::{json, Value};
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::{Condvar, Mutex};
+	use std::time::Duration;
+	#[test]
+	fn single_item_keeps_the_original_response() {
+		assert_eq!(
+			batch::execute("show", &json!({"name":"one"}), |args| {
+				assert_eq!(args["name"], "one");
+				Ok("plain text".into())
+			})
+			.unwrap(),
+			"plain text"
+		);
+	}
+
+	#[test]
+	fn invalid_envelopes_never_execute_any_item() {
+		for args in [
+			Value::Null,
+			json!([]),
+			json!({"items":null}),
+			json!({"items":[]}),
+			json!({"items":vec![json!({});33]}),
+			json!({"items":[{},null]}),
+			json!({"items":[{"items":[{}]}]}),
+			json!({"items":[{"concurrency":1}]}),
+			json!({"items":[{}],"name":"mixed"}),
+			json!({"concurrency":2}),
+			json!({"items":[{}],"concurrency":0}),
+			json!({"items":[{}],"concurrency":9}),
+			json!({"items":[{}],"concurrency":1.5}),
+			json!({"items":[{}],"concurrency":"2"}),
+		] {
+			assert!(
+				batch::execute("reload", &args, |_| panic!("invalid batch executed")).is_err(),
+				"{args}"
+			);
+		}
+	}
+
+	#[test]
+	fn read_batches_overlap_with_a_bound_and_preserve_order_and_errors() {
+		let active = AtomicUsize::new(0);
+		let peak = AtomicUsize::new(0);
+		let gate = (Mutex::new(false), Condvar::new());
+		let args = json!({"items":(0..10).map(|n| json!({"n":n})).collect::<Vec<_>>(),"concurrency":3});
+		let reply = batch::execute("show", &args, |item| {
+			let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+			peak.fetch_max(current, Ordering::SeqCst);
+			let mut opened = gate.0.lock().unwrap();
+			if current == 3 {
+				*opened = true;
+				gate.1.notify_all();
+			}
+			let (opened, _) = gate
+				.1
+				.wait_timeout_while(opened, Duration::from_secs(3), |open| !*open)
+				.unwrap();
+			assert!(*opened, "items did not overlap");
+			drop(opened);
+			let n = item["n"].as_u64().unwrap();
+			std::thread::sleep(Duration::from_millis(10 - n));
+			active.fetch_sub(1, Ordering::SeqCst);
+			if n == 3 {
+				Err("missing run".into())
+			} else {
+				Ok(n.to_string())
+			}
+		})
+		.unwrap_err();
+		let reply: Value = serde_json::from_str(&reply).unwrap();
+		assert_eq!(peak.load(Ordering::SeqCst), 3);
+		assert_eq!(reply["failed"], 1);
+		assert_eq!(reply["skipped"], 0);
+		for (n, result) in reply["results"].as_array().unwrap().iter().enumerate() {
+			assert_eq!(result["index"], n);
+			assert_eq!(result["result"]["error"], n == 3);
+			assert_eq!(
+				result["result"]["content"],
+				if n == 3 {
+					"missing run".into()
+				} else {
+					n.to_string()
+				}
+			);
+		}
+	}
+
+	#[test]
+	fn mutations_run_in_order_and_stop_without_rolling_back() {
+		let seen = Mutex::new(Vec::new());
+		let reply = batch::execute(
+			"ast_grep",
+			&json!({"items":[
+        {"n":0}, {"n":1,"apply":true}, {"n":2}
+    ],"concurrency":8}),
+			|item| {
+				let n = item["n"].as_u64().unwrap();
+				seen.lock().unwrap().push(n);
+				if n == 1 {
+					Err("rewrite failed".into())
+				} else {
+					Ok("done".into())
+				}
+			},
+		)
+		.unwrap_err();
+		assert_eq!(*seen.lock().unwrap(), vec![0, 1]);
+		let reply: Value = serde_json::from_str(&reply).unwrap();
+		assert_eq!(reply["failed"], 1);
+		assert_eq!(reply["skipped"], 1);
+		assert_eq!(reply["results"][0]["result"]["content"], "done");
 	}
 }

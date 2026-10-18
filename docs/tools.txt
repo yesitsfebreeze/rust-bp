@@ -11,13 +11,13 @@ Paths and commands are relative to the repository root. Examples use the default
 | `status` | structured daemon state and readiness; `start:false` inspects without starting |
 | `reload` / `stop` | rebuild-and-swap (`wait:true` waits for success/failure) / idempotent stop |
 | `channels` | live snapshot; `top` limits rows, `filter` selects name substrings; quantiles are approximate bucket lower bounds |
-| `memory_report` | native `leaks` (+`heap`) on the live executable, pid defaults to the supervised app |
+| `memory_report` | live process memory counters on Windows/Linux/macOS, plus macOS `leaks` and optional `heap`; defaults to the app PID |
 | `valgrind_run` | one callgrind or memcheck run, parsed and stored under `valgrind/` in the daemon dir |
 | `runs` / `show` | filter/sort runs with timing and age / compact report (`raw:true` includes benchmark snapshots; `group_by_function:true` groups Callgrind self costs) |
 | `rank` | `mode:auto` uses Jev when configured, otherwise local measured-cost/error-class ordering; `local` and `jev` select explicitly |
 | `benchmark` | native timings and channel summaries; `warmups` defaults to 1; records SHA-256 of executable and sample spread |
 | `compare` | guarded before/after instruction, allocation, or native timing comparisons |
-| `events` | compiler events by default; `kind:all` or exact kind; forward paging via `cursor`/`next_cursor`; opt-in delivery |
+| `events` | compiler events by default; `kind:all` or exact kind; forward paging via `cursor`/`next_cursor`; standard MCP failure notifications |
 | `lsp` | rust-analyzer, owned by the daemon: `definition` / `references` / `hover` (file, line, col), `symbols` (query), `diagnostics` (cargo check), `status`, `rename` (new_name), `call_hierarchy` (direction), `code_actions`; edits are previews, raw LSP ranges use zero-based UTF-16 |
 | `ast_grep` | structural search or rewrite with ast-grep: a `pattern` (+ `rewrite`) or a YAML `rule`; dry run unless `apply` |
 | `audit` | read-only failure and latency evidence; `mode:local` uses no external service |
@@ -52,7 +52,7 @@ CLI exit), while preserving successful results in the same response.
 | Execution | Tools |
 | --- | --- |
 | Parallel reads | `docs`, `lsp` navigation/status/edit previews, `ast_grep` previews, `events` reads, `audit`, `usage`, `compare`, `status`, `channels`, `runs`, `show`, `rank` |
-| Sequential, stop on first error | `reload`, `stop`, `benchmark`, `valgrind_run`, `memory_report`; any batch containing `lsp` diagnostics, `ast_grep apply:true`, or an `events` subscription change |
+| Sequential, stop on first error | `reload`, `stop`, `benchmark`, `valgrind_run`, `memory_report`; any batch containing `lsp` diagnostics, `ast_grep apply:true` |
 
 A sequential batch keeps input order and reports the unexecuted tail in
 `skipped`. Completed effects are not rolled back. Profiling runs are serialized
@@ -75,12 +75,11 @@ Use `docs {"query":"profiling"}` or a specific topic only when a workflow needs
 explanation; all guides are offline and support batching. Full audit recovery
 instructions are available under `docs {"topic":"audit"}` when an alert occurs.
 Conversation and subjective tooling feedback need no startup calls. Repository
-workflow selection lives in `docs/workflow.txt`; installed skills are not a checklist.
+workflow selection lives in `SYSTEM.md`; installed skills are not a checklist.
 
 Three failures of the same recorded operation, source, arguments and working
 directory within ten minutes, without a matching success, set
-`audit_required:true`. External hooks omit arguments, so their alerts group
-by the recorded tool identity. Other successful calls and running an audit
+`audit_required:true`. Other successful calls and running an audit
 do not clear the alert. A matching successful operation resets its streak;
 window expiry alone does not prove a repair.
 
@@ -91,12 +90,9 @@ when an alert is attached. Batch results and success/error status are preserved.
 Malformed calls also count as failures. Counts cover recorded failure events;
 nested compiler/model/tool failures can describe the same underlying defect.
 
-On an alert, run `audit {"mode":"local"}`, then delegate the problem to a
-subagent with the evidence, expected behavior and a bounded scope. Use one
-worker per distinct problem. Reproduce, fix the root cause, rerun the exact
-operation, and audit with `since_ms` set to the repair start. Verify the
-subagent's result; an empty audit window is not evidence of success. If the
-host lacks subagents, follow that workflow directly and report the limitation.
-Audit diagnoses and supplies instructions; the host agent performs repairs.
+On an alert, run `audit {"mode":"local"}`. Use the evidence, expected behavior
+and bounded scope to reproduce and fix the root cause. Rerun the exact operation,
+then audit with `since_ms` set to the repair start. An empty audit window is
+not evidence of success. Audit diagnoses; the agent performs and verifies repairs.
 Intentional negative tests are not automatically defects.
 

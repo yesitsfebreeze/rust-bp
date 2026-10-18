@@ -1,0 +1,64 @@
+Install the runtime MCP
+
+1. Open the project root. Install stable Rust/Cargo with rustup.
+   Windows: Windows 10 1803+ and the MSVC C++ build tools with Windows SDK.
+   Linux/macOS: the platform C/C++ linker/build tools.
+   For recipes and tests, install just and Bash/Perl (Git for Windows includes
+   Bash/Perl; put Git's bin directory on PATH).
+
+2. Install code intelligence and build the runtime:
+
+   rustup component add rust-analyzer rustfmt clippy
+   cargo install ast-grep --locked
+   cargo build --release --locked -p daemon --bin daemon
+
+   The runtime builds the app/modules when requested. Optional project rename:
+   bash setup.sh my-project
+
+3. Register ONE stdio MCP server using the client's supported configuration:
+
+   command: absolute path to target/release/daemon.exe on Windows,
+            or target/release/daemon on Linux/macOS
+   arguments: ["mcp"]
+   working directory: absolute path to this project root
+   environment: inherit PATH with Cargo, rust-analyzer and ast-grep available
+
+   Do not start another supervisor for MCP. The executable contains the MCP
+   server and starts its supervisor in the same process on demand. Stdout is
+   JSON-RPC only; diagnostics go to stderr and app output to daemon.log.
+   Use an argument array, not a shell command string. No launcher script or
+   separate MCP executable is needed.
+
+4. Load SYSTEM.md through the agent's supported project-instruction mechanism.
+   If it requires a particular entry filename, create a local reference to
+   SYSTEM.md. Keep project rules in SYSTEM.md as the single source.
+
+5. Connect, initialize MCP and list tools. Call:
+
+   status {"start":false}
+   reload {"wait":true}
+   channels {}
+   lsp {"method":"status"}
+   memory_report {}
+
+   The first call inspects without starting the app. Reload builds/runs it;
+   readiness and channel values confirm the live app. LSP indexing may take
+   time. Stop with stop {}; MCP stays connected for the next reload.
+   Disconnecting MCP also closes its owned app, supervisor and language server.
+   To rebuild the runtime executable, disconnect first and reconnect afterward.
+
+Optional profiling:
+   Install native Valgrind on Linux, or install/start Docker and build the image:
+   docker build -f valgrind.Dockerfile -t valgrind-v2 .
+   Valgrind runs a separate, bounded workload; it does not attach to the live app.
+   memory_report reads live process counters on Windows/Linux/macOS; macOS also
+   offers leaks/heap. channels reads the app's instrumented values and timings.
+   Local ranking needs no service. Jev ranking optionally uses TYPESAFE_API_KEY.
+   See docs/profiling.txt.
+
+Troubleshooting:
+   Run the exact registered executable from the project root and check stderr.
+   Verify PATH in the MCP client's environment and use matching manifests/lockfile.
+   cargo run --release -p daemon -- dir prints the project log/state directory.
+   DAEMON_DIR overrides it for isolated checks. just smoke verifies the real
+   stdio connection, runtime ownership, code intelligence and stateful reload.

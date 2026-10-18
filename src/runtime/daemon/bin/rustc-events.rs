@@ -1,7 +1,7 @@
 //! `rustc-events` — a Cargo `RUSTC_WRAPPER`: runs the compiler unchanged
 //! (stdout, stdin, jobserver fds and exit status pass through), appends one
 //! `compile_finished` / `compile_failed` event per crate to `events.jsonl`
-//! in the project's daemon dir, and hands failures to `daemon::events::notify`.
+//! in the project's daemon dir, for the runtime's MCP notification stream.
 //!
 //! Opt-in, and then for every build: Cargo fingerprints include the wrapper,
 //! so builds with and without it recompile each other's work. Install it once
@@ -84,7 +84,6 @@ fn main() {
 				"compile_failed"
 			};
 			match daemon::events::publish(kind, data) {
-				Ok(event) if code != 0 => daemon::events::notify(&event),
 				Ok(_) => (),
 				Err(error) => eprintln!("event recording failed: {error}"),
 			}

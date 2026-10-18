@@ -1,33 +1,35 @@
 # Testing
 
-Documentation index: [llms.txt](../llms.txt).
-Paths and commands are relative to the repository root. Examples use the default app name, `app`.
+Tests live with implementation under #[cfg(test)], including embedded source
+fixtures written to temporary checkouts when a compiler or process is needed.
 
-## Repeatable checks
+    cargo test --workspace --locked
+    just ci
+    just smoke
 
-```sh
-cargo test --workspace --locked
-cargo test -p mcp --test integration -- --ignored --nocapture check
-# Daemon lifecycle only, without the profilers:
-CHECK_JOURNEY=lifecycle cargo test -p mcp --test integration -- --ignored --nocapture check
-# Also exercise the real Jev service (requires TYPESAFE_API_KEY):
-CHECK_LIVE_JEV=1 cargo test -p mcp --test integration -- --ignored --nocapture check
-```
+just smoke runs two ignored tests in src/runtime/daemon/mcp/mod.rs.
+The lifecycle journey builds an isolated workspace and exercises the real
+runtime's stdio MCP connection, tool listing, LSP, live memory, channel reads,
+reload, compiler notifications, failure recovery, stop/restart and EOF cleanup.
+It verifies the supervisor PID is the MCP PID and its app/language server close.
+The stateful journey uses the actual starter and counter module to prove module
+swaps preserve PID/state, app rebuilds restore both states, and failed snapshots
+leave the old process serving. CI runs both journeys on Windows/Linux/macOS.
 
-The `check` test copies the workspace into an owned temporary directory, replaces
-its main with `tests/fixtures/workload.rs`, and checks the advertised tool contract and exercises the tools over the persistent stdio MCP launcher.
-It asserts PID swaps, preservation of the app after a deliberate compile
-error, compiler notifications, native memory inspection (macOS), both Valgrind
-modes, comparison arithmetic, source context, ranking, and worker replacement
-without reconnecting. Linux checks the explicit unsupported-platform result
-for native memory tools. Default ranking uses a local Jev protocol fixture;
-`CHECK_LIVE_JEV=1` uses the external service. Docker must be running when native
-Valgrind is unavailable. The temporary checkout and its isolated build artifacts
-are removed after the test.
+For the complete profiling journey:
 
-`just smoke` also runs `stateful_reload` with the actual starter app and counter
-module, proving same-process module swaps, app-state handoff and preservation
-of the old process on a snapshot write failure. The CI matrix runs `just ci`
-and both smoke journeys on Windows, Linux and macOS. The separate Docker/signal
-regression fixture remains Unix-only; native memory inspection remains macOS-only.
+    just e2e
+
+It runs native benchmarks and both Valgrind modes, checks comparisons, source
+context and rankings, and uses a local Jev protocol fixture by default.
+Install native Valgrind or start Docker and build the profiler image first.
+CHECK_LIVE_JEV=1 switches to the external service and requires TYPESAFE_API_KEY.
+just regressions exercises Docker timeout/cancellation cleanup on Unix.
+
+Direct lifecycle invocation (Bash):
+
+    CHECK_JOURNEY=lifecycle cargo test --locked -p daemon --lib mcp::integration_tests::check -- --ignored --nocapture --exact
+
+Tests create owned temporary workspaces and isolated logs, then clean them up.
+Intentional compile failures and panic fixtures are expected test evidence.
 

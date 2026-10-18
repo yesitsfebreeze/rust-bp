@@ -17,7 +17,3 @@ host = ["dep:daemon", "dep:libloading", "dep:serde_json"]
 daemon = { path = "../daemon", optional = true }
 libloading = { version = "0.8", optional = true }
 serde_json = { workspace = true, optional = true }
-
-[[test]]
-name = "reload"
-path = "../../../tests/reload/reload.rs"

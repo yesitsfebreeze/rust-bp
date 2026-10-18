@@ -1,14 +1,4 @@
-//! Native memory debugging — on the machine, against the live process,
-//! nothing containerized. On macOS that is the system's own tools (a
-//! valgrind does not exist on Apple Silicon):
-//!
-//! - `leaks <pid>` — leaked bytes with the call stacks that allocated them;
-//! - `heap <pid>`  — the live heap's allocation classes and sizes.
-//!
-//! For a graphics program this is the only honest view: Metal, the window
-//! server and the driver's allocations all live in the same process the
-//! tools read. The MCP `memory_report` tool wraps both; on other platforms
-//! it names that it is macOS-only.
+//! Live process memory accounting on each platform, plus macOS leaks/heap.
 
 use crate::util;
 use std::time::Duration;
@@ -80,4 +70,46 @@ pub fn summarize(text: &str, backtraces: usize) -> String {
 		));
 	}
 	out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+	use crate as daemon;
+	use daemon::native::summarize;
+
+	#[test]
+	fn live_process_memory_is_readable() {
+		let report = crate::platform::memory_usage(std::process::id()).unwrap();
+		assert!(report["resident_bytes"].as_u64().unwrap() > 0, "{report}");
+		assert!(crate::platform::memory_usage(u32::MAX).is_err());
+	}
+
+	#[test]
+	fn a_leaks_reply_compresses_to_summary_and_stacks() {
+		let text = "\
+Process 1234: 4 nodes malloced for 1024 bytes
+Process 1234: 2 leaks for 320 total leaked bytes.
+
+Stack backtrace for leak 1: 320 bytes
+0   app                                0x1000 _foo + 32
+1   app                                0x2000 _main + 48
+
+Stack backtrace for leak 2: 64 bytes
+0   app                                0x1000 _bar + 32
+";
+		let summary = summarize(text, 1);
+		assert!(summary.contains("2 leaks for 320"), "{summary}");
+		assert!(summary.contains("leak 1"), "{summary}");
+		assert!(summary.contains("2 leak call stacks total"), "{summary}");
+		assert!(!summary.contains("_bar"), "{summary}");
+		assert!(!summary.contains("nodes malloced"), "{summary}");
+	}
+
+	#[test]
+	fn a_clean_leaks_reply_says_so() {
+		let text = "Process 1234: 100 nodes malloced for 4096 bytes\nProcess 1234: 0 leaks for 0 total leaked bytes.\n";
+		let summary = summarize(text, 5);
+		assert!(summary.contains("0 leaks"), "{summary}");
+		assert!(summary.contains("no leaks"), "{summary}");
+	}
 }

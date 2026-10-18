@@ -1,22 +1,9 @@
-use daemon::events::{log_path, subscription_path};
+use crate as daemon;
+use daemon::events::log_path;
 use serde_json::{json, Value};
 
 pub fn tool(args: &Value) -> Result<String, String> {
 	daemon::ensure_dir().map_err(|e| e.to_string())?;
-	let subscription = subscription_path();
-	if let Some(thread) = args["subscribe_thread"].as_str() {
-		if thread.len() != 36 || !thread.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-') {
-			return Err("subscribe_thread must be an explicit Codex session UUID".into());
-		}
-		std::fs::write(&subscription, thread).map_err(|e| e.to_string())?;
-	}
-	if args["unsubscribe"].as_bool() == Some(true) {
-		match std::fs::remove_file(&subscription) {
-			Ok(_) => (),
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-			Err(e) => return Err(e.to_string()),
-		}
-	}
 	let log = log_path();
 	let text = match std::fs::read_to_string(&log) {
 		Ok(text) => text,
@@ -24,7 +11,6 @@ pub fn tool(args: &Value) -> Result<String, String> {
 		Err(e) => return Err(e.to_string()),
 	};
 	let mut reply = select(&text, args);
-	reply["subscribed_thread"] = json!(std::fs::read_to_string(&subscription).ok());
 	reply["log"] = json!(log.display().to_string());
 	Ok(reply.to_string())
 }
@@ -72,4 +58,34 @@ pub fn select(text: &str, args: &Value) -> Value {
 		events.drain(..events.len() - limit);
 	}
 	json!({"events":events,"next_cursor":next_cursor,"cursor_reset":original_cursor.is_some_and(|c| c>text.len() as u64)})
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::mcp;
+	#[test]
+	fn compiler_event_pages_do_not_lose_equal_timestamps_or_partial_lines() {
+		let log = "{\"kind\":\"tool_call\",\"time_ms\":1}\n{\"kind\":\"compile_failed\",\"time_ms\":1,\"id\":\"a\"}\n{\"kind\":\"compile_failed\",\"time_ms\":1,\"id\":\"b\"}\n{\"kind\":";
+		let first = mcp::events::select(log, &serde_json::json!({"cursor":0,"limit":1}));
+		assert_eq!(first["events"][0]["id"], "a");
+		let second = mcp::events::select(
+			log,
+			&serde_json::json!({"cursor":first["next_cursor"],"limit":1}),
+		);
+		assert_eq!(second["events"][0]["id"], "b");
+		let last = mcp::events::select(log, &serde_json::json!({"cursor":second["next_cursor"]}));
+		assert_eq!(last["next_cursor"], second["next_cursor"]);
+		assert_eq!(last["events"], serde_json::json!([]));
+		assert_eq!(
+			mcp::events::select(log, &serde_json::json!({"kind":"all"}))["events"]
+				.as_array()
+				.unwrap()
+				.len(),
+			3
+		);
+		assert_eq!(
+			mcp::events::select(log, &serde_json::json!({"cursor":99999}))["cursor_reset"],
+			true
+		);
+	}
 }

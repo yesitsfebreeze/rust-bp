@@ -1,111 +1,34 @@
 # Activity and compiler events
 
 Documentation index: [llms.txt](../llms.txt).
-Paths and commands are relative to the repository root. Examples use the default app name, `app`.
 
-## Live activity
+just viz shows the project's own tool calls and builds: time, duration, outcome,
+inputs and audit alerts. j/k or arrows move, g/G go newest/oldest, q quits.
+The clock advances even without new events. Historical failure counts remain
+after recovery. Use cargo run --release -p daemon --bin viz -- --once for a
+snapshot or --heatmap for the timeline. Unrecorded activity is not proof of success.
 
-`just viz` shows local time, outcome, duration and the operation. Its clock
-updates once a second even when no events arrive; `HISTORY (g follows)`
-means the cursor is browsing older events. Press `g` to follow new calls.
-The selected row uses reverse video. Result labels are green for success,
-red for failure and yellow for unknown outcomes. The header always retains
-total error and failed-call counts plus active audit alerts; selecting a row
-shows counts for that operation and its recorded inputs. Historical counts
-remain after recovery. Header red means an active alert, yellow means past
-failures, and green means no recorded errors.
-Use `cargo run --release -p daemon --bin viz -- --once` for a snapshot or
-`--heatmap` for the colour timeline.
+The runtime records to events.jsonl. cargo run -q -p daemon -- dir prints its
+directory; DAEMON_DIR overrides it for isolated tests. Only the runtime's own
+usage is tracked. No agent-specific notification or usage adapters are needed.
 
-The app MCP and daemon builds record directly. To include **all MCP servers
-called by Codex in this repository**, build once with `cargo build --release`,
-then review and trust the project's PreToolUse/PostToolUse entries in Codex
-`/hooks` and start/resume a session that loads them. This is the
-[Codex hook trust requirement](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks);
-installing a hook does not activate it automatically.
+MCP streams compile_failed events as standard notifications/message records.
+The client's notification handling determines how these are displayed.
+Use events {"errors_only":true} to inspect stored failures at any time.
+kind:all includes tool activity; next_cursor supports paging.
 
-`.codex/hooks.json` runs the small Rust `mcp-usage-hook` binary. It records
-server/tool name, session/call IDs, elapsed time and outcome in the same
-project log. Arguments and response bodies are omitted. The app MCP's own
-calls are not duplicated. Calls are recorded when completed; a missing
-pre-hook leaves duration unknown. Native shell/file calls and other projects
-are outside this MCP feed. Tests use isolated logs, so their calls do not
-appear in your project's viewer. `cargo run -q -p daemon -- dir` prints the
-log directory (`events.jsonl`); `DAEMON_DIR` overrides it.
+The supervisor records one event per build. Optional per-crate compiler events:
 
+    cargo install --path src/runtime/daemon --bin rustc-events
 
-## Live compiler events in Codex
+Configure RUSTC_WRAPPER=rustc-events or a local .cargo/config.toml with
+[build] rustc-wrapper = "rustc-events". Keep it stable: Cargo fingerprints
+include the wrapper, so toggling it triggers rebuilds. Compiler output and exit
+status are preserved; the supervisor avoids duplicate events.
 
-The daemon records every build it runs in the daemon dir's `events.jsonl`: one
-`compile_finished` or `compile_failed` event with the build's diagnostics
-(`daemon::events`). Terminal builds are not captured by default. To record
-every crate of every build, including terminal ones, install the compiler
-wrapper once and configure it for all builds — Cargo fingerprints include the
-wrapper, so switching it on and off recompiles everything each time:
-
-```sh
-cargo install --path src/runtime/daemon --bin rustc-events
-# then, in a .cargo/config.toml that is not checked in (or RUSTC_WRAPPER=rustc-events):
-# [build]
-# rustc-wrapper = "rustc-events"
-```
-
-The wrapper preserves compiler output and exit status. When it records a
-build's crates, the daemon adds no event of its own.
-
-Subscribe the intended session once with the MCP `events` tool:
-
-```json
-{"subscribe_thread":"YOUR-CODEX-SESSION-UUID"}
-```
-
-Failures are sent to that session with `codex queue --thread ... --message ...`.
-The launcher also streams live MCP error notifications; these alone do not
-guarantee the host wakes an agent. Queue acceptance/failure is recorded in the
-event log, and full diagnostics remain there even when the queued message is
-truncated. Each event is claimed to avoid duplicate delivery by a compiler
-wrapper and launcher. Native builds can queue messages without the launcher;
-container builds need the host launcher running to deliver their events.
-Use `events {"errors_only":true}` to inspect failures, or
-`events {"unsubscribe":true}` to stop queued messages. A subscription persists
-in this workspace; update it when switching sessions.
-
-To queue one intentionally broken build to the current session (the isolated
-harness restores the file):
-
-```sh
-CHECK_LIVE_JEV=1 CHECK_NOTIFY_THREAD="$CODEX_THREAD_ID" \
-  cargo test -p mcp --test integration -- --ignored --nocapture check
-# After the failure message arrives in that session:
-cargo test -p mcp --test integration -- --ignored --nocapture verify_receipt
-```
-
-Queue success is recorded as `notification_queued`, not a delivery receipt.
-The receipt verifier requires the exact event ID in an incoming user message
-in the named session's persisted transcript. An accepted queue request alone
-cannot pass it; the message may arrive after the active turn finishes.
-
-Run `cargo test -p mcp --test integration -- --ignored --nocapture regressions`
-for the audit regressions, including real Docker timeout/cancellation cleanup.
-It requires a running Docker daemon and the profiler image. The normal
-integration suite uses a local Jev fixture; `CHECK_LIVE_JEV=1` uses the
-configured external service and starts no fixture server.
-
-Profile names accept only ASCII letters, digits, hyphens and underscores.
-Native comparisons check counts in every recorded repetition. Input files and
-unrecorded environment variables must still be held constant by the caller.
-Source links identify unique matching definitions in the current checkout;
-ambiguous matches are omitted. Memcheck errors use the raw `ERROR SUMMARY`,
-while finding counts describe displayed records or leaked blocks.
-
-Commands own process groups and clean them on exit, timeout, SIGINT and SIGTERM.
-Docker jobs have unique container names and remove their container after failure
-or cancellation. SIGKILL and deliberately detached daemons cannot be cleaned by
-an in-process handler. Cleanup errors are reported rather than counted as success.
-
-If a fresh Codex session reports an initialization failure, run
-`cargo build --release --locked -p mcp` in that workspace. The entry script
-prints startup build diagnostics to stderr; retry after correcting the build. If Cargo reports an outdated lockfile after copying or changing
-manifests, run `cargo build --release -p mcp` once, review `Cargo.lock`,
-then retry. Copy manifests and the matching lockfile together.
+Commands own process trees and clean up on completion, timeout and cancellation.
+Docker jobs have unique names and remove their containers. Cleanup failures are
+reported; abrupt process termination cannot execute an in-process cleanup handler.
+For startup problems, check the registered runtime path, cwd and stderr, following
+[install.txt](../install.txt). See [testing](testing.txt) for isolated failure tests.
 

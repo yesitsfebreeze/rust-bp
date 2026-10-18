@@ -9,7 +9,7 @@ default:
 
 # ---- build ----
 
-# Build; `just setup <name>` renames the demo crate and the MCP server.
+# Build; `just setup <name>` renames the demo app.
 [group('build')]
 setup *name:
     ./setup.sh "$@"
@@ -54,18 +54,18 @@ test:
 # End-to-end check in an isolated harness (CHECK_LIVE_JEV=1: real Jev).
 [group('check')]
 e2e:
-    cargo test -p mcp --test integration -- --ignored --nocapture check
+    cargo test --locked -p daemon --lib mcp::integration_tests::check -- --ignored --nocapture --exact
 
 # Fast end-to-end daemon, MCP and code-intelligence journey; no Docker or API key.
 [group('check')]
 smoke:
-    CHECK_JOURNEY=lifecycle cargo test --locked -p mcp --test integration -- --ignored --nocapture --exact check
-    cargo test --locked -p mcp --test integration -- --ignored --nocapture --exact stateful_reload
+    CHECK_JOURNEY=lifecycle cargo test --locked -p daemon --lib mcp::integration_tests::check -- --ignored --nocapture --exact
+    cargo test --locked -p daemon --lib mcp::integration_tests::stateful_reload -- --ignored --nocapture --exact
 
 # Audit regressions, incl. Docker timeout and cancellation cleanup; needs a daemon and the image.
 [group('check')]
 regressions:
-    cargo test -p mcp --test integration -- --ignored --nocapture regressions
+    cargo test --locked -p daemon --lib mcp::integration_tests::regressions -- --ignored --nocapture --exact
 
 # What CI runs: format check, clippy, tests.
 [group('check')]
@@ -89,12 +89,12 @@ daemon *args:
 # Call one MCP tool from the shell: `just call status`, `just call rank '{"name":"demo"}'`.
 [group('run')]
 call tool *json:
-    cargo run --release -p mcp -- --call "$@"
+    cargo run --release -p daemon -- --call "$@"
 
-# The MCP server on stdio, as .mcp.json starts it.
+# The runtime's built-in MCP server on stdio.
 [group('run')]
 mcp:
-    ./mcp.sh
+    cargo run --release -p daemon -- mcp
 
 # The live session stream in the terminal: one column per tool, crate, model, file, symbol and run, calls stacked newest at the bottom (q quits).
 [group('run')]

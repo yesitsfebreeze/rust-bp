@@ -1,26 +1,16 @@
 # rust-boilerplate
 
-> A Rust starter with a hello-world app and a local MCP harness for building, reloading, inspecting, and profiling your code.
+> A Rust starter with one runtime MCP for building, reloading, inspecting and profiling.
 
-The application starts in `src/main.rs`, retaining a tick count and a dynamically loaded counter module across reloads.
-Reusable tooling lives in `src/runtime/`; instrumented test workloads live in `tests/fixtures/`.
-Read the workflow for repository work, then load only the guides relevant to the task.
-Links are relative to this file. Guide paths and commands are relative to the repository root.
+The app starts in src/main.rs; reusable runtime code lives in src/runtime/.
+Tests live beside implementation. Load only the guides relevant to the task.
 
-## Development
-
-- [Getting started](docs/getting-started.txt): Requirements, layout, build commands, project naming, and first run.
-- [Repository workflow](docs/workflow.txt): Task scope, editing, verification, and evidence requirements.
-- [Architecture](docs/architecture.txt): Daemon, MCP launcher and worker, optional channels, and build profiles.
-- [Stateful reload](docs/reload.txt): Module ABI, app checkpoints, failure behavior and the counter example.
-- [Testing](docs/testing.txt): Unit tests, isolated lifecycle checks, and profiling integration tests.
-
-## Tools
-
-- [Agent setup](docs/agent-setup.txt): Connect an MCP host and understand worker rebuilds.
-- [MCP tools](docs/tools.txt): Tool reference, batch requests, startup guidance, and failure recovery.
-
-## Optional
-
-- [Profiling](docs/profiling.txt): Instrumentation, memory inspection, Valgrind, and before/after comparisons.
-- [Events and activity](docs/events.txt): Activity viewer, compiler events, notifications, and troubleshooting.
+- [Install](install.txt): Prerequisites, one executable to register, connection checks.
+- [System instructions](SYSTEM.md): Development workflow, ownership and verification.
+- [Getting started](docs/getting-started.txt): Layout, commands and project naming.
+- [Architecture](docs/architecture.txt): Runtime, app, LSP, channels and build profiles.
+- [Stateful reload](docs/reload.txt): Module ABI, app checkpoints and failure behavior.
+- [Testing](docs/testing.txt): Colocated tests and isolated runtime journeys.
+- [MCP tools](docs/tools.txt): Tool reference, batching and failure recovery.
+- [Profiling](docs/profiling.txt): Live memory, instrumentation, Valgrind and comparisons.
+- [Events](docs/events.txt): Activity viewer and standard MCP compiler notifications.

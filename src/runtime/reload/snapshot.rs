@@ -78,3 +78,24 @@ pub fn read() -> Result<BTreeMap<String, Vec<u8>>, String> {
 	let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
 	decode(&bytes)
 }
+
+#[cfg(test)]
+mod tests {
+	use crate::snapshot;
+	use std::collections::BTreeMap;
+	#[test]
+	fn snapshot_validates_lengths_names_and_duplicate_entries() {
+		let entries = BTreeMap::from([
+			("app:score".into(), vec![1, 2, 3]),
+			("module:empty".into(), vec![]),
+		]);
+		let bytes = snapshot::encode(&entries);
+		assert_eq!(snapshot::decode(&bytes).unwrap(), entries);
+		assert!(snapshot::decode(b"wrong format").is_err());
+		assert!(snapshot::decode(&bytes[..bytes.len() - 1]).is_err());
+		let one = snapshot::encode(&BTreeMap::from([("same".into(), vec![7])]));
+		let mut duplicate = one.clone();
+		duplicate.extend_from_slice(&one[b"reload-snapshot-1\n".len()..]);
+		assert!(snapshot::decode(&duplicate).is_err());
+	}
+}

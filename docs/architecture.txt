@@ -1,64 +1,45 @@
 # Runtime architecture
 
 Documentation index: [llms.txt](../llms.txt).
-Paths and commands are relative to the repository root. Examples use the default app name, `app`.
 
-## How it works
+The registered runtime executable owns MCP and supervision in one process:
 
-Three processes, two local sockets (AF_UNIX on Windows, Linux and macOS), one directory:
+    agent --stdio/JSON-RPC--> daemon mcp
+                              |-- supervisor + daemon.sock
+                              |-- rust-analyzer (started on demand)
+                              |-- app + app.sock (live channels/state)
+                              |-- bounded profiling commands
 
-```text
-agent ──stdio/JSON-RPC──▶ mcp-launcher ──per request──▶ target/release/mcp
-                                                              │ <daemon dir>/daemon.sock
-                                                              ▼
-                              cargo build --release ◀── daemon serve (daemon)
-                                      │ swaps on success        │ spawn / SIGKILL
-                                      ▼                         ▼
-                              target/release/app ───────▶ <daemon dir>/app.sock (channels)
-```
+MCP requests are handled directly in src/runtime/daemon/mcp/mod.rs. There is no
+per-request worker. Initialize, tools/list and status {start:false} do not start
+the app. reload, status, channels and lsp start the supervisor when needed.
+The supervisor watches src/ and Cargo.toml, builds the app/modules and swaps
+only successful generations. Its socket prevents two supervisors per project.
+MCP owns the supervisor thread, socket workers and language server. stop closes
+them and the app; MCP remains ready for a new reload. EOF closes owned resources.
+A client attaching to an existing supervisor does not own its lifetime.
 
-1. **Daemon** (`daemon serve`, `src/runtime/daemon/hot.rs`): builds once,
-   spawns `./target/release/app`, polls `src/` and `Cargo.toml` for changes,
-   rebuilds, and swaps the child only when the build succeeded. It answers
-   `status` / `reload` / `stop` on `daemon.sock` in the daemon dir.
-   Nobody has to start it: the first `status`, `reload` or `channels` (CLI
-   or MCP) that finds no socket starts `daemon serve --detach --idle 30m`,
-   a per-project daemon in its own session that logs to `daemon.log`
-   in the daemon dir and exits after 30 minutes without a request or a
-   source edit. `daemon serve` in a terminal is the same loop without the
-   idle exit; the socket is the lock, so only one runs per project.
-The starter app opens `app.sock`, ticks a stateful module and answers persist
-requests. Module-only rebuilds keep the child process; app rebuilds stage a
-new executable and checkpoint both states before restarting. See [Stateful
-reload](reload.txt). The default build includes the app and module, so a
-running daemon or launcher does not lock its own build output on Windows.
+The standalone serve and --call commands use the same runtime executable.
+A one-shot CLI call can start a detached supervisor with a 30-minute idle limit;
+persistent MCP uses its own in-process supervisor. Output from the supervised
+app goes to daemon.log so it cannot corrupt JSON-RPC stdout. Runtime executable
+changes require rebuilding and reconnecting; app and module changes reload
+through the supervisor. On Windows, disconnect before rebuilding the runtime.
 
-2. **Channels** (`src/runtime/daemon/channels.rs`): the executable calls
-   `daemon::channels::serve(&daemon::app_socket())` once, then records
-   counters, latency histograms and values in-process. Any reader asks the
-   socket for a snapshot. Channel storage is per-process; module swaps keep it,
-   while app restarts report gauges from restored state.
-3. **MCP worker** (`src/runtime/mcp`): stateless. `mcp-launcher` (same
-   crate, started by `.mcp.json` through `mcp.sh`) keeps the stdio
-   connection to the agent open and starts the current worker binary for every
-   request, so a rebuilt worker is live on the next call without reconnecting.
-   The worker talks to the two sockets, runs `leaks` / valgrind, and sends
-   results to Jev. Every tool also runs from the shell with `--call`.
-4. **Compile events** (`daemon::events`): the daemon appends one event
-   per build it runs to `events.jsonl` in the daemon dir; the launcher tails it
-   and forwards failures to the agent as MCP log notifications. The optional
-   `rustc-events` wrapper records every crate of every build instead.
+The starter calls daemon::channels::serve once, ticks a stateful module and
+answers checkpoint requests. Module-only edits keep the app process; app edits
+checkpoint app/module state before restarting. See [reload](reload.txt).
+Channels record counters, timing histograms and last values in the app process.
 
-5. **Code intelligence** (`src/runtime/daemon/lsp.rs`, `src/runtime/mcp/astgrep.rs`): the
-   daemon starts one `rust-analyzer` on the first `lsp` request and keeps it
-   for its lifetime, so the index is built once per project and survives
-   every worker swap; rust-analyzer watches the sources itself, so an edit
-   is live on the next question. Positions are 1-based on the wire. While
-   it still indexes, the reply says so and the agent retries. `ast_grep` is
-   stateless and runs the `ast-grep` binary per call from the project root.
-   Both need the tool on PATH (`rustup component add rust-analyzer`,
-   `brew install ast-grep`).
+One rust-analyzer index is reused until the supervisor stops. The LSP bridge
+returns 1-based source coordinates; edit previews retain LSP UTF-16 ranges.
+AST queries use ast-grep from the project root. Native memory inspection reads
+the live app; Valgrind runs separate bounded workloads, natively or in Docker.
 
+Builds and tool calls record to events.jsonl in the project runtime directory.
+MCP emits standard logging notifications for build failures. The optional
+rustc-events compiler wrapper records individual crates, including terminal
+builds. No client-specific hooks, queue adapters or session configuration exist.
 
 ## Build profiles
 
