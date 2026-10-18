@@ -36,7 +36,8 @@ running daemon or launcher does not lock its own build output on Windows.
 2. **Channels** (`src/runtime/daemon/channels.rs`): the executable calls
    `daemon::channels::serve(&daemon::app_socket())` once, then records
    counters, latency histograms and values in-process. Any reader asks the
-   socket for a snapshot. Channels are per-process; each swap restarts at zero.
+   socket for a snapshot. Channel storage is per-process; module swaps keep it,
+   while app restarts report gauges from restored state.
 3. **MCP worker** (`src/runtime/mcp`): stateless. `mcp-launcher` (same
    crate, started by `.mcp.json` through `mcp.sh`) keeps the stdio
    connection to the agent open and starts the current worker binary for every

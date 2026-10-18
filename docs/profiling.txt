@@ -3,15 +3,16 @@
 Documentation index: [llms.txt](../llms.txt).
 Paths and commands are relative to the repository root. Examples use the default app name, `app`.
 
-The starter exits after printing `hello world`; it has no live channels or sustained
-workload. Add instrumentation and a bounded workload to your application when needed.
+The starter runs a stateful counter with live app/module gauges. Add a bounded
+workload to your application before using command-based profiling or benchmarks.
 The integration tests use `tests/fixtures/workload.rs` in a temporary checkout.
 
 ## The loops
 
 1. **Hot reload** — the daemon watches `src/` and `Cargo.toml`,
-   rebuilds on change and SIGKILLs the old child only when the new build is
-   good; a failed build keeps the old one serving. `daemon status / reload /
+   rebuilds on change and saves state before replacing the child when the app
+   changes; module-only edits swap in-process. A failed build or checkpoint keeps
+   the old one serving. `daemon status / reload /
    stop` (and the MCP tools of the same names) drive it; `status`, `reload`
    and `channels` start it as a daemon when none runs, `stop` ends it, and
    it ends itself after 30 idle minutes (`serve --detach --idle 0` to stay).
@@ -27,7 +28,8 @@ The integration tests use `tests/fixtures/workload.rs` in a temporary checkout.
 
    `daemon channels` (or the MCP `channels` tool) reads the snapshot live:
    counters, latency histograms (mean/p50/p90/p99/max µs) and last values.
-   Channels are per-process — every hot swap starts them from zero.
+   Channel storage is per-process; module-only swaps keep it. After an app
+   restart, the starter reports gauges from its restored simulation state.
 
 3. **Memory, native where it runs** — `memory_report` reads the *live*
    process on this machine (macOS `leaks`, opt-in `heap`): leaked bytes with
@@ -81,10 +83,11 @@ Callgrind compares self instruction totals and per-location changes; Memcheck
 compares allocations, frees, allocated bytes and definitely lost bytes. A clean
 Memcheck run is valid too. Inclusive call costs are never summed as work.
 
-For native timing, call `benchmark` twice around the edit:
+For native timing, add a terminating `--benchmark` workload, then call
+`benchmark` twice around the edit (the starter itself runs until stopped):
 
 ```json
-{"name":"baseline","command":["./target/release/app"],"repeats":5,"workload":"hello world"}
+{"name":"baseline","command":["./target/release/app","--benchmark"],"repeats":5,"workload":"your bounded workload"}
 ```
 
 The tool stores individual wall-time samples and p50/p90. Apps opt into final
