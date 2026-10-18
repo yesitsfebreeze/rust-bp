@@ -41,7 +41,8 @@ pub fn failed(event: &Value) -> bool {
 }
 
 /// `src/x.rs` for a path under `root`, with `..` segments folded (Cargo
-/// reports generated-manifest sources as `target/gen/<crate>/../../../src/…`).
+/// reports generated-manifest sources as `target/gen/<crate>/../../../src/…`)
+/// and `/` separators on every OS, so names match across platforms.
 pub fn normalize(path: &str, root: &Path) -> String {
 	let full = if Path::new(path).is_absolute() {
 		PathBuf::from(path)
@@ -58,10 +59,15 @@ pub fn normalize(path: &str, root: &Path) -> String {
 			other => folded.push(other),
 		}
 	}
-	folded
+	let shown = folded
 		.strip_prefix(root)
 		.map(|p| p.display().to_string())
-		.unwrap_or_else(|_| folded.display().to_string())
+		.unwrap_or_else(|_| folded.display().to_string());
+	if cfg!(windows) {
+		shown.replace('\\', "/")
+	} else {
+		shown
+	}
 }
 
 /// Files a compiler event names: every `--> path:line` in its diagnostics,
@@ -736,17 +742,10 @@ fn fit(text: &str, width: usize) -> String {
 
 /// Local wall-clock time, including the host timezone's daylight-saving rules.
 pub fn local_clock(time_ms: u64) -> String {
-	let seconds = (time_ms / 1000) as libc::time_t;
-	// SAFETY: an all-zero tm is valid storage for localtime_r to fill.
-	let mut local: libc::tm = unsafe { std::mem::zeroed() };
-	// SAFETY: localtime_r reads a valid time_t and writes the supplied tm.
-	if unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
-		return "--:--:--".into();
+	match crate::platform::local_hms(time_ms) {
+		Some((h, m, s)) => format!("{h:02}:{m:02}:{s:02}"),
+		None => "--:--:--".into(),
 	}
-	format!(
-		"{:02}:{:02}:{:02}",
-		local.tm_hour, local.tm_min, local.tm_sec
-	)
 }
 
 /// A changing clock distinguishes a live but quiet viewer from a frozen one.

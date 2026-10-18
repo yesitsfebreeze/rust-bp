@@ -14,19 +14,27 @@ use daemon::events;
 use daemon::util::{self, ProcessTree};
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-const WORKER_BUILD: [&str; 6] = ["cargo", "build", "--release", "--locked", "-p", "mcp"];
+const WORKER_BUILD: [&str; 8] = [
+	"cargo",
+	"build",
+	"--release",
+	"--locked",
+	"-p",
+	"mcp",
+	"--bin",
+	"mcp",
+];
 const BUILD_TIMEOUT: Duration = Duration::from_secs(110);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1200);
 const TERMINATE_GRACE: Duration = Duration::from_secs(15);
 
-type Version = (u64, i64, i64, u64);
+type Version = (Option<std::time::SystemTime>, u64);
 
 struct Launcher {
 	worker: PathBuf,
@@ -64,7 +72,7 @@ fn parse_args() -> Launcher {
 	let worker = worker.unwrap_or_else(|| {
 		PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
 			.join("release")
-			.join("mcp")
+			.join(format!("mcp{}", std::env::consts::EXE_SUFFIX))
 	});
 	Launcher {
 		worker: std::path::absolute(&worker).unwrap_or(worker),
@@ -140,16 +148,20 @@ impl Launcher {
 		}
 		let meta =
 			std::fs::metadata(&self.worker).map_err(|e| format!("{}: {e}", self.worker.display()))?;
-		let version = (meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.size());
+		// Portable rebuild check: a new worker build changes its mtime or length.
+		let version = (meta.modified().ok(), meta.len());
 		if self.initialized.load(Ordering::Relaxed) && self.last_version != Some(version) {
 			emit(&json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
 		}
+		let staged = daemon::staging::Executable::copy(&self.worker, &daemon::dir().join("workers"))
+			.map_err(|e| format!("stage worker: {e}"))?;
 		let mut tree = ProcessTree::spawn(
-			Command::new(&self.worker)
+			Command::new(staged.path())
 				.stdin(Stdio::piped())
 				.stdout(Stdio::piped()),
 		)
 		.map_err(|e| format!("cannot start {}: {e}", self.worker.display()))?;
+		tree.keep_executable(Some(staged));
 		let mut stdin = tree.0.stdin.take().ok_or("worker stdin")?;
 		let mut stdout = tree.0.stdout.take().ok_or("worker stdout")?;
 		let (sender, receiver) = mpsc::channel();

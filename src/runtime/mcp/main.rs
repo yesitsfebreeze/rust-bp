@@ -109,7 +109,7 @@ fn pretty(value: &Value) -> Result<String, String> {
 
 fn tool_status(args: &Value) -> Result<String, String> {
 	let mut status = if args["start"].as_bool() == Some(false) {
-		if std::os::unix::net::UnixStream::connect(daemon_socket()).is_err() {
+		if daemon::platform::LocalStream::connect(daemon_socket()).is_err() {
 			return pretty(&json!({"ok":true,"running":false,"daemon_running":false}));
 		}
 		wire::ask(&daemon_socket(), json!({"op":"status"}))?
@@ -155,7 +155,7 @@ fn tool_reload(args: &Value) -> Result<String, String> {
 }
 
 fn tool_stop(_: &Value) -> Result<String, String> {
-	if std::os::unix::net::UnixStream::connect(daemon_socket()).is_err() {
+	if daemon::platform::LocalStream::connect(daemon_socket()).is_err() {
 		return pretty(&json!({"op":"stop","ok":true,"already_stopped":true}));
 	}
 	let mut reply = wire::ask(&daemon_socket(), json!({"op":"stop"}))?;

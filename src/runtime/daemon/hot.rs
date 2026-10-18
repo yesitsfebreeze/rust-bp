@@ -6,9 +6,17 @@
 //! 1. build once, spawn the executable (default `./target/release/app`);
 //! 2. poll the watched paths every `poll`; on change (or a `reload`
 //!    request through the control socket) run `cargo build --release`;
-//! 3. a good build SIGKILLs the old child and spawns the new one; a failed
+//! 3. a good build that changed the executable (or a `reload` request) asks
+//!    the old child to persist its state (`{"op":"persist"}` on the app
+//!    socket, see `reload::Host`), kills it and spawns the new one, which
+//!    restores that state; a build that changed only module libraries keeps
+//!    the child running and its `reload::Host` swaps them in-process; a failed
 //!    build keeps the old child serving and records the error;
 //! 4. a child that exits on its own is respawned (counted as a restart).
+//!
+//! The child runs from a per-generation copy of the executable in the daemon
+//! dir (`run/`), so the build can replace the original even where a running
+//! executable is locked (Windows). Children get `DAEMON_SUPERVISED=1`.
 //!
 //! The control socket answers `status`, `reload` and `stop` — the `daemon`
 //! CLI and the MCP `status`/`reload`/`stop` tools speak it.
@@ -46,6 +54,12 @@ pub struct Daemon {
 	pub idle: Option<Duration>,
 }
 
+/// The default child, relative to the project root (`setup` renames it).
+const APP: &str = "./target/release/app";
+
+/// How long a persist request may take before the restart is rejected.
+const PERSIST_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// Idle limit of a detached daemon.
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(30 * 60);
 
@@ -53,7 +67,17 @@ impl Default for Daemon {
 	fn default() -> Self {
 		Self {
 			build_command: vec!["cargo".into(), "build".into(), "--release".into()],
-			child_command: vec!["./target/release/app".into()],
+			child_command: vec![std::env::var_os("CARGO_TARGET_DIR")
+				.map(PathBuf::from)
+				.map(|dir| {
+					dir
+						.join("release")
+						.join(std::path::Path::new(APP).file_name().unwrap())
+				})
+				.unwrap_or_else(|| PathBuf::from(APP))
+				.with_extension(if cfg!(windows) { "exe" } else { "" })
+				.display()
+				.to_string()],
 			watch: vec![
 				PathBuf::from("src"),
 				PathBuf::from("Cargo.toml"),
@@ -81,6 +105,8 @@ struct Shared {
 	last_build: String,
 	last_build_ms: u64,
 	last_swap_ms: u64,
+	executable_stamp: Option<(SystemTime, u64)>,
+	restore: Option<PathBuf>,
 }
 
 struct State {
@@ -122,7 +148,6 @@ pub fn parse_idle(text: &str) -> Result<Option<Duration>, String> {
 /// Start `command` as a daemon: its own session, cwd the project root, stdin
 /// closed, stdout and stderr appended to `daemon.log`. Returns the pid.
 pub fn spawn_detached(command: &mut Command) -> Result<u32, String> {
-	use std::os::unix::process::CommandExt;
 	crate::ensure_dir().map_err(|e| e.to_string())?;
 	let log = std::fs::OpenOptions::new()
 		.create(true)
@@ -135,13 +160,7 @@ pub fn spawn_detached(command: &mut Command) -> Result<u32, String> {
 		.stdin(Stdio::null())
 		.stdout(Stdio::from(log))
 		.stderr(Stdio::from(err));
-	// SAFETY: setsid only detaches the child from our session and terminal.
-	unsafe {
-		child.pre_exec(|| {
-			libc::setsid();
-			Ok(())
-		});
-	}
+	crate::platform::detach(child);
 	child.spawn().map(|c| c.id()).map_err(|e| e.to_string())
 }
 
@@ -194,9 +213,10 @@ fn now_ms() -> u64 {
 		.unwrap_or(0)
 }
 
-fn spawn(command: &[String]) -> Option<ProcessTree> {
-	let (head, tail) = command.split_first()?;
-	ProcessTree::spawn(Command::new(head).args(tail)).ok()
+/// Modification time and length: enough to tell a rebuilt executable.
+fn fingerprint(path: &std::path::Path) -> Option<(SystemTime, u64)> {
+	let meta = std::fs::metadata(path).ok()?;
+	Some((meta.modified().ok()?, meta.len()))
 }
 
 impl Daemon {
@@ -222,6 +242,8 @@ impl Daemon {
 				last_build: "never built".into(),
 				last_build_ms: 0,
 				last_swap_ms: 0,
+				executable_stamp: None,
+				restore: None,
 			}),
 			reload: AtomicBool::new(false),
 			stop: AtomicBool::new(false),
@@ -312,7 +334,7 @@ impl Daemon {
 			self.watch
 		);
 		let mut baseline = watch::snapshot(&self.watch);
-		let mut child = self.build_and_swap(None, &state);
+		let mut child = self.build_and_swap(None, &state, true);
 		println!(
 			"daemon: serving {} — reload through the control socket",
 			self.child_command.join(" ")
@@ -330,12 +352,12 @@ impl Daemon {
 						sh.restarts += 1;
 					}
 					drop(child.take());
-					child = spawn(&self.child_command);
+					child = self.spawn_child(&state);
 					self.note_child(&state, child.as_ref());
 				}
 			}
 			if child.is_none() {
-				child = spawn(&self.child_command);
+				child = self.spawn_child(&state);
 				self.note_child(&state, child.as_ref());
 				std::thread::sleep(Duration::from_secs(2));
 			}
@@ -348,7 +370,7 @@ impl Daemon {
 				}
 				// Capture before building: edits during this build trigger the next one.
 				baseline = watch::snapshot(&self.watch);
-				child = self.build_and_swap(child.take(), &state);
+				child = self.build_and_swap(child.take(), &state, requested);
 			}
 			if let Some(limit) = self.idle {
 				let idle = state.last_contact.lock().unwrap().elapsed();
@@ -368,8 +390,18 @@ impl Daemon {
 		0
 	}
 
-	fn build_and_swap(&self, old: Option<ProcessTree>, state: &State) -> Option<ProcessTree> {
+	/// Build; then swap the child when the build changed the executable or
+	/// `forced` (first start, `reload` request). An unchanged executable keeps
+	/// the running child: its modules reload in-process.
+	fn build_and_swap(
+		&self,
+		mut old: Option<ProcessTree>,
+		state: &State,
+		forced: bool,
+	) -> Option<ProcessTree> {
 		let started = Instant::now();
+		let executable = self.executable();
+		let before = state.shared.lock().unwrap().executable_stamp;
 		let ticket = {
 			let mut sh = state.shared.lock().unwrap();
 			sh.building = true;
@@ -400,11 +432,43 @@ impl Daemon {
 				return old;
 			}
 		}
+		let alive = old
+			.as_mut()
+			.is_some_and(|c| matches!(c.0.try_wait(), Ok(None)));
+		let changed = executable.is_none() || executable.as_deref().and_then(fingerprint) != before;
+		if alive && !forced && !changed {
+			println!("daemon: build ok, executable unchanged; modules reload in the running child");
+			let mut sh = state.shared.lock().unwrap();
+			sh.building = false;
+			sh.reload_completed = ticket;
+			return old;
+		}
+		// Stage before touching the old process: copy failures cannot lose state.
+		let prepared = self.prepare_child().and_then(|prepared| {
+			if alive {
+				let saved = self.persist()?;
+				state.shared.lock().unwrap().restore = saved;
+			}
+			Ok(prepared)
+		});
+		let (mut command, staged) = match prepared {
+			Ok(prepared) => prepared,
+			Err(error) => {
+				let _ = wire::ask(&crate::app_socket(), json!({"op": "resume"}));
+				eprintln!("daemon: restart rejected, keeping old process: {error}");
+				let mut sh = state.shared.lock().unwrap();
+				sh.building = false;
+				sh.reload_completed = ticket;
+				sh.last_build_ok = false;
+				sh.last_build = error;
+				return old;
+			}
+		};
 		drop(old);
 		if util::cancelled() {
 			return None;
 		}
-		let child = spawn(&self.child_command);
+		let child = self.start_prepared(&mut command, staged, state);
 		{
 			let mut sh = state.shared.lock().unwrap();
 			sh.swaps += 1;
@@ -478,6 +542,91 @@ impl Daemon {
 			Ok(_) => (),
 			Err(error) => println!("daemon: cannot record the build event: {error}"),
 		}
+	}
+
+	/// The child's executable when it is a file in the project (a build
+	/// output); `None` for a command such as `sh`.
+	fn executable(&self) -> Option<PathBuf> {
+		let head = PathBuf::from(self.child_command.first()?);
+		(head.components().count() > 1 && head.is_file()).then_some(head)
+	}
+
+	/// Ask the running child to save its state for the next process; a child
+	/// without `reload::Host` (or none listening) just answers no.
+	fn persist(&self) -> Result<Option<PathBuf>, String> {
+		let socket = crate::app_socket();
+		if !std::path::Path::new(&socket).exists() {
+			return Ok(None);
+		}
+		let reply = wire::ask_within(&socket, json!({"op": "persist"}), PERSIST_TIMEOUT)?;
+		if reply["ok"] != true {
+			return Err(format!("state save rejected: {reply}"));
+		}
+		if reply["supported"] == false {
+			return Ok(None);
+		}
+		let path = reply["path"]
+			.as_str()
+			.map(PathBuf::from)
+			.filter(|p| p.is_file())
+			.ok_or("saved state file is missing")?;
+		println!("daemon: child persisted its state");
+		Ok(Some(path))
+	}
+
+	/// Spawn the child from a per-generation copy of its executable (the
+	/// original stays writable for the next build), removing older copies.
+	fn prepare_child(&self) -> Result<(Command, Option<crate::staging::Executable>), String> {
+		let (head, tail) = self
+			.child_command
+			.split_first()
+			.ok_or("empty child command")?;
+		let mut command = Command::new(head);
+		let mut staged = None;
+		if let Some(executable) = self.executable() {
+			let original = std::path::absolute(&executable).map_err(|e| e.to_string())?;
+			let copy = crate::staging::Executable::copy(&original, &crate::dir().join("run"))
+				.map_err(|e| e.to_string())?;
+			command = Command::new(copy.path());
+			command.env("DAEMON_ARTIFACT_DIR", original.parent().unwrap());
+			staged = Some(copy);
+		}
+		command
+			.args(tail)
+			.env("DAEMON_SUPERVISED", "1")
+			.env_remove("DAEMON_RESTORE_SNAPSHOT");
+		Ok((command, staged))
+	}
+
+	fn start_prepared(
+		&self,
+		command: &mut Command,
+		staged: Option<crate::staging::Executable>,
+		state: &State,
+	) -> Option<ProcessTree> {
+		if let Some(path) = &state.shared.lock().unwrap().restore {
+			command.env("DAEMON_RESTORE_SNAPSHOT", path);
+		}
+		match ProcessTree::spawn(command) {
+			Ok(mut child) => {
+				child.keep_executable(staged);
+				state.shared.lock().unwrap().executable_stamp =
+					self.executable().as_deref().and_then(fingerprint);
+				Some(child)
+			}
+			Err(error) => {
+				eprintln!("daemon: spawn failed: {error}");
+				None
+			}
+		}
+	}
+
+	fn spawn_child(&self, state: &State) -> Option<ProcessTree> {
+		let (mut command, staged) = self
+			.prepare_child()
+			.map_err(|e| eprintln!("daemon: {e}"))
+			.ok()?;
+		self.start_prepared(&mut command, staged, state)
 	}
 
 	fn note_child(&self, state: &State, child: Option<&ProcessTree>) {

@@ -1,0 +1,60 @@
+# Stateful reload
+
+The starter demonstrates both reload boundaries. `just serve` builds the app
+and counter module. `just call channels` reports app_ticks, module_count and
+module_generation. Change STEP in src/modules/counter/lib.rs: the count
+continues using the new step without replacing the app process. Change
+src/main.rs: the daemon saves both states and starts the replacement app.
+
+## Module boundary
+
+Each module is a cdylib depending on reload with default-features = false.
+Implement reload::Module and call reload::export_module!(YourType). Calls,
+configuration and state use byte buffers. Document their encoding and version
+your own state; restore should migrate compatible versions or return an error.
+Never pass Rust objects, pointers or allocator ownership across the boundary.
+
+The app owns one reload::Host. Load named modules, call poll at a simulation
+boundary, and use call for module methods. The host copies the library before
+loading it so Cargo can overwrite its output on Windows. The old generation
+stays live until the new library passes ABI, create, save and restore checks.
+Any failure preserves the old code and state. Owned copies are removed after
+unloading. A failed build is retried after the next source/library change.
+
+These libraries are trusted native code, not a sandbox. Panics from Module
+methods are caught with unwinding builds; aborts and invalid native memory
+access cannot be recovered. Release keeps panic unwinding enabled.
+
+## Application boundary
+
+Host::new reads only the snapshot explicitly supplied by the supervisor.
+Load modules and consume application parts with restored before starting the
+simulation. Invalid snapshots or incompatible module state fail startup;
+the snapshot stays on disk for recovery instead of silently resetting state.
+
+Open daemon::channels::serve after creating the host. Each frame, check
+persist_requested and pass application parts to persist. The host saves all
+loaded module states and the app parts in one atomically replaced snapshot.
+After a successful save, stop advancing app state while quiesced is true.
+The starter main.rs is a complete example of this handshake.
+
+The daemon stages the executable before asking the old app to save. Failed
+copies, rejected saves, write failures and timeouts keep the old process.
+Successful saves transfer the snapshot path to the new process. The daemon
+keeps the checkpoint for startup retries. A fresh daemon session ignores it;
+crashes can only recover the last successful checkpoint, not unsaved frames.
+This development checkpoint is not a persistent save-game system.
+
+Module edits build only the module and leave the app alive. An explicit reload
+request always restarts the app. App binaries run from a staged copy; the
+daemon passes DAEMON_ARTIFACT_DIR so module paths still find Cargo's outputs.
+DAEMON_RESTORE_SNAPSHOT identifies the checkpoint during a restart. Custom
+DAEMON_DIR values must fit the platform's local-socket path length limit.
+
+## Verification
+
+cargo test -p reload --locked checks real shared-library swaps, bad ABIs,
+create/save/restore failures, old-library cleanup, snapshot parsing and a
+new-process state handoff. just smoke additionally exercises the actual
+starter under the daemon: live module edits, app rebuilds, failed persistence
+and repair, plus the MCP lifecycle. CI runs these on Windows, Linux and macOS.

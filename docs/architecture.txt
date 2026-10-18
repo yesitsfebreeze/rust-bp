@@ -5,7 +5,7 @@ Paths and commands are relative to the repository root. Examples use the default
 
 ## How it works
 
-Three processes, two Unix sockets, one directory:
+Three processes, two local sockets (AF_UNIX on Windows, Linux and macOS), one directory:
 
 ```text
 agent ──stdio/JSON-RPC──▶ mcp-launcher ──per request──▶ target/release/mcp
@@ -27,7 +27,11 @@ agent ──stdio/JSON-RPC──▶ mcp-launcher ──per request──▶ targ
    in the daemon dir and exits after 30 minutes without a request or a
    source edit. `daemon serve` in a terminal is the same loop without the
    idle exit; the socket is the lock, so only one runs per project.
-The starter app exits immediately and does not open `app.sock`.
+The starter app opens `app.sock`, ticks a stateful module and answers persist
+requests. Module-only rebuilds keep the child process; app rebuilds stage a
+new executable and checkpoint both states before restarting. See [Stateful
+reload](reload.txt). The default build includes the app and module, so a
+running daemon or launcher does not lock its own build output on Windows.
 
 2. **Channels** (`src/runtime/daemon/channels.rs`): the executable calls
    `daemon::channels::serve(&daemon::app_socket())` once, then records

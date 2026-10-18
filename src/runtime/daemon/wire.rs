@@ -2,9 +2,9 @@
 //! reply line out. Used by the channel socket, the daemon control socket
 //! and their clients.
 
+use crate::platform::{LocalListener as UnixListener, LocalStream as UnixStream};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +18,9 @@ pub fn bind(path: &str) -> std::io::Result<UnixListener> {
 		));
 	}
 	let _ = std::fs::remove_file(path);
-	UnixListener::bind(path)
+	let listener = UnixListener::bind(path)?;
+	crate::platform::not_inherited(&listener);
+	Ok(listener)
 }
 
 /// Serve one connection per thread-less loop: read a request line, answer
@@ -45,26 +47,48 @@ fn serve_workers(
 	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
 	workers: usize,
 ) {
+	// One thread accepts and a fixed pool answers: several threads blocking
+	// in accept on clones of one socket is not supported everywhere (Winsock
+	// AF_UNIX), while a single acceptor behaves the same on every OS.
 	let handler = Arc::new(handler);
+	let (send, receive) = std::sync::mpsc::sync_channel::<UnixStream>(workers * 4);
+	let receive = Arc::new(std::sync::Mutex::new(receive));
 	for _ in 0..workers {
-		let listener = listener.try_clone().expect("clone listener");
+		let receive = receive.clone();
 		let handler = handler.clone();
-		std::thread::spawn(move || {
-			for conn in listener.incoming() {
-				let Ok(mut conn) = conn else { continue };
-				let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
-				let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
-				let mut reader = BufReader::new(conn.try_clone().expect("clone socket"));
-				let mut line = String::new();
-				if reader.read_line(&mut line).unwrap_or(0) == 0 {
-					continue;
-				}
-				let request = serde_json::from_str::<Value>(line.trim()).unwrap_or_else(|_| json!({}));
-				let reply = handler(request);
-				let _ = conn.write_all(format!("{reply}\n").as_bytes());
+		std::thread::spawn(move || loop {
+			let next = receive.lock().unwrap().recv();
+			match next {
+				Ok(conn) => answer(conn, &*handler),
+				Err(_) => break,
 			}
 		});
 	}
+	std::thread::spawn(move || {
+		for conn in listener.incoming() {
+			let Ok(conn) = conn else { continue };
+			crate::platform::not_inherited(&conn);
+			if send.send(conn).is_err() {
+				break;
+			}
+		}
+	});
+}
+
+fn answer(mut conn: UnixStream, handler: &(impl Fn(Value) -> Value + ?Sized)) {
+	let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+	let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+	let Ok(clone) = conn.try_clone() else { return };
+	// A duplicated Windows socket is a new handle, inheritable again.
+	crate::platform::not_inherited(&clone);
+	let mut reader = BufReader::new(clone);
+	let mut line = String::new();
+	if reader.read_line(&mut line).unwrap_or(0) == 0 {
+		return;
+	}
+	let request = serde_json::from_str::<Value>(line.trim()).unwrap_or_else(|_| json!({}));
+	let reply = handler(request);
+	let _ = writeln!(conn, "{reply}");
 }
 
 /// One request over the wire; the reply is the parsed reply line.
@@ -75,6 +99,7 @@ pub fn ask(path: &str, request: Value) -> Result<Value, String> {
 /// `ask` with its own read timeout, for ops that wait on a build or an index.
 pub fn ask_within(path: &str, request: Value, timeout: Duration) -> Result<Value, String> {
 	let mut stream = UnixStream::connect(path).map_err(|_| format!("no socket answers at {path}"))?;
+	crate::platform::not_inherited(&stream);
 	stream.set_read_timeout(Some(timeout)).ok();
 	stream
 		.write_all(format!("{request}\n").as_bytes())
@@ -82,7 +107,7 @@ pub fn ask_within(path: &str, request: Value, timeout: Duration) -> Result<Value
 	let mut reply = String::new();
 	let mut stream = BufReader::new(stream);
 	stream
-		.read_to_string(&mut reply)
+		.read_line(&mut reply)
 		.map_err(|e| format!("{path}: {e}"))?;
 	serde_json::from_str(reply.trim())
 		.map_err(|_| format!("{path} answered no JSON: {}", reply.trim()))

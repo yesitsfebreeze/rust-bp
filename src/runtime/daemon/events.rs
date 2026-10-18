@@ -15,7 +15,6 @@ use crate::util;
 use serde_json::{json, Map, Value};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -61,11 +60,8 @@ pub fn publish(kind: &str, data: Map<String, Value>) -> std::io::Result<Value> {
 	event.insert("kind".into(), json!(kind));
 	event.extend(data);
 	let event = Value::Object(event);
-	let mut file = OpenOptions::new()
-		.create(true)
-		.append(true)
-		.mode(0o600)
-		.open(log_path())?;
+	let mut file =
+		crate::platform::private_file(OpenOptions::new().create(true).append(true)).open(log_path())?;
 	// One write per line: appends below PIPE_BUF stay whole across writers.
 	file.write_all(format!("{event}\n").as_bytes())?;
 	Ok(event)
@@ -94,10 +90,7 @@ pub fn notify(event: &Value) {
 	}
 	// Claim the event before delivery: a wrapper and a launcher may both see it.
 	let claim = claims_dir().join(id);
-	if OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.mode(0o600)
+	if crate::platform::private_file(OpenOptions::new().write(true).create_new(true))
 		.open(&claim)
 		.is_err()
 	{

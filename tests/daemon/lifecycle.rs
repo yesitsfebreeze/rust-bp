@@ -32,6 +32,11 @@ fn wait(mut condition: impl FnMut() -> bool) {
 		std::thread::sleep(Duration::from_millis(20));
 	}
 }
+#[cfg(windows)]
+fn running(pid: i32) -> bool {
+	daemon::platform::alive(pid as u32)
+}
+#[cfg(unix)]
 fn running(pid: i32) -> bool {
 	// Zombies cannot execute and may await the OS reaper briefly on Linux.
 	let output = Command::new("ps")
@@ -156,6 +161,8 @@ fn edits_during_build_are_not_lost_and_reload_builds_once() {
 	assert!(!temp.0.join("control.sock").exists());
 }
 
+// Another process can be sent SIGTERM only on Unix; Windows stops a daemon through `stop`.
+#[cfg(unix)]
 #[test]
 fn sigterm_cleans_daemon_descendants() {
 	let temp = Temp::new("signal");

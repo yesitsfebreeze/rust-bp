@@ -7,18 +7,21 @@ Paths and commands are relative to the repository root. Examples use the default
 
 ```text
 Cargo.toml           app package, workspace members, shared dependency versions and build profiles
-src/main.rs          bin `app`: prints hello world; replace it with your executable
+src/main.rs          bin `app`: stateful tick loop; replace it with your executable
+src/modules/counter/ sample hot-reloadable cdylib with save/restore
 src/runtime/         the harness; daemon/ and mcp/ each have a normal Cargo.toml
   daemon/            lib `daemon` + bin/daemon.rs: channels, daemon, valgrind runner, wire
                      + bin/rustc-events.rs: optional RUSTC_WRAPPER recording per-crate compile events
   mcp/               lib `mcp` (Jev wire, events and usage tools) + main.rs: the control MCP server (stdio, JSON-RPC 2.0)
                      + bin/mcp-launcher.rs: stable MCP transport; starts the latest worker per request
+  reload/            module ABI, transactional library swaps and application checkpoints
 tests/<crate>/       integration tests, explicitly listed in each crate's Cargo.toml
   daemon/            <module>.rs per module (parsers, channels, watcher, ...), lifecycle.rs: daemon lifecycle
   mcp/               integration.rs: isolated end-to-end checks, Docker regressions, receipt check; jev.rs, usage.rs
 justfile             the recipes: just build / check / ci / serve / call <tool>, grouped build / check / run; `just` lists them
 setup.sh             optional project rename and build: ./setup.sh <name>
 mcp.sh               build the MCP binaries together, then start the persistent launcher
+mcp.ps1              native Windows MCP entry point, stages the launcher outside Cargo outputs
 valgrind.Dockerfile  the Linux container valgrind falls back to
 .mcp.json            wires `app` as an MCP server for Claude Code, through mcp.sh
 ```
@@ -26,13 +29,16 @@ valgrind.Dockerfile  the Linux container valgrind falls back to
 
 ## Development
 
-Requires Rust/Cargo and a Unix host (macOS or Linux). `just` is optional.
+Requires Rust/Cargo on Windows 10 1803+, macOS or Linux. Windows needs the
+MSVC C++ build tools and Git Bash on PATH for recipes and shell test fixtures.
+`just` is optional.
 From a fresh checkout, without a setup step:
 
 ```sh
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked
-cargo run --release --bin app          # prints hello world
+cargo build --release --locked         # app and module
+cargo run --release -p daemon -- serve # watch, build and reload
 just ci                               # format, clippy, tests
 just smoke                            # real MCP + daemon journey; no Docker or API key
 ```
@@ -59,7 +65,7 @@ Renames the app package in `Cargo.toml` to `<name>` (binary
 at it, and names the MCP server `<name>` in `.mcp.json`, so the agent sees
 `mcp__<name>__status`. The framework crates stay `daemon` and
 `mcp`. Run it once after copying the repo; run it again to rename
-again. Needs perl and cargo; it ends with `cargo build --release`, so
+again. Needs Bash, perl (included with Git for Windows) and cargo; it ends with `cargo build --release`, so
 `Cargo.lock` follows.
 
 
@@ -71,7 +77,8 @@ cargo run --release -p mcp -- --call status   # starts the daemon, reports it
 cargo run --release -p daemon -- logs -f     # its output; `daemon serve` runs it in a terminal instead
 ```
 
-Edit `src/main.rs` — the daemon rebuilds and swaps the
-executable. The starter prints `hello world` and exits. The integration tests
+Edit `src/modules/counter/lib.rs` to hot-swap its implementation while keeping
+the app alive. Edit `src/main.rs` to restart with both states restored.
+Read [Stateful reload](reload.txt) for the protocol. Profiling integration tests
 use a separate instrumented workload in `tests/fixtures/workload.rs`.
 

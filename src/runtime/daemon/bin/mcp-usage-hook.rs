@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
@@ -46,12 +45,13 @@ fn record(input: &Value) -> Result<(), Box<dyn std::error::Error>> {
 	match input["hook_event_name"].as_str() {
 		Some("PreToolUse") => {
 			use std::io::Write;
-			let mut file = std::fs::OpenOptions::new()
-				.write(true)
-				.create(true)
-				.truncate(true)
-				.mode(0o600)
-				.open(pending)?;
+			let mut file = daemon::platform::private_file(
+				std::fs::OpenOptions::new()
+					.write(true)
+					.create(true)
+					.truncate(true),
+			)
+			.open(pending)?;
 			writeln!(file, "{}", now_ms())?;
 		}
 		Some("PostToolUse") => {

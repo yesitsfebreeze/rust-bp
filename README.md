@@ -6,18 +6,20 @@
 [![MCP](https://img.shields.io/badge/MCP-server-7C3AED)](https://modelcontextprotocol.io)
 [![Stars](https://img.shields.io/github/stars/yesitsfebreeze/rust-bp?style=social)](https://github.com/yesitsfebreeze/rust-bp/stargazers)
 
-Start with `src/main.rs`, which prints `hello world` and exits. The harness in `src/runtime/` gives your agent one
-MCP server to run the app, inspect it and measure changes.
+Start with `src/main.rs` and the small counter module in `src/modules/counter/`.
+The app keeps ticking while rebuilt modules swap in. The harness in
+`src/runtime/` gives your agent one MCP server to run, inspect and profile it.
 
-- **Reload on edit.** Rebuild and restart automatically; failed builds keep the last working app running.
+- **Reload with state.** Module edits keep the process and module state. App edits restart with both app and module state restored. Failed builds or state transfers keep the working generation.
 - **Measure real work.** Read live counters and timings, inspect memory, and compare profiles before and after a change.
 - **Navigate the code.** Find definitions and references with rust-analyzer, or search structurally with ast-grep.
 - **See what happened.** Follow builds and tool activity with `just viz`.
 
 ## Get started
 
-Requires Rust/Cargo on macOS or Linux. Install [just](https://github.com/casey/just)
-to use the recipes below.
+Requires Rust/Cargo on Windows 10 1803 or newer, macOS, or Linux. Windows
+also needs the MSVC C++ build tools and Git for Windows (Bash on PATH for
+the shell recipes/tests). Install [just](https://github.com/casey/just) for the recipes.
 
 ```sh
 git clone https://github.com/yesitsfebreeze/rust-bp.git
@@ -26,8 +28,10 @@ cargo build --release --locked
 just serve
 ```
 
-Edit `src/main.rs` — the daemon rebuilds and restarts the app.
-To name your project, run `./setup.sh my-project`.
+Edit `STEP` in `src/modules/counter/lib.rs`, then inspect `just call channels`:
+the count continues with the new step and the process stays alive. Edit
+`src/main.rs` to rebuild the app; its tick count and the module count survive
+the restart. To name your project, run `bash setup.sh my-project`.
 
 Your app lives in `src/main.rs` and `src/bin/`; the reusable daemon and MCP
 crates live in `src/runtime/`. All use ordinary Cargo manifests.
@@ -37,7 +41,8 @@ crates live in `src/runtime/`. All use ordinary Cargo manifests.
 The checkout includes configuration for Claude Code and Codex. Start your
 agent from the project root and approve or trust the project configuration.
 For another MCP host, register `./mcp.sh` as a stdio server with this
-directory as its working directory.
+directory as its working directory. On Windows, use
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./mcp.ps1`.
 
 Try:
 
@@ -63,7 +68,7 @@ Ranking works locally; Jev ranking optionally uses `TYPESAFE_API_KEY`.
 
 ```sh
 just ci       # formatting, Clippy and tests
-just smoke    # real MCP and reload journey; no Docker or API key
+just smoke    # real MCP, module swaps and app state handoff; no Docker or API key
 ```
 
 For the tool list, agent configuration, profiling workflows and troubleshooting,

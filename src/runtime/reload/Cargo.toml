@@ -1,0 +1,23 @@
+[package]
+name = "reload"
+version.workspace = true
+edition.workspace = true
+description = "Hot-reloadable modules whose state survives rebuilds, and app state that survives restarts"
+
+[lib]
+path = "lib.rs"
+
+[features]
+# `host`: loading, swapping and persisting modules (the app). Module crates
+# depend on `reload` with default-features = false and get only the ABI.
+default = ["host"]
+host = ["dep:daemon", "dep:libloading", "dep:serde_json"]
+
+[dependencies]
+daemon = { path = "../daemon", optional = true }
+libloading = { version = "0.8", optional = true }
+serde_json = { workspace = true, optional = true }
+
+[[test]]
+name = "reload"
+path = "../../../tests/reload/reload.rs"

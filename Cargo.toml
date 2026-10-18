@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 # Ordinary Cargo manifests: the workspace loads before any build has run.
-members = ["src/runtime/daemon", "src/runtime/mcp"]
-default-members = [".", "src/runtime/daemon", "src/runtime/mcp"]
+members = ["src/runtime/daemon", "src/runtime/mcp", "src/runtime/reload", "src/modules/counter"]
+default-members = [".", "src/modules/counter"]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +25,7 @@ description = "The demo executable — replace this crate with your project"
 
 [dependencies]
 daemon = { path = "src/runtime/daemon" }
+reload = { path = "src/runtime/reload" }
 
 # Dev: the inner loop (cargo test, cargo check). Workspace crates keep
 # file:line tables for backtraces; dependencies carry no debug info at all,

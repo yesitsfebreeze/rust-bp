@@ -2,6 +2,7 @@
 # Plain Cargo commands work too, including on a fresh checkout.
 
 set positional-arguments
+set windows-shell := ["bash", "-cu"]
 
 default:
     @just --list --unsorted
@@ -59,6 +60,7 @@ e2e:
 [group('check')]
 smoke:
     CHECK_JOURNEY=lifecycle cargo test --locked -p mcp --test integration -- --ignored --nocapture --exact check
+    cargo test --locked -p mcp --test integration -- --ignored --nocapture --exact stateful_reload
 
 # Audit regressions, incl. Docker timeout and cancellation cleanup; needs a daemon and the image.
 [group('check')]

@@ -2,8 +2,8 @@
   "mcpServers": {
     "app": {
       "type": "stdio",
-      "command": "./mcp.sh",
-      "args": [],
+      "command": "bash",
+      "args": ["./mcp.sh"],
       "env": {}
     }
   }

@@ -15,7 +15,6 @@
 
 use serde_json::{json, Map};
 use std::io::Write;
-use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -57,10 +56,7 @@ fn main() {
 	let mut stderr = std::io::stderr();
 	let _ = stderr.write_all(&output.stderr);
 	let _ = stderr.flush();
-	let code = output
-		.status
-		.code()
-		.unwrap_or_else(|| 128 + output.status.signal().unwrap_or(0));
+	let code = daemon::platform::exit_code(output.status);
 	// Compiler discovery/probes are not builds; real crate invocations name a crate.
 	if let Some(at) = rest.iter().position(|a| a == "--crate-name") {
 		if let Some(crate_name) = rest.get(at + 1) {

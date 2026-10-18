@@ -16,7 +16,7 @@
 //! --height H]` prints one frame and exits, for a pipe or a test.
 
 use daemon::usage::{self, Timeline};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(300);
@@ -56,7 +56,7 @@ fn main() {
 		}
 		return;
 	}
-	let Some(_raw) = Raw::enter() else {
+	let Some(mut raw) = Raw::enter() else {
 		eprintln!("viz: not a terminal; use --once");
 		std::process::exit(2);
 	};
@@ -67,7 +67,6 @@ fn main() {
 	let mut last_size = (0, 0);
 	let mut last_paint = Instant::now() - POLL;
 	let mut dirty = true;
-	let mut stdin = std::io::stdin().lock();
 	let mut buf = [0u8; 32];
 	loop {
 		// the log grew: refold; a cursor below the top stays on its event
@@ -115,7 +114,7 @@ fn main() {
 			dirty = false;
 		}
 		// keys: VMIN 0, VTIME 1 makes this read wait at most 100 ms
-		let n = stdin.read(&mut buf).unwrap_or(0);
+		let n = raw.0.read(&mut buf);
 		let max_x = t.columns.len().saturating_sub(1);
 		let max_y = t.entries.len().saturating_sub(1);
 		let mut i = 0;
@@ -173,42 +172,24 @@ fn paint(
 }
 
 fn size() -> Option<(usize, usize)> {
-	let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-	// SAFETY: TIOCGWINSZ fills a winsize; a failure leaves it zeroed.
-	if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } != 0 || ws.ws_col == 0 {
-		return None;
-	}
-	Some((ws.ws_col as usize, ws.ws_row as usize))
+	daemon::platform::terminal_size()
 }
 
 /// Raw terminal mode on the alternate screen, restored on drop.
-struct Raw(libc::termios);
+struct Raw(daemon::platform::RawTerminal);
 
 impl Raw {
 	fn enter() -> Option<Raw> {
-		let mut t: libc::termios = unsafe { std::mem::zeroed() };
-		// SAFETY: tcgetattr writes a termios for a tty fd and fails otherwise.
-		if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut t) } != 0 {
-			return None;
-		}
-		let saved = t;
-		t.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN);
-		t.c_iflag &= !(libc::IXON | libc::ICRNL);
-		t.c_cc[libc::VMIN] = 0;
-		t.c_cc[libc::VTIME] = 1;
-		// SAFETY: a termios we read and adjusted, applied to the same fd.
-		unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) };
-		print!("\x1b[?1049h\x1b[?25l\x1b[2J");
+		let terminal = daemon::platform::RawTerminal::enter()?;
+		print!("[?1049h[?25l[2J");
 		let _ = std::io::stdout().flush();
-		Some(Raw(saved))
+		Some(Raw(terminal))
 	}
 }
 
 impl Drop for Raw {
 	fn drop(&mut self) {
-		print!("\x1b[0m\x1b[?25h\x1b[?1049l");
+		print!("[0m[?25h[?1049l");
 		let _ = std::io::stdout().flush();
-		// SAFETY: the termios tcgetattr gave us, restored on the same fd.
-		unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
 	}
 }

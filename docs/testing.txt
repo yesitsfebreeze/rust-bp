@@ -15,7 +15,7 @@ CHECK_LIVE_JEV=1 cargo test -p mcp --test integration -- --ignored --nocapture c
 ```
 
 The `check` test copies the workspace into an owned temporary directory, replaces
-its hello-world main with `tests/fixtures/workload.rs`, and checks the advertised tool contract and exercises the tools over the persistent stdio MCP launcher.
+its main with `tests/fixtures/workload.rs`, and checks the advertised tool contract and exercises the tools over the persistent stdio MCP launcher.
 It asserts PID swaps, preservation of the app after a deliberate compile
 error, compiler notifications, native memory inspection (macOS), both Valgrind
 modes, comparison arithmetic, source context, ranking, and worker replacement
@@ -24,4 +24,10 @@ for native memory tools. Default ranking uses a local Jev protocol fixture;
 `CHECK_LIVE_JEV=1` uses the external service. Docker must be running when native
 Valgrind is unavailable. The temporary checkout and its isolated build artifacts
 are removed after the test.
+
+`just smoke` also runs `stateful_reload` with the actual starter app and counter
+module, proving same-process module swaps, app-state handoff and preservation
+of the old process on a snapshot write failure. The CI matrix runs `just ci`
+and both smoke journeys on Windows, Linux and macOS. The separate Docker/signal
+regression fixture remains Unix-only; native memory inspection remains macOS-only.
 

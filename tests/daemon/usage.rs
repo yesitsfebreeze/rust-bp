@@ -404,6 +404,10 @@ fn activity_clock_uses_local_timezone_instead_of_utc() {
 		),
 	)
 	.unwrap();
+	// TZ with IANA zone names is POSIX; Windows takes the zone from the system settings.
+	if cfg!(windows) {
+		return;
+	}
 	for (zone, expected) in [("Europe/Berlin", "21:39:00"), ("UTC", "19:39:00")] {
 		let output = std::process::Command::new(env!("CARGO_BIN_EXE_viz"))
 			.args(["--once", "--width", "140", "--height", "8"])

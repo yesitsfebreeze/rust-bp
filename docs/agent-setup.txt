@@ -8,6 +8,11 @@ Paths and commands are relative to the repository root. Examples use the default
 The MCP server must run with this directory as cwd (that is how MCP servers
 launch); the framework's paths are project-root relative.
 
+On Windows, the native entry point is `powershell.exe -NoProfile
+-ExecutionPolicy Bypass -File ./mcp.ps1`. The shared `bash ./mcp.sh` entry
+detects Git Bash and delegates to it. The launcher and per-request workers
+run from copies, leaving Cargo outputs writable during a request.
+
 - **pi** — register `./mcp.sh` as a stdio MCP server from the project root.
 - **Claude Code** — `.mcp.json` supplies `mcpServers.app`. First run
   `cargo build --release --locked -p mcp` to avoid a cold-build connection

@@ -4,21 +4,28 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// A process group owned by this operation. Drop cleans descendants even when
-/// the group leader has already exited (including error and cancellation paths).
-pub struct ProcessTree(pub std::process::Child);
+/// A process tree owned by this operation (process group on Unix, Job Object
+/// on Windows: [`crate::platform::Group`]). Drop cleans descendants even when
+/// the leader has already exited (including error and cancellation paths).
+pub struct ProcessTree(
+	pub std::process::Child,
+	crate::platform::Group,
+	Option<crate::staging::Executable>,
+);
 impl ProcessTree {
 	pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
-		use std::os::unix::process::CommandExt;
 		let _ = cancelled(); // install handlers before creating owned children
-		command.process_group(0).spawn().map(Self)
+		crate::platform::spawn_group(command).map(|(child, group)| Self(child, group, None))
 	}
-	/// SIGTERM the group and wait up to `grace` for the leader to exit, so it
-	/// can clean up (containers, sockets); Drop SIGKILLs whatever remains.
+
+	/// Remove a staged executable only after this process has exited.
+	pub fn keep_executable(&mut self, executable: Option<crate::staging::Executable>) {
+		self.2 = executable;
+	}
+	/// Ask the tree to stop and wait up to `grace` for the leader to exit, so
+	/// it can clean up (containers, sockets); Drop kills whatever remains.
 	pub fn terminate(&mut self, grace: Duration) {
-		unsafe {
-			libc::kill(-(self.0.id() as i32), libc::SIGTERM);
-		}
+		self.1.request_stop(self.0.id());
 		let start = Instant::now();
 		while start.elapsed() < grace {
 			if let Ok(Some(_)) = self.0.try_wait() {
@@ -30,10 +37,7 @@ impl ProcessTree {
 }
 impl Drop for ProcessTree {
 	fn drop(&mut self) {
-		// Only signal the group we created, never the caller's process group.
-		unsafe {
-			libc::kill(-(self.0.id() as i32), libc::SIGKILL);
-		}
+		self.1.kill(self.0.id());
 		let _ = self.0.wait();
 	}
 }
@@ -50,8 +54,8 @@ pub fn cancel_signal() -> i32 {
 		.unwrap_or(0) as i32
 }
 
-/// SIGINT/SIGTERM/SIGHUP request cancellation so RAII cleanup still runs;
-/// SIGHUP is the terminal closing, which must not orphan the app child.
+/// SIGINT/SIGTERM (and SIGHUP on Unix) request cancellation so RAII cleanup
+/// still runs; SIGHUP is the terminal closing, which must not orphan the app child.
 pub fn cancelled() -> bool {
 	use std::sync::{
 		atomic::{AtomicBool, Ordering},
@@ -64,7 +68,7 @@ pub fn cancelled() -> bool {
 			let which = CANCEL_SIGNAL
 				.get_or_init(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
 				.clone();
-			for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+			for &signal in crate::platform::TERMINATION_SIGNALS {
 				signal_hook::flag::register(signal, flag.clone()).expect("register termination handler");
 				signal_hook::flag::register_usize(signal, which.clone(), signal as usize)
 					.expect("register termination handler");
@@ -118,17 +122,11 @@ fn run_bounded(
 	// Nonblocking readers also terminate when a detached descendant retains a
 	// pipe. A deadline must not turn into an unbounded JoinHandle::join.
 	fn drain(
-		mut stream: impl Read + std::os::fd::AsRawFd + Send + 'static,
+		mut stream: impl Read + Send + 'static,
 		keep: usize,
 		done: std::sync::Arc<std::sync::atomic::AtomicBool>,
 	) -> std::thread::JoinHandle<Vec<u8>> {
 		use std::sync::atomic::Ordering;
-		unsafe {
-			let flags = libc::fcntl(stream.as_raw_fd(), libc::F_GETFL);
-			assert!(
-				flags >= 0 && libc::fcntl(stream.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
-			);
-		}
 		std::thread::spawn(move || {
 			let mut saved = Vec::new();
 			let mut buffer = [0; 8192];
@@ -150,8 +148,14 @@ fn run_bounded(
 		})
 	}
 	let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-	let stdout = drain(child.0.stdout.take().unwrap(), keep, done.clone());
-	let stderr = drain(child.0.stderr.take().unwrap(), keep, done.clone());
+	let (out, err) = (
+		child.0.stdout.take().unwrap(),
+		child.0.stderr.take().unwrap(),
+	);
+	crate::platform::nonblocking(&out);
+	crate::platform::nonblocking(&err);
+	let stdout = drain(out, keep, done.clone());
+	let stderr = drain(err, keep, done.clone());
 	let started = Instant::now();
 	let result = loop {
 		if interruptible && (cancelled() || stop()) {

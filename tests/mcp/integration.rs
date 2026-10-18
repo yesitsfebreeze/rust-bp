@@ -19,12 +19,21 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod stateful;
+
+#[test]
+#[ignore = "builds isolated release binaries and exercises real stateful reloads"]
+fn stateful_reload() {
+	stateful::run();
+}
 
 fn root() -> PathBuf {
 	Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -50,12 +59,19 @@ fn wait_for<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
 }
 
 fn process_running(pid: u64) -> bool {
-	let output = Command::new("ps")
-		.args(["-o", "stat=", "-p", &pid.to_string()])
-		.output()
-		.unwrap();
-	let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-	!state.is_empty() && !state.starts_with('Z')
+	#[cfg(windows)]
+	{
+		daemon::platform::alive(pid as u32)
+	}
+	#[cfg(unix)]
+	{
+		let output = Command::new("ps")
+			.args(["-o", "stat=", "-p", &pid.to_string()])
+			.output()
+			.unwrap();
+		let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+		!state.is_empty() && !state.starts_with('Z')
+	}
 }
 
 fn on_path(program: &str) -> bool {
@@ -108,27 +124,21 @@ impl Env {
 	}
 }
 
-/// A process group killed on drop (SIGKILL), the test's cleanup guarantee.
-struct Owned(Child);
-impl Drop for Owned {
-	fn drop(&mut self) {
-		unsafe {
-			libc_kill(-(self.0.id() as i32), 9);
-		}
-		let _ = self.0.wait();
-	}
-}
+type Owned = daemon::util::ProcessTree;
 
+#[cfg(unix)]
 extern "C" {
 	#[link_name = "kill"]
 	fn libc_kill(pid: i32, signal: i32) -> i32;
 }
 
+#[cfg(unix)]
 fn signal(pid: u32, signal: i32) {
 	unsafe {
 		libc_kill(pid as i32, signal);
 	}
 }
+#[cfg(unix)]
 const SIGTERM: i32 = 15;
 
 /// The MCP client side: one launcher process on a pipe, requests by id.
@@ -145,16 +155,21 @@ struct Mcp {
 impl Mcp {
 	fn start(launcher: &Path, args: &[&str], cwd: &Path, env: &Env) -> Mcp {
 		let mut command = Command::new(launcher);
+		if launcher.extension().is_some_and(|e| e == "ps1") {
+			command = Command::new("powershell.exe");
+			command
+				.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+				.arg(launcher);
+		}
 		command
 			.args(args)
 			.current_dir(cwd)
 			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
-			.process_group(0);
+			.stdout(Stdio::piped());
 		env.apply(&mut command);
-		let mut child = command.spawn().expect("start launcher");
-		let stdin = child.stdin.take();
-		let stdout = child.stdout.take().unwrap();
+		let mut child = Owned::spawn(&mut command).expect("start launcher");
+		let stdin = child.0.stdin.take();
+		let stdout = child.0.stdout.take().unwrap();
 		let (sender, incoming) = mpsc::channel();
 		std::thread::spawn(move || {
 			for line in BufReader::new(stdout).lines() {
@@ -167,7 +182,7 @@ impl Mcp {
 			}
 		});
 		let mut mcp = Mcp {
-			process: Owned(child),
+			process: child,
 			stdin,
 			incoming,
 			notifications: vec![],
@@ -346,7 +361,13 @@ fn copy_fixture_sources(root: &Path, directory: &Path) {
 		directory.join("src/main.rs"),
 	)
 	.unwrap();
-	for name in ["Cargo.toml", "Cargo.lock", "valgrind.Dockerfile", "mcp.sh"] {
+	for name in [
+		"Cargo.toml",
+		"Cargo.lock",
+		"valgrind.Dockerfile",
+		"mcp.sh",
+		"mcp.ps1",
+	] {
 		std::fs::copy(root.join(name), directory.join(name)).unwrap();
 	}
 }
@@ -386,10 +407,7 @@ fn check() {
 			.set
 			.push(("TYPESAFE_API_KEY".into(), "local-test-fixture".into()));
 	}
-	let enclosure = Enclosure(PathBuf::from(format!(
-		"/tmp/mcp-check-{}",
-		std::process::id()
-	)));
+	let enclosure = Enclosure(std::env::temp_dir().join(format!("mcp-check-{}", std::process::id())));
 	let directory = enclosure.0.join("boilerplate");
 	std::fs::create_dir_all(&directory).unwrap();
 	// Keep generated manifests and artifacts inside this fixture. A shared
@@ -404,16 +422,21 @@ fn check() {
 	let daemon_dir = daemon::dir_for(&directory);
 	std::fs::create_dir_all(&daemon_dir).unwrap();
 	let log = std::fs::File::create(daemon_dir.join("daemon.log")).unwrap();
-	let mut daemon_command = Command::new(target.join("release/daemon"));
+	let mut daemon_command =
+		Command::new(target.join(format!("release/daemon{}", std::env::consts::EXE_SUFFIX)));
 	daemon_command
 		.arg("serve")
 		.current_dir(&directory)
 		.stdout(log.try_clone().unwrap())
-		.stderr(log)
-		.process_group(0);
+		.stderr(log);
 	env.apply(&mut daemon_command);
-	let mut daemon = Owned(daemon_command.spawn().unwrap());
-	let mut mcp = Mcp::start(&directory.join("mcp.sh"), &[], &directory, &env);
+	let mut daemon = Owned::spawn(&mut daemon_command).unwrap();
+	let mut mcp = Mcp::start(
+		&directory.join(if cfg!(windows) { "mcp.ps1" } else { "mcp.sh" }),
+		&[],
+		&directory,
+		&env,
+	);
 
 	let tools: BTreeSet<String> = mcp.rpc("tools/list", json!({}))["tools"]
 		.as_array()
@@ -552,14 +575,18 @@ fn check() {
 			);
 		}
 	}
-	pass(
-		mcp.call_json("reload", json!({}))["queued"] == true,
-		"reload accepted",
-	);
+	let reload_request = mcp.call_json("reload", json!({}));
+	pass(reload_request["queued"] == true, "reload accepted");
 	let state = wait_for(Duration::from_secs(90), || {
 		let s = mcp.daemon_status();
 		match s["child_pid"].as_u64() {
-			Some(pid) if pid != first_pid => Some(s),
+			Some(pid)
+				if pid != first_pid
+					&& s["building"] == false
+					&& s["reload_completed"].as_u64() >= reload_request["ticket"].as_u64() =>
+			{
+				Some(s)
+			}
 			_ => None,
 		}
 	});
@@ -893,6 +920,7 @@ fn check() {
 	);
 }
 
+#[cfg(unix)]
 fn owned_containers() -> BTreeSet<String> {
 	let output = Command::new("docker")
 		.args(["ps", "-aq", "--filter", "label=valgrind.owned=true"])
@@ -913,6 +941,7 @@ fn owned_containers() -> BTreeSet<String> {
 /// signals, build races, parser and comparison failures.
 #[test]
 #[ignore = "needs a running Docker daemon and the profiler image"]
+#[cfg(unix)]
 fn regressions() {
 	let root = root();
 	let plain = Env {
@@ -965,7 +994,7 @@ fn regressions() {
 			.stderr(Stdio::null())
 			.process_group(0);
 		env.apply(&mut probe);
-		let mut probe = Owned(probe.spawn().unwrap());
+		let mut probe = Owned::spawn(&mut probe).unwrap();
 		let mut stdin = probe.0.stdin.take().unwrap();
 		let mut stdout = BufReader::new(probe.0.stdout.take().unwrap());
 		let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -1052,7 +1081,7 @@ fn regressions() {
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
 			.process_group(0);
-		let mut running = Owned(launcher_command.spawn().unwrap());
+		let mut running = Owned::spawn(&mut launcher_command).unwrap();
 		let mut stdin = running.0.stdin.take().unwrap();
 		stdin.write_all(request("cancel", 120).as_bytes()).unwrap();
 		stdin.flush().unwrap();

@@ -1,5 +1,5 @@
 //! The preset profiler channel: every interesting number of the executable
-//! recorded in-process and read live through a Unix socket.
+//! recorded in-process and read live through a local socket.
 //!
 //! Three kinds, one registry, zero configuration:
 //!
@@ -250,10 +250,30 @@ pub fn snapshot() -> Value {
 	})
 }
 
-/// Serve the channel snapshots at `path` (call once from the executable).
+type PersistHook = std::sync::Arc<dyn Fn(&str) -> Value + Send + Sync>;
+static PERSIST: Mutex<Option<PersistHook>> = Mutex::new(None);
+
+/// Answer `{"op":"persist"}` on the channel socket with `hook`: the daemon
+/// sends it before restarting the executable so it can save its state
+/// (`reload::Host` installs this). The latest hook wins.
+pub fn on_persist(hook: impl Fn(&str) -> Value + Send + Sync + 'static) {
+	*PERSIST.lock().unwrap() = Some(std::sync::Arc::new(hook));
+}
+
+/// Serve the channel snapshots at `path` (call once from the executable);
+/// `persist` requests go to the [`on_persist`] hook.
 pub fn serve(path: &str) -> Result<(), String> {
 	let listener = wire::bind(path).map_err(|e| format!("serve {path}: {e}"))?;
-	wire::serve_loop(listener, |_| snapshot());
+	wire::serve_loop(listener, |request| {
+		if request["op"] == "persist" || request["op"] == "resume" {
+			let hook = PERSIST.lock().unwrap().clone();
+			return match hook {
+				Some(hook) => hook(request["op"].as_str().unwrap()),
+				None => json!({"op": "persist", "ok": true, "supported": false}),
+			};
+		}
+		snapshot()
+	});
 	Ok(())
 }
 

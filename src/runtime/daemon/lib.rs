@@ -16,14 +16,15 @@ pub mod health;
 pub mod hot;
 pub mod lsp;
 pub mod native;
+pub mod platform;
 pub mod profiles;
+pub mod staging;
 pub mod usage;
 pub mod util;
 pub mod valgrind;
 pub mod watch;
 pub mod wire;
 
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 /// The directory every framework process writes into: `DAEMON_DIR` when
@@ -63,20 +64,10 @@ pub fn project_root() -> PathBuf {
 /// naming the root it serves, so a human browsing the temp dir can tell.
 pub fn ensure_dir() -> std::io::Result<PathBuf> {
 	let dir = dir();
-	std::fs::DirBuilder::new()
-		.recursive(true)
-		.mode(0o700)
-		.create(&dir)?;
+	platform::private_dir(std::fs::DirBuilder::new().recursive(true)).create(&dir)?;
 	let note = dir.join("project");
 	if !note.exists() {
-		let _ = std::fs::write(
-			note,
-			format!(
-				"{}
-",
-				project_root().display()
-			),
-		);
+		let _ = std::fs::write(note, format!("{}\n", project_root().display()));
 	}
 	Ok(dir)
 }
