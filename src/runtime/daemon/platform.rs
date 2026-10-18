@@ -10,6 +10,7 @@
 
 use std::io;
 use std::process::{Child, Command};
+#[cfg(windows)]
 use std::time::Duration;
 
 // ---- local sockets ----

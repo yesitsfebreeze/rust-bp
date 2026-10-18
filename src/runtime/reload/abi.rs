@@ -1,6 +1,6 @@
-//! The stable C ABI between the app ([`crate::Host`]) and module crates. A
+//! The stable C ABI between the app (`Host`) and module crates. A
 //! module is a `cdylib` that implements [`Module`] and calls
-//! [`export_module!`], which exports one symbol, `module_api`, returning a
+//! [`crate::export_module!`], which exports one symbol, `module_api`, returning a
 //! static [`ModuleApi`]. Calls exchange byte buffers whose encoding each
 //! module documents, so module crates need no shared types with the app.
 //! `save` and `restore` carry the module's state across a rebuild and a
