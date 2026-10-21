@@ -1,0 +1,85 @@
+# Player cvars. Edit here or in the console (` key), then `writeconfig`.
+
+# World gravity, units/s².
+sv_gravity = 800.0
+
+# Ground acceleration, multiples of wish speed per second.
+sv_accelerate = 5.0
+
+# Air acceleration; air wish speed is capped at 30 u/s.
+sv_airaccelerate = 10.0
+
+# Ground friction.
+sv_friction = 4.0
+
+# Friction multiplier near a drop-off.
+sv_edgefriction = 2.0
+
+# Below this speed friction acts as if moving this fast.
+sv_stopspeed = 75.0
+
+# Server cap on player speed, u/s.
+sv_maxspeed = 320.0
+
+# Cap on each velocity component, u/s.
+sv_maxvelocity = 2000.0
+
+# Highest step walked up without jumping, units.
+sv_stepsize = 18.0
+
+# Stick to stairs going down and ease the view through steps; 0 is CS 1.6. Not in CS 1.6.
+sv_stepsmooth = 1.0
+
+# Slope in degrees the view follows through a step at walking speed. Not in CS 1.6.
+sv_stepangle = 45.0
+
+# Movement ticks per second; rendering interpolates between ticks. CS 1.6 ran one tick per frame.
+sv_tickrate = 128.0
+
+# Speed of the held weapon, u/s (knife 250, AWP 210).
+player_maxspeed = 250.0
+
+# Forward key speed, u/s.
+cl_forwardspeed = 400.0
+
+# Back key speed, u/s.
+cl_backspeed = 400.0
+
+# Strafe key speed, u/s.
+cl_sidespeed = 400.0
+
+# Noclip up and down speed, u/s.
+cl_upspeed = 320.0
+
+# Speed multiplier while walking (shift).
+cl_movespeedkey = 0.52
+
+# Mouse sensitivity.
+sensitivity = 3.0
+
+# Degrees of yaw per mouse count, before sensitivity.
+m_yaw = 0.022
+
+# Degrees of pitch per mouse count, before sensitivity; negative inverts.
+m_pitch = 0.022
+
+# Horizontal field of view at 4:3, degrees; wider screens see more.
+fov = 90.0
+
+# Draw the player between the last two ticks; 0 draws the last tick.
+cl_interp = 1.0
+
+# Show horizontal speed.
+cl_showspeed = 1.0
+
+# Show frame rate and tick rate.
+cl_showfps = 1.0
+
+# Draw the crosshair.
+cl_crosshair = 1.0
+
+# Subsurface scattering strength; 0 renders every surface opaque. Not in CS 1.6.
+r_subsurface = 1.0
+
+# Scene brightness before tone mapping. Not in CS 1.6.
+r_exposure = 1.0

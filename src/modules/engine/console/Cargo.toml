@@ -1,0 +1,12 @@
+[package]
+name = "console"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "In-game console: commands, history and completion over a set of cvars"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+cvar = { path = "../cvar" }

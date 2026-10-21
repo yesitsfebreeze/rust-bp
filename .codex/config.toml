@@ -1,8 +1,8 @@
 # Repository-specific tool selection. Global integrations remain installed.
-# Start Codex from the project root; mcp.sh resolves its own working directory.
+# Start Codex from the project root; mcp.ps1 resolves its own working directory.
 [mcp_servers.app]
-command = "bash"
-args = ["./mcp.sh"]
+command = "powershell.exe"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "./mcp.ps1"]
 startup_timeout_sec = 120
 tool_timeout_sec = 1200
 

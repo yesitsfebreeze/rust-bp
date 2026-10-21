@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 # Ordinary Cargo manifests: the workspace loads before any build has run.
-members = ["src/runtime/daemon", "src/runtime/mcp", "src/runtime/reload", "src/modules/counter"]
-default-members = [".", "src/modules/counter"]
+members = ["src/runtime/daemon", "src/runtime/mcp", "src/runtime/reload", "src/modules/engine", "src/modules/engine/physics", "src/modules/engine/linalg", "src/modules/engine/cvar", "src/modules/engine/console", "src/modules/engine/lightbake", "src/modules/gameplay"]
+default-members = ["."]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ signal-hook = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
+macroquad = "0.4.16"
 
 # The app uses Cargo's standard layout. `./setup.sh <name>` renames it.
 # The framework crates live under src/runtime/.
@@ -21,11 +22,12 @@ ureq = { version = "2", features = ["json"] }
 name = "app"
 version.workspace = true
 edition.workspace = true
-description = "The demo executable — replace this crate with your project"
+publish = false
+description = "The player demo: the CS movement port in a first-person PBR arena with TOML cvars, an in-game console, 1.6 weapons and punch-through"
 
 [dependencies]
-daemon = { path = "src/runtime/daemon" }
-reload = { path = "src/runtime/reload" }
+gameplay = { path = "src/modules/gameplay" }
+macroquad.workspace = true
 
 # Dev: the inner loop (cargo test, cargo check). Workspace crates keep
 # file:line tables for backtraces; dependencies carry no debug info at all,

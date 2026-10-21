@@ -2,8 +2,8 @@
   "mcpServers": {
     "app": {
       "type": "stdio",
-      "command": "bash",
-      "args": ["./mcp.sh"],
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "./mcp.ps1"],
       "env": {}
     }
   }

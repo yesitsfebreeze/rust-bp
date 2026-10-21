@@ -354,10 +354,21 @@ pub fn source_context(location: &str, root: &Path) -> Option<Value> {
 	let text = std::fs::read_to_string(&path).ok()?;
 	let lines: Vec<_> = text.lines().collect();
 	let needle = format!("fn {symbol}(");
+	// Visibility and async-ness prefixes a definition can carry; `async fn` is
+	// what macroquad's entry point is.
+	let prefixes = [
+		"",
+		"pub ",
+		"pub(crate) ",
+		"async ",
+		"pub async ",
+		"pub(crate) async ",
+	];
 	let mut candidates = lines.iter().enumerate().filter(|(_, l)| {
-		l.trim_start().starts_with(&needle)
-			|| l.trim_start().starts_with(&format!("pub {needle}"))
-			|| l.trim_start().starts_with(&format!("pub(crate) {needle}"))
+		let l = l.trim_start();
+		prefixes
+			.iter()
+			.any(|p| l.starts_with(&format!("{p}{needle}")))
 	});
 	let (line, _) = candidates.next()?;
 	// A basename match cannot identify an impl when multiple definitions exist.

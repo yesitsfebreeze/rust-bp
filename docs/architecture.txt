@@ -59,6 +59,16 @@ running daemon or launcher does not lock its own build output on Windows.
    Both need the tool on PATH (`rustup component add rust-analyzer`,
    `brew install ast-grep`).
 
+## Game and engine crates
+
+`src/modules/gameplay` is the `gameplay` crate: player movement, weapons, bullets,
+controls, and gameplay state. The root `app` only creates the window and calls
+into gameplay. `src/modules/engine` owns the engine facade and its component
+crates (`physics`, `linalg`, `cvar`, `console`, and `lightbake`) as well as BSP
+and GoldSrc asset loading, surface textures, and rendering. The dependency
+direction is strict: gameplay depends on engine, and no engine crate depends
+on gameplay.
+
 
 ## Build profiles
 
@@ -73,4 +83,3 @@ Defined in the root `Cargo.toml`; the choice follows what each build is for.
 `release` deliberately has no `strip`, `lto` or `panic = "abort"`: they remove
 the symbols the profilers report against and change the unwinding and heap
 paths being measured. Put size work into `distribution`.
-

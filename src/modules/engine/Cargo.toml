@@ -1,0 +1,17 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Engine math, collision, cvars, console, lighting, map assets, and rendering"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+linalg = { path = "linalg", features = ["macroquad"] }
+lightbake = { path = "lightbake" }
+macroquad.workspace = true
+physics = { path = "physics" }
+console = { path = "console" }
+cvar = { path = "cvar" }

@@ -1,0 +1,1 @@
+(x86)\Steam\steamapps\common\Half-Life\cstrike\maps\de_dust2.bsp: The system cannot find the path specified. (os error 3)

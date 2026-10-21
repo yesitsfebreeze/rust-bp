@@ -1,0 +1,12 @@
+[package]
+name = "cvar"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Console variables: typed fields addressable by name, loaded from and saved to TOML"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+toml = "0.8"

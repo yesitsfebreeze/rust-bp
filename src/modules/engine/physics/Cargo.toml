@@ -1,0 +1,12 @@
+[package]
+name = "physics"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Sphere and capsule collision against triangle soups, without internal-edge ghost contacts"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+linalg = { path = "../linalg" }

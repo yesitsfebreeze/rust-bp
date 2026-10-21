@@ -1,0 +1,14 @@
+[package]
+name = "gameplay"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Counter-Strike gameplay, weapons, movement, and arena state"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+# The weapon table: `weapons.toml` parses to `toml::Table`, no serde.
+toml = "0.8"

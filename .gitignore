@@ -1,2 +1,9 @@
 /target
 .DS_Store
+# 1.6 game assets copied from the local Steam install; never redistribute.
+# The weapon and money tables are extracted numbers, not game files: they
+# stay tracked so a fresh checkout builds.
+/assets/*
+!/assets/weapons/*.toml
+!/assets/money.toml
+REA/

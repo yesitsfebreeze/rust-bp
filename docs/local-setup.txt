@@ -1,0 +1,89 @@
+# Local Windows setup
+
+Workspace: D:\dev\cs
+Upstream: https://github.com/yesitsfebreeze/rust-bp
+Checked-out commit: 5bc9ebcfd25fcb83a02687d8a1e390d8fe263ddb
+Verified: 2026-10-21
+
+The default application name remains `app`. The release workspace is built,
+including the application, counter module, daemon, and MCP worker and launcher.
+No Rust source or global configuration was changed during setup.
+
+## Native MCP configuration
+
+Both `.codex/config.toml` and `.mcp.json` now launch:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./mcp.ps1
+```
+
+Run the host from D:\dev\cs. The shipped PowerShell entry point builds the MCP
+binaries and stages the launcher outside Cargo outputs.
+
+The original bare `bash` command resolved to Windows WSL when launched through
+native process creation, despite PowerShell resolving Git Bash. That attempt
+failed with `Bash/Service/CreateInstance/CreateVm/0x800705b4`. Selecting the
+repository's native entry point avoids this executable-resolution problem.
+
+## Start the daemon before connecting MCP
+
+From PowerShell in D:\dev\cs:
+
+```powershell
+$daemon = Start-Process -WindowStyle Hidden `
+  -FilePath "$PWD\target\release\daemon.exe" `
+  -ArgumentList 'serve', '--detach' `
+  -WorkingDirectory "$PWD" -PassThru
+$daemon.WaitForExit()
+if ($daemon.ExitCode -ne 0) { throw "Daemon startup failed: $($daemon.ExitCode)" }
+```
+
+Then connect the MCP host using its project configuration. To launch the stdio
+server directly instead:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./mcp.ps1
+```
+
+The stdio server expects MCP JSON-RPC messages. Useful shell commands are:
+
+```powershell
+.\target\release\mcp.exe --call status '{"start":false}'
+.\target\release\mcp.exe --call reload '{"wait":true}'
+.\target\release\mcp.exe --call stop '{}'
+```
+
+Starting the daemon separately is necessary for the currently observed Windows
+cold-start problem. When a launcher worker starts the daemon, the app becomes
+ready but the launcher does not return the worker response until the daemon is
+stopped independently. The launcher reads worker stdout to EOF; an inherited
+pipe handle appears to keep that stream open. Windows process-tree ownership
+also needs investigation before changing the launcher reader alone. No runtime
+fix was attempted as part of this setup. Restart the daemon separately after
+stopping it or after its default 30-minute idle shutdown, before using MCP tools
+that would start it automatically.
+
+## Verification
+
+The following commands passed:
+
+```powershell
+cargo check --workspace --all-targets --locked
+cargo build --release --workspace --locked
+git diff --check
+```
+
+The configured native MCP command successfully initialized, listed 17 tools,
+answered a status request with `start:false`, and exited cleanly on stdin EOF.
+
+With the daemon started separately using the command above, a single persistent
+MCP connection successfully initialized, listed tools, completed a reload with
+`wait:true`, reported `ready:true` with three available app channels, stopped
+the daemon, and exited with code 0. This complete journey took approximately
+nine seconds. Direct CLI reload/status/stop was also verified.
+
+The comprehensive test suite was not run. These checks cover compilation,
+configuration, MCP protocol startup, and actual app/daemon lifecycle behavior.
+
+All setup-owned runtime processes were stopped. The final status request
+returned `ok:true`, `daemon_running:false`, and `running:false`.

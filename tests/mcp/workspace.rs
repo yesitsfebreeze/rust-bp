@@ -115,6 +115,17 @@ fn setup_can_rename_and_rebuild_the_stateful_workspace_twice() {
 	] {
 		std::fs::copy(root.join(name), fixture.0.join(name)).unwrap();
 	}
+	// The tracked weapon tables, as a fresh checkout has them; the build's
+	// include_str! reads them. The rest of assets/ stays local-only.
+	copy_tree(
+		&root.join("assets/weapons"),
+		&fixture.0.join("assets/weapons"),
+	);
+	std::fs::copy(
+		root.join("assets/money.toml"),
+		fixture.0.join("assets/money.toml"),
+	)
+	.unwrap();
 	// Git's normal Windows checkout may use CRLF; setup must rename it too.
 	let manifest = fixture.0.join("Cargo.toml");
 	let text = std::fs::read_to_string(&manifest)

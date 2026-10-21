@@ -1,0 +1,16 @@
+[package]
+name = "linalg"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Vectors, quaternions, matrices and cameras shared by physics, movement and rendering"
+
+[lib]
+path = "lib.rs"
+
+[features]
+# Conversions to macroquad's math types and its `Camera` trait, for drawing.
+macroquad = ["dep:macroquad"]
+
+[dependencies]
+macroquad = { version = "0.4.16", optional = true }
