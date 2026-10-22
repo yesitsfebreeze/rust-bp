@@ -5,5 +5,12 @@ edition.workspace = true
 publish = false
 description = "Baked lightmaps for static level geometry: one atlas, a chart per triangle, full bakes and partial rebakes on geometry edits"
 
+[features]
+# The wgpu compute bake, for the baking tool; the game itself stays wgpu-free.
+gpu = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
 linalg = { path = "../linalg" }
+physics = { path = "../physics" }
+wgpu = { version = "26", optional = true }
+pollster = { version = "0.4", optional = true }

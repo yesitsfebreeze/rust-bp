@@ -38,7 +38,8 @@ engine::cvar::cvars! {
 		sv_penetration = 1.0, "Bullets punch through thin walls, losing damage per material.";
 		r_subsurface = 1.0, "Subsurface scattering strength; 0 renders every surface opaque. Not in CS 1.6.";
 		r_exposure = 1.0, "Scene brightness before tone mapping. Not in CS 1.6.";
-		r_lightbake = 0.0, "Bake the map's light with lightbake at load: our sun, sky and one bounce, reported to the console. The textured path keeps the map's own lightdata.";
+		r_voxel = 4.0, "Pixels a voxel of the traced map spans at any distance: smaller is finer and slower. Not in CS 1.6.";
+		r_shell = 0.0, "March the map voxelized ahead into sparse shells around the eye instead of tracing each hit. Not in CS 1.6.";
 	}
 }
 

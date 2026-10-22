@@ -23,6 +23,71 @@
 
 use engine::linalg::{lerp, vec3, Vec3};
 use engine::physics::{Cylinder, Mesh};
+use std::cell::Cell;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollisionQueries {
+	pub casts: u32,
+	pub overlaps: u32,
+	/// Time spent inside the mesh queries, nanoseconds.
+	pub nanos: u64,
+	/// The longest single mesh query, nanoseconds.
+	pub longest_nanos: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CollisionQueryCounter {
+	active: bool,
+	counts: CollisionQueries,
+}
+
+thread_local! {
+	static COLLISION_QUERIES: Cell<CollisionQueryCounter> = const { Cell::new(CollisionQueryCounter {
+		active: false,
+		counts: CollisionQueries {
+			casts: 0,
+			overlaps: 0,
+			nanos: 0,
+			longest_nanos: 0,
+		},
+	}) };
+}
+
+pub fn begin_collision_query_count() {
+	COLLISION_QUERIES.with(|counter| {
+		counter.set(CollisionQueryCounter {
+			active: true,
+			counts: CollisionQueries::default(),
+		})
+	});
+}
+
+pub fn take_collision_query_count() -> CollisionQueries {
+	COLLISION_QUERIES.with(|counter| {
+		let previous = counter.replace(CollisionQueryCounter::default());
+		previous.counts
+	})
+}
+
+/// A mesh query of kind `overlap` that took `elapsed`: counted, and its time
+/// added to the tick's collision total and worst-query record.
+fn count_collision_query(overlap: bool, elapsed: std::time::Duration) {
+	COLLISION_QUERIES.with(|counter| {
+		let mut state = counter.get();
+		if !state.active {
+			return;
+		}
+		let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+		if overlap {
+			state.counts.overlaps = state.counts.overlaps.saturating_add(1);
+		} else {
+			state.counts.casts = state.counts.casts.saturating_add(1);
+		}
+		state.counts.nanos = state.counts.nanos.saturating_add(nanos);
+		state.counts.longest_nanos = state.counts.longest_nanos.max(nanos);
+		counter.set(state);
+	});
+}
 
 pub const UP: Vec3 = vec3(0.0, 1.0, 0.0);
 
@@ -126,7 +191,10 @@ pub struct Trace {
 /// `PM_PlayerTrace`: sweeps `hull` from `start` toward `end`.
 pub fn trace(world: &Mesh, hull: Cylinder, start: Vec3, end: Vec3) -> Trace {
 	let motion = end - start;
-	match world.cast_cylinder(start, hull, motion, SKIN) {
+	let started = std::time::Instant::now();
+	let hit = world.cast_cylinder(start, hull, motion, SKIN);
+	count_collision_query(false, started.elapsed());
+	match hit {
 		Some(c) => Trace {
 			fraction: c.fraction,
 			end: start + motion * c.fraction,
@@ -142,7 +210,10 @@ pub fn trace(world: &Mesh, hull: Cylinder, start: Vec3, end: Vec3) -> Trace {
 
 /// `PM_TestPlayerPosition`: whether `hull` at `origin` overlaps nothing.
 pub fn fits(world: &Mesh, hull: Cylinder, origin: Vec3) -> bool {
-	!world.cylinder_overlaps(origin, hull)
+	let started = std::time::Instant::now();
+	let overlaps = world.cylinder_overlaps(origin, hull);
+	count_collision_query(true, started.elapsed());
+	!overlaps
 }
 
 /// `PM_ClipVelocity` with an overbounce of 1: removes the motion into `normal`.
@@ -576,13 +647,23 @@ impl Player {
 		// Blocked: slide along the ground, and separately step up, slide, and step
 		// back down. Keep whichever got farther.
 		let (original, original_velocity) = (self.origin, self.velocity);
-		self.fly_move(world, dt);
+		self.fly_move_with_first_trace(world, dt, Some(tr));
 		let (down, down_velocity) = (self.origin, self.velocity);
 
 		(self.origin, self.velocity) = (original, original_velocity);
 		self.origin = trace(world, hull, self.origin, self.origin + UP * vars.stepsize).end;
 		self.fly_move(world, dt);
-		let tr = trace(world, hull, self.origin, self.origin - UP * vars.stepsize);
+		// `SKIN` past `stepsize`: the cast stops within `SKIN` of a surface, and a
+		// floor at the step's own height — the top of a low ridge, flat ground past
+		// a lip — sits just inside that margin. An exact `stepsize` trace's last
+		// sweep step overshoots it, finds no floor, and rejects the step, leaving
+		// the clipped slide to snag on the lip.
+		let tr = trace(
+			world,
+			hull,
+			self.origin,
+			self.origin - UP * (vars.stepsize + SKIN),
+		);
 		if !tr.normal.is_some_and(|n| n.y >= FLOOR) {
 			(self.origin, self.velocity) = (down, down_velocity);
 			return;
@@ -601,6 +682,10 @@ impl Player {
 
 	/// `PM_FlyMove`: moves for `dt`, sliding along up to five surfaces.
 	fn fly_move(&mut self, world: &Mesh, dt: f32) {
+		self.fly_move_with_first_trace(world, dt, None);
+	}
+
+	fn fly_move_with_first_trace(&mut self, world: &Mesh, dt: f32, mut first: Option<Trace>) {
 		let hull = self.hull();
 		let primal = self.velocity;
 		let mut original = self.velocity;
@@ -612,7 +697,9 @@ impl Player {
 			if self.velocity == Vec3::ZERO {
 				break;
 			}
-			let tr = trace(world, hull, self.origin, self.origin + self.velocity * left);
+			let tr = first
+				.take()
+				.unwrap_or_else(|| trace(world, hull, self.origin, self.origin + self.velocity * left));
 			travelled += tr.fraction;
 			if tr.fraction > 0.0 {
 				self.origin = tr.end;
@@ -700,6 +787,22 @@ mod tests {
 	use super::*;
 
 	const RATE: f32 = 128.0;
+
+	#[test]
+	fn collision_query_counts_are_scoped_to_a_movement_tick() {
+		let world = Mesh::default();
+		begin_collision_query_count();
+		trace(&world, STANDING, Vec3::ZERO, Vec3::ZERO);
+		fits(&world, STANDING, Vec3::ZERO);
+		let counted = take_collision_query_count();
+		assert_eq!((counted.casts, counted.overlaps), (1, 1));
+		assert!(
+			counted.nanos > 0 && counted.longest_nanos > 0,
+			"{counted:?}"
+		);
+		trace(&world, STANDING, Vec3::ZERO, Vec3::ZERO);
+		assert_eq!(take_collision_query_count(), CollisionQueries::default());
+	}
 
 	fn floor() -> Mesh {
 		let mut m = Mesh::default();
@@ -1262,6 +1365,205 @@ mod tests {
 		// Falling 200 units lands at sqrt(2 · 800 · 200) = 566 u/s.
 		assert!((roll - 566.0 * 0.013).abs() < 0.3, "roll {roll}");
 		assert_eq!(p.punch_roll, 0.0);
+	}
+
+	/// A run at full speed, and its worst per-tick speed loss and turn over the
+	/// states within `x` in `near`: what a snag on a seam or lip shows up as.
+	fn worst_snag(states: &[Player], near: std::ops::Range<f32>) -> (f32, f32, f32) {
+		let window: Vec<&Player> = states
+			.iter()
+			.filter(|s| near.contains(&s.origin.x))
+			.collect();
+		let min_speed = window.iter().map(|s| s.speed()).fold(f32::MAX, f32::min);
+		let drop = window
+			.windows(2)
+			.map(|w| w[0].speed() - w[1].speed())
+			.fold(0.0, f32::max);
+		let turn = window
+			.windows(2)
+			.filter(|w| w[0].speed() > 100.0 && w[1].speed() > 100.0)
+			.map(|w| {
+				(w[1].velocity.z.atan2(w[1].velocity.x) - w[0].velocity.z.atan2(w[0].velocity.x))
+					.abs()
+					.to_degrees()
+			})
+			.fold(0.0, f32::max);
+		(min_speed, drop, turn)
+	}
+
+	/// Two floor faces a hair apart, as adjacent world brushes in a map are: the
+	/// seam between them must not snag a player walking over it.
+	#[test]
+	fn walks_over_seam_deltas_smoothly() {
+		for delta in [0.0, 1.0 / 32.0, 0.25, 0.5, 1.0] {
+			let mut world = Mesh::default();
+			world.push_quad(
+				vec3(-512.0, 0.0, -64.0),
+				vec3(128.0, 0.0, -64.0),
+				vec3(128.0, 0.0, 64.0),
+				vec3(-512.0, 0.0, 64.0),
+				UP,
+			);
+			world.push_quad(
+				vec3(128.0, delta, -64.0),
+				vec3(2000.0, delta, -64.0),
+				vec3(2000.0, delta, 64.0),
+				vec3(128.0, delta, 64.0),
+				UP,
+			);
+			let mut p = grounded(&world, vec3(-400.0, 0.0, 0.0));
+			run(&mut p, &world, forward(), 1.0, RATE);
+			let states = run(&mut p, &world, forward(), 6.0, RATE);
+			assert!(states.first().unwrap().speed() > 249.0);
+			let (min_speed, worst, turn) = worst_snag(&states, 0.0..500.0);
+			assert!(p.origin.x > 700.0, "stuck at {:?} delta {delta}", p.origin);
+			assert!(
+				min_speed > 249.0 && worst < 0.5 && turn < 0.5,
+				"delta {delta}: snag min {min_speed} drop {worst} turn {turn}"
+			);
+		}
+	}
+
+	/// 64-unit floor cells alternating 0 and `delta`: a bumpy road of face seams.
+	#[test]
+	fn walks_a_bumpy_road_smoothly() {
+		for delta in [1.0 / 32.0, 0.25, 0.5] {
+			let mut world = Mesh::default();
+			for i in 0..24 {
+				let y = if i % 2 == 0 { 0.0 } else { delta };
+				let x = -512.0 + i as f32 * 64.0;
+				world.push_quad(
+					vec3(x, y, -64.0),
+					vec3(x + 64.0, y, -64.0),
+					vec3(x + 64.0, y, 64.0),
+					vec3(x, y, 64.0),
+					UP,
+				);
+			}
+			let mut p = grounded(&world, vec3(-500.0, 0.0, 0.0));
+			run(&mut p, &world, forward(), 1.0, RATE);
+			let states = run(&mut p, &world, forward(), 6.0, RATE);
+			assert!(states.first().unwrap().speed() > 249.0);
+			let (min_speed, worst, turn) = worst_snag(&states, -400.0..900.0);
+			assert!(p.origin.x > 900.0, "stuck at {:?} delta {delta}", p.origin);
+			assert!(
+				min_speed > 249.0 && worst < 0.5 && turn < 0.5,
+				"delta {delta}: snag min {min_speed} drop {worst} turn {turn}"
+			);
+		}
+	}
+
+	/// Flat floor strip `x` in [x0, x1], `z` in [-2048, 2048], at `y`.
+	fn slab(world: &mut Mesh, x0: f32, x1: f32, y: f32) {
+		world.push_quad(
+			vec3(x0, y, -2048.0),
+			vec3(x1, y, -2048.0),
+			vec3(x1, y, 2048.0),
+			vec3(x0, y, 2048.0),
+			UP,
+		);
+	}
+
+	/// One bump case: its name, the world it builds, the speed it costs.
+	type Bump = (&'static str, Box<dyn Fn(&mut Mesh)>, f32);
+
+	/// The shapes flat ground in a map snags on, crossed at full speed: lips and
+	/// crests at angles to the path, kinked and faceted slopes, a ridge narrower
+	/// than the hull. None may cost speed or turn the player.
+	#[test]
+	fn walks_smoothly_over_bumps_and_seams() {
+		let cases: [Bump; 5] = [
+			// 1-unit lip crossed at 45°.
+			(
+				"diagonal lip 1u",
+				Box::new(|w: &mut Mesh| {
+					slab(w, -1024.0, 128.0, 0.0);
+					slab(w, 128.0, 2048.0, 1.0);
+				}),
+				45.0,
+			),
+			// Crest line at 30° to the path, 0.5 units tall.
+			(
+				"crest 30deg 0.5u",
+				Box::new(|w: &mut Mesh| {
+					slab(w, -1024.0, 0.0, 0.0);
+					let a = vec3(0.0, 0.0, -2048.0);
+					let b = vec3(768.0, 0.0, -2048.0);
+					let c = vec3(768.0, 0.5, 2048.0);
+					let d = vec3(0.0, 0.5, 2048.0);
+					w.push_quad(a, b, c, d, UP);
+					slab(w, 768.0, 2048.0, 0.5);
+				}),
+				0.0,
+			),
+			// 3° kink up and back down: a road bump 128 long.
+			(
+				"3deg bump",
+				Box::new(|w: &mut Mesh| {
+					slab(w, -1024.0, 0.0, 0.0);
+					let tan = 3.0f32.to_radians().tan();
+					w.push_quad(
+						vec3(0.0, 0.0, -512.0),
+						vec3(128.0, 128.0 * tan, -512.0),
+						vec3(128.0, 128.0 * tan, 512.0),
+						vec3(0.0, 0.0, 512.0),
+						UP,
+					);
+					slab(w, 128.0, 2048.0, 128.0 * tan);
+				}),
+				0.0,
+			),
+			// Narrow ridge, 4 wide, 1 tall.
+			(
+				"ridge 4x1",
+				Box::new(|w: &mut Mesh| {
+					slab(w, -1024.0, 2048.0, 0.0);
+					w.push_box(vec3(128.0, 0.0, -2048.0), vec3(132.0, 1.0, 2048.0));
+				}),
+				45.0,
+			),
+			// Faceted ramp: six 5° facets.
+			(
+				"facets 5deg",
+				Box::new(|w: &mut Mesh| {
+					slab(w, -1024.0, 0.0, 0.0);
+					let tan = 5.0f32.to_radians().tan();
+					let mut y = 0.0;
+					for i in 0..6 {
+						let x = i as f32 * 64.0;
+						let y2 = y + 64.0 * tan;
+						w.push_quad(
+							vec3(x, y, -512.0),
+							vec3(x + 64.0, y2, -512.0),
+							vec3(x + 64.0, y2, 512.0),
+							vec3(x, y, 512.0),
+							UP,
+						);
+						y = y2;
+					}
+					slab(w, 384.0, 2048.0, y);
+				}),
+				0.0,
+			),
+		];
+		for (name, build, yaw) in cases {
+			let mut world = Mesh::default();
+			build(&mut world);
+			let input = Input {
+				forward: 400.0,
+				yaw,
+				..Input::default()
+			};
+			let mut p = grounded(&world, vec3(-900.0, 0.0, 0.0));
+			run(&mut p, &world, input, 1.0, RATE);
+			let states = run(&mut p, &world, input, 6.0, RATE);
+			assert!(states.first().unwrap().speed() > 249.0);
+			let (min_speed, worst, turn) = worst_snag(&states, -300.0..500.0);
+			assert!(
+				min_speed > 249.0 && worst < 0.5 && turn < 0.5,
+				"{name}: snag min {min_speed} drop {worst} turn {turn}"
+			);
+		}
 	}
 
 	#[test]

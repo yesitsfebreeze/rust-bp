@@ -8,10 +8,20 @@ description = "Engine math, collision, cvars, console, lighting, map assets, and
 [lib]
 path = "lib.rs"
 
+[features]
+# The GPU light bake's entry points and tests, for the baking tool.
+gpu-bake = []
+
 [dependencies]
-linalg = { path = "linalg", features = ["macroquad"] }
-lightbake = { path = "lightbake" }
-macroquad.workspace = true
+linalg = { path = "linalg" }
+# `gpu` packs the bake's BVH for the renderer's ray casts.
+lightbake = { path = "lightbake", features = ["gpu"] }
+# The window, input and renderer (`gpu`): winit and wgpu, ProggyClean
+# rasterized by fontdue for the HUD.
+fontdue = "0.9"
+pollster = "0.4"
+wgpu = "26"
+winit = "0.30"
 physics = { path = "physics" }
 console = { path = "console" }
 cvar = { path = "cvar" }

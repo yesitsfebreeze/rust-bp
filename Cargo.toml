@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 # Ordinary Cargo manifests: the workspace loads before any build has run.
-members = ["src/runtime/daemon", "src/runtime/mcp", "src/runtime/reload", "src/modules/engine", "src/modules/engine/physics", "src/modules/engine/linalg", "src/modules/engine/cvar", "src/modules/engine/console", "src/modules/engine/lightbake", "src/modules/gameplay"]
-default-members = ["."]
+members = ["src/runtime/daemon", "src/runtime/mcp", "src/runtime/reload", "src/modules/engine", "src/modules/engine/physics", "src/modules/engine/linalg", "src/modules/engine/cvar", "src/modules/engine/console", "src/modules/engine/lightbake", "src/modules/engine/parallel", "src/modules/engine/dylib", "src/modules/hot", "src/modules/hot/game", "src/modules/counter", "src/modules/audio", "src/modules/gameplay"]
+# `cargo build` without a package selector must also build the sample module:
+# the daemon rebuilds with this command and reloads `counter` in the child.
+default-members = [".", "src/modules/counter"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +16,7 @@ signal-hook = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
-macroquad = "0.4.16"
+sokol = { git = "https://github.com/floooh/sokol-rust", rev = "b7c2bb487ee250d90d3adcdf21665595b918fd1e" }
 
 # The app uses Cargo's standard layout. `./setup.sh <name>` renames it.
 # The framework crates live under src/runtime/.
@@ -23,11 +25,21 @@ name = "app"
 version.workspace = true
 edition.workspace = true
 publish = false
-description = "The player demo: the CS movement port in a first-person PBR arena with TOML cvars, an in-game console, 1.6 weapons and punch-through"
+description = "The player demo: the CS movement port on Dust2, traced as voxels with FLIP water, with TOML cvars, an in-game console, 1.6 weapons and punch-through"
 
 [dependencies]
+daemon = { path = "src/runtime/daemon" }
+engine = { path = "src/modules/engine" }
 gameplay = { path = "src/modules/gameplay" }
-macroquad.workspace = true
+# The stateful-reload smoke journey swaps `src/main.rs` for the fixture app
+# in `tests/fixtures/stateful_app.rs`, whose channels-ticking main loads the
+# sample `counter` module through this crate; the game's own main never
+# touches it.
+reload = { path = "src/runtime/reload" }
+
+[features]
+# The GPU light bake, for `cargo run --features gpu-bake --bin gpu_bake`.
+gpu-bake = ["engine/gpu-bake"]
 
 # Dev: the inner loop (cargo test, cargo check). Workspace crates keep
 # file:line tables for backtraces; dependencies carry no debug info at all,

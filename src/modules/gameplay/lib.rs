@@ -1,7 +1,11 @@
 //! Counter-Strike gameplay: movement, weapons, combat, and arena state.
 //!
 //! WASD move - mouse look - Space or mouse wheel jump - Ctrl or C duck - Shift walk
-//! F flycam - F3 wireframe - ` or F1 console - Esc frees the mouse, click to grab it again
+//! F flycam - G throws a physics sphere, H clears them - ` or F1 console - Esc
+//! opens 1.6's menu and frees the mouse, Resume Game grabs it again; alt-tab
+//! frees it too, and focusing the window re-grabs it
+//!
+//! The map draws through `engine::gpu`: traced per pixel as voxels.
 //!
 //! Movement ticks at `sv_tickrate`; the view turns every frame from raw mouse counts
 //! and the player is drawn between the last two ticks. The first argument names the
@@ -10,14 +14,18 @@
 
 #![deny(warnings)]
 
-mod bullets;
-mod cvars;
-mod materials;
-mod player;
-#[allow(dead_code)]
+// The profiling workload in `src/bin/engine_bench.rs` drives movement, bullet
+// traces and the weapon table headless, so these stay public.
+pub mod bullets;
+pub mod cvars;
+pub mod materials;
+mod menu;
+pub mod player;
+mod profiler;
+mod rng;
 mod state;
 mod viewmodel;
-mod weapons;
+pub mod weapons;
 
 fn root() -> &'static std::path::Path {
 	std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -37,29 +45,36 @@ fn selected_map(args: &[String]) -> std::path::PathBuf {
 
 use engine::console::{Action, Console};
 use engine::cvar::Registry;
-use engine::linalg::{vec3, Camera, Quat, Vec3};
-use engine::macroquad;
-use engine::macroquad::prelude::*;
-use engine::{bsp, lightmap, map_render};
+use engine::gpu::{self, Color, Gfx, Key, MouseButton, View, Window};
+use engine::linalg::{vec3, Quat, Vec3};
+use engine::{bsp, lightmap, physics};
 use player::movement::angle_vectors;
 use player::{Input, Player};
 
 use crate::bullets::Shot;
 use crate::cvars::{movement_vars, Cvars};
 use crate::materials::SurfaceMaterial;
-use crate::weapons::{load, load_sound, Armed, Table};
-use engine::map_render::MapRenderer;
+use crate::weapons::{load, load_clip, Armed, Table};
+use audio::{Binaural, Clip};
 
 /// How long a fired bullet's tracer and holes stay drawn, seconds.
 const SHOT_LIFE: f32 = 2.0;
+/// Spheres in the physics playground at most; past it, the oldest goes.
+const BODY_CAP: usize = 64;
 
 /// Longest frame time simulated; a longer stall drops time instead of piling up ticks.
 const MAX_FRAME: f32 = 0.25;
 const TEXT: Color = Color::new(0.95, 0.96, 0.97, 1.0);
 const MUTED: Color = Color::new(0.75, 0.78, 0.8, 1.0);
 
+/// A horizontal `fov` at 4:3 as the vertical angle a projection takes:
+/// GoldSrc's widescreen keeps the vertical extent of the 4:3 frame.
+pub fn vertical_fov(fov: f32) -> f32 {
+	2.0 * ((fov.clamp(10.0, 170.0).to_radians() * 0.5).tan() * 0.75).atan()
+}
+
 /// Sets `cvars` from the config, writing the defaults there first if it is missing.
-fn load_config(console: &mut Console, cvars: &mut Cvars) {
+pub fn load_config(console: &mut Console, cvars: &mut Cvars) {
 	let path = console.config().to_owned();
 	if !path.exists() {
 		match std::fs::write(&path, cvars.to_toml()) {
@@ -71,45 +86,40 @@ fn load_config(console: &mut Console, cvars: &mut Cvars) {
 }
 
 /// Edits the console line from this frame's keys; returns whether it was submitted.
-fn type_into(console: &mut Console) -> bool {
-	while let Some(c) = get_char_pressed() {
+pub fn type_into(console: &mut Console, keys: &gpu::Input) -> bool {
+	for &c in keys.chars() {
 		if !c.is_control() && c != '`' && c != '^' {
 			console.input.push(c);
 		}
 	}
-	if is_key_pressed(KeyCode::Backspace) {
+	if keys.pressed(Key::Backspace) {
 		console.input.pop();
 	}
-	if is_key_pressed(KeyCode::Tab) {
+	if keys.pressed(Key::Tab) {
 		console.complete::<Cvars>();
 	}
-	if is_key_pressed(KeyCode::Up) {
+	if keys.pressed(Key::ArrowUp) {
 		console.recall(true);
 	}
-	if is_key_pressed(KeyCode::Down) {
+	if keys.pressed(Key::ArrowDown) {
 		console.recall(false);
 	}
-	is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter)
+	keys.pressed(Key::Enter) || keys.pressed(Key::NumpadEnter)
 }
 
-fn draw_console(console: &Console) {
-	let h = screen_height() * 0.45;
-	draw_rectangle(
-		0.0,
-		0.0,
-		screen_width(),
-		h,
-		Color::new(0.05, 0.07, 0.09, 0.88),
-	);
+pub fn draw_console(gfx: &mut Gfx, console: &Console) {
+	let (width, height) = gfx.size();
+	let h = height * 0.45;
+	gfx.rect(0.0, 0.0, width, h, Color::new(0.05, 0.07, 0.09, 0.88));
 	let size = 20.0;
 	let mut y = h - 12.0;
-	draw_text(format!("] {}_", console.input), 12.0, y, size, TEXT);
+	gfx.text(&format!("] {}_", console.input), 12.0, y, size, TEXT);
 	for line in console.lines().iter().rev() {
 		y -= size;
 		if y < size {
 			break;
 		}
-		draw_text(line, 12.0, y, size, MUTED);
+		gfx.text(line, 12.0, y, size, MUTED);
 	}
 }
 
@@ -117,6 +127,8 @@ fn draw_console(console: &Console) {
 /// ammo top-right. Every argument is one HUD line's data.
 #[allow(clippy::too_many_arguments)]
 fn hud(
+	gfx: &mut Gfx,
+	fps: u32,
 	cvars: &Cvars,
 	player: &Player,
 	fly: bool,
@@ -126,13 +138,27 @@ fn hud(
 	money: u32,
 	report: &str,
 ) {
+	let (width, height) = gfx.size();
 	let mut y = 28.0;
-	let mut line = |text: String| {
-		draw_text(&text, 16.0, y, 24.0, TEXT);
+	let mut line = |gfx: &mut Gfx, text: String| {
+		gfx.text(&text, 16.0, y, 24.0, TEXT);
 		y += 24.0;
 	};
 	if cvars.cl_showfps != 0.0 {
-		line(format!("{} fps  {} ticks/s", get_fps(), ticks));
+		line(gfx, format!("{fps} fps  {ticks} ticks/s"));
+		// GPU milliseconds per stage, where the adapter can time them.
+		let stages: Vec<String> = gfx
+			.timings()
+			.iter()
+			.map(|(stage, ms)| format!("{stage} {ms:.2}"))
+			.collect();
+		if !stages.is_empty() {
+			let total: f32 = gfx.timings().iter().map(|(_, ms)| ms).sum();
+			line(gfx, format!("gpu {total:.2} ms: {}", stages.join("  ")));
+		}
+	}
+	if gfx.view_mode() != "lit" {
+		line(gfx, format!("view: {} (F5)", gfx.view_mode()));
 	}
 	if cvars.cl_showspeed != 0.0 {
 		let state = if fly {
@@ -146,58 +172,128 @@ fn hud(
 				(_, false, false) => "air",
 			}
 		};
-		line(format!("{:.1} u/s  {state}", player.speed()));
+		line(gfx, format!("{:.1} u/s  {state}", player.speed()));
 	}
-	draw_text(
-		"WASD move  Space/wheel jump  Ctrl duck  Shift walk  mouse 1 fire  mouse 2 zoom/burst  1-8 weapon  B buy  R reload  F flycam  F3 wireframe  ` console",
+	gfx.text(
+		"WASD move  Space/wheel jump  Ctrl duck  Shift walk  mouse 1 fire  mouse 2 zoom/burst  1-8 weapon  B buy  R reload  F flycam  G throw ball  H clear balls  ` console",
 		16.0,
-		screen_height() - 16.0,
+		height - 16.0,
 		20.0,
 		MUTED,
 	);
-	line(format!(
-		"{}  (1-8: knife, glock, usp, deagle, mp5, ak47, m4a1, awp)",
-		weapon.name
-	));
+	line(
+		gfx,
+		format!(
+			"{}  (1-8: knife, glock, usp, deagle, mp5, ak47, m4a1, awp)",
+			weapon.name
+		),
+	);
 	if !report.is_empty() {
-		line(report.to_string());
+		line(gfx, report.to_string());
 	}
 	// The economy and ammo read from the top-right, as in 1.6's HUD.
-	draw_text(format!("${money}"), screen_width() - 90.0, 28.0, 24.0, TEXT);
+	gfx.text(&format!("${money}"), width - 90.0, 28.0, 24.0, TEXT);
 	let ammo = if weapon.melee {
 		"-".to_string()
 	} else {
 		format!("{} / {}", armed.clip, armed.reserve)
 	};
-	draw_text(ammo, screen_width() - 90.0, 52.0, 24.0, TEXT);
+	gfx.text(&ammo, width - 90.0, 52.0, 24.0, TEXT);
 	if cvars.cl_crosshair != 0.0 {
-		let (cx, cy) = (screen_width() / 2.0, screen_height() / 2.0);
+		let (cx, cy) = (width / 2.0, height / 2.0);
 		for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-			draw_line(
+			gfx.line(
 				cx + dx * 4.0,
 				cy + dy * 4.0,
 				cx + dx * 12.0,
 				cy + dy * 12.0,
 				2.0,
-				GREEN,
+				Color::GREEN,
 			);
 		}
 	}
 }
 
-/// One weapon's sounds, loaded once from the 1.6 assets; a synthesized report
-/// stands in when the files are missing.
+/// One weapon's sounds, loaded once from the 1.6 assets as mixer clips; a
+/// synthesized report stands in when the files are missing. Each field is the
+/// clip's index in the audio engine.
 struct Gun {
-	fire: Vec<macroquad::audio::Sound>,
-	dry: Option<macroquad::audio::Sound>,
-	deploy: Option<macroquad::audio::Sound>,
+	fire: Vec<usize>,
+	dry: Option<usize>,
+	deploy: Option<usize>,
 	/// Reload sounds at their fraction of the reload, as `weapons.toml`
 	/// stages them (`file@fraction`).
-	reload: Vec<(f32, macroquad::audio::Sound)>,
-	zoom: Option<macroquad::audio::Sound>,
+	reload: Vec<(f32, usize)>,
+	zoom: Option<usize>,
 	/// The knife's stab swing and its sound when it meets a wall.
-	stab: Option<macroquad::audio::Sound>,
-	wall: Option<macroquad::audio::Sound>,
+	stab: Option<usize>,
+	wall: Option<usize>,
+}
+
+/// The gun in hand sits low-right ahead of the eye, as the drawn viewmodel.
+fn muzzle(eye: Vec3, forward: Vec3, right: Vec3, up: Vec3) -> Vec3 {
+	eye + forward * 8.0 - right * 3.0 - up * 2.5
+}
+
+/// Spatial weapon audio: the frame's sounds queue with world positions, then
+/// play through the HRTF mixer at the listener's ears and out the device.
+struct GameAudio {
+	engine: Option<Binaural>,
+	device: audio::Device,
+	queue: Vec<(usize, [f32; 3], f32)>,
+}
+
+impl GameAudio {
+	/// Loads the HRTF dataset beside the clips and opens the output device; a
+	/// missing or mismatched dataset leaves the game running silently.
+	fn new(root: &std::path::Path, clips: Vec<Clip>) -> GameAudio {
+		let engine = match std::fs::read(root.join("assets").join("audio").join("hrtf.mhr")) {
+			Ok(bytes) => match Binaural::new(&bytes, audio::DISTANCE_SCALE, clips) {
+				Ok(engine) => Some(engine),
+				Err(e) => {
+					eprintln!("HRTF audio unavailable: {e}");
+					None
+				}
+			},
+			Err(e) => {
+				eprintln!("assets/audio/hrtf.mhr: {e}");
+				None
+			}
+		};
+		GameAudio {
+			engine,
+			device: audio::Device::open(),
+			queue: Vec::new(),
+		}
+	}
+
+	fn play(&mut self, clip: usize, position: Vec3, volume: f32) {
+		self
+			.queue
+			.push((clip, [position.x, position.y, position.z], volume));
+	}
+
+	/// One frame: place the listener at the view, flush the queue, push the mix.
+	fn frame(&mut self, eye: Vec3, forward: Vec3, up: Vec3) {
+		let GameAudio {
+			engine,
+			device,
+			queue,
+		} = self;
+		if let Some(mixer) = engine {
+			mixer.listener(
+				[eye.x, eye.y, eye.z],
+				[forward.x, forward.y, forward.z],
+				[up.x, up.y, up.z],
+			);
+			for (clip, position, volume) in std::mem::take(queue) {
+				mixer.play(clip, position, volume);
+			}
+		} else {
+			queue.clear();
+		}
+		device.update(engine.as_mut());
+	}
 }
 
 /// Draws the weapon in `to`: the old magazine goes back to the store, the new
@@ -214,6 +310,8 @@ fn holster(
 	to: usize,
 	now: f32,
 	console: &mut Console,
+	audio: &mut GameAudio,
+	at: Vec3,
 ) {
 	mags[*slot] = (armed.clip, armed.reserve);
 	let w = &table.weapons[to];
@@ -221,14 +319,36 @@ fn holster(
 	if let Some(vm) = &mut viewmodels[to] {
 		vm.start("draw", now, false);
 	}
-	if let Some(s) = guns[to].deploy.as_ref() {
-		macroquad::audio::play_sound_once(s);
+	if let Some(s) = guns[to].deploy {
+		audio.play(s, at, 0.7);
 	}
 	console.print(format!("{} ({} of 8)", w.name, to + 1));
 	*slot = to;
 }
 
-pub async fn run() {
+/// Opens the window and plays until the game quits or the window closes.
+pub fn run() {
+	let mut window = match Window::open("player", 1600, 900) {
+		Ok(window) => window,
+		Err(e) => {
+			eprintln!("{e}");
+			std::process::exit(1);
+		}
+	};
+	play(&mut window, None, 0, &mut || false);
+}
+
+/// One generation of the game in an open window. `reload` is asked once per
+/// frame; when it answers true the game returns its [`state::Carried`] bytes
+/// for the next generation, which passes them back as `carried`. `generation`
+/// counts hot reloads, 0 when there are none. None when the game quits or
+/// the window closes.
+pub fn play(
+	window: &mut Window,
+	carried: Option<&[u8]>,
+	generation: u32,
+	reload: &mut dyn FnMut() -> bool,
+) -> Option<Vec<u8>> {
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	if args.iter().any(|arg| arg == "--arena") {
 		eprintln!("--arena is no longer supported; the game now loads Dust2 by default");
@@ -259,43 +379,35 @@ pub async fn run() {
 		map.world.tris().len(),
 		map.spawn
 	));
-	let renderer = match MapRenderer::new(&map.render) {
-		Ok(renderer) => renderer,
-		Err(e) => {
-			eprintln!("{e}");
-			std::process::exit(1);
-		}
-	};
-	// The BSP's embedded GoldSrc lightdata is the default baked lightmap.
-	// This optional bake remains available for comparison and rebaking.
-	if cvars.r_lightbake != 0.0 {
-		let start = std::time::Instant::now();
-		match lightmap::bake(&map, &map_path) {
-			Ok(baked) => console.print(format!(
-				"lightmap: {} charts in a {}x{} atlas, baked in {:?}",
-				baked.charts(),
-				baked.atlas().0,
-				baked.atlas().0,
-				start.elapsed()
-			)),
-			Err(e) => console.print(format!("lightmap bake failed: {e}")),
-		}
-	}
-	let (world, surfaces, spawn, spawn_yaw, spawn_pitch, kill_y) = (
-		map.world,
+	// The BSP's embedded GoldSrc lightdata is the fallback; our own bake at
+	// 2 units per texel is sharper and caches beside the map after the first
+	// bake.
+	// The sun and sky the map's entities describe; the raycast voxel field
+	// stores each voxel's light from them as the view draws it.
+	let light = lightmap::config(&map_path).unwrap_or_else(|e| {
+		console.print(format!("map light unreadable, using defaults: {e}"));
+		engine::lightbake::Config::default()
+	});
+	let traced = window.gfx().load_world(&map, &light);
+	console.print(format!("traced world: {} triangles", traced.triangles));
+	// The map's collision mesh, with the physics playground's spheres in it.
+	let (mut play, surfaces, spawn, spawn_yaw, spawn_pitch, kill_y) = (
+		physics::World::new(map.world),
 		map.surfaces,
 		map.spawn,
 		map.spawn_yaw,
 		map.spawn_pitch,
 		map.kill_y,
 	);
+	// GoldSrc gravity, so playground spheres fall like the player does.
+	play.gravity = vec3(0.0, -800.0, 0.0);
 	let mut player = Player::spawn(spawn);
 	let mut previous = player;
 	// The free camera on F: where it floats, or None while the player plays.
 	let (mut fly, mut fly_eye) = (false, player.eye());
 	let (mut yaw, mut pitch) = (spawn_yaw, spawn_pitch);
-	let mut wireframe = false;
-	let mut grabbed = true;
+	// Esc's menu; while it is open the cursor is free and the game takes no input.
+	let mut menu = menu::Menu::new();
 	// The 1.6 weapon table, its sounds and viewmodels, and the gun in hand.
 	let table = {
 		let mut noted = Vec::new();
@@ -313,7 +425,7 @@ pub async fn run() {
 		.map(|w| {
 			cstrike
 				.as_ref()
-				.and_then(|dir| viewmodel::Viewmodel::load(dir, w))
+				.and_then(|dir| viewmodel::Viewmodel::load(window.gfx(), dir, w))
 		})
 		.collect();
 	// The reload takes at least as long as its animation, the deploy as the
@@ -328,44 +440,39 @@ pub async fn run() {
 		}
 	}
 	let mut guns = Vec::with_capacity(table.weapons.len());
+	// The clips all load into the one list the mixer owns; each gun keeps indices.
+	let mut clips: Vec<Clip> = Vec::new();
 	for w in &table.weapons {
 		let dir = sound_dir.as_deref();
-		let mut fire = Vec::new();
-		for name in &w.sounds.fire {
-			fire.push(load_sound(dir, name, w).await);
-		}
+		let mut at = |file: &str| -> usize {
+			clips.push(load_clip(dir, file, w));
+			clips.len() - 1
+		};
+		let fire: Vec<usize> = w.sounds.fire.iter().map(|n| at(n)).collect();
 		let mut reload = Vec::new();
 		for s in &w.sounds.reload {
 			let (file, frac) = s.split_once('@').unwrap_or((s.as_str(), "0"));
-			reload.push((
-				frac.parse::<f32>().unwrap_or(0.0),
-				load_sound(dir, file, w).await,
-			));
+			reload.push((frac.parse::<f32>().unwrap_or(0.0), at(file)));
 		}
 		guns.push(Gun {
 			fire,
-			dry: match w.sounds.dry.as_deref() {
-				Some(f) => Some(load_sound(dir, f, w).await),
-				None => None,
-			},
-			deploy: match w.sounds.deploy.as_deref() {
-				Some(f) => Some(load_sound(dir, f, w).await),
-				None => None,
-			},
+			dry: w.sounds.dry.as_deref().map(&mut at),
+			deploy: w.sounds.deploy.as_deref().map(&mut at),
 			reload,
-			zoom: match w.zoom.as_ref().and_then(|z| z.sound.as_deref()) {
-				Some(f) => Some(load_sound(dir, f, w).await),
-				None => None,
-			},
-			stab: match w.sounds.stab.as_deref() {
-				Some(f) => Some(load_sound(dir, f, w).await),
-				None => None,
-			},
-			wall: match w.sounds.wall.as_deref() {
-				Some(f) => Some(load_sound(dir, f, w).await),
-				None => None,
-			},
+			zoom: w
+				.zoom
+				.as_ref()
+				.and_then(|z| z.sound.as_deref())
+				.map(&mut at),
+			stab: w.sounds.stab.as_deref().map(&mut at),
+			wall: w.sounds.wall.as_deref().map(at),
 		});
+	}
+	// Binaural HRTF audio: the clips above, convolved per voice against the
+	// listener's ears.
+	let mut audio = GameAudio::new(root(), clips);
+	if let Some(engine) = &audio.engine {
+		console.print(format!("binaural HRTF audio: {}", engine.stats()));
 	}
 	if cstrike.is_some() {
 		console.print("1.6 models and sounds loaded".to_string());
@@ -387,27 +494,109 @@ pub async fn run() {
 	}
 	cvars.player_maxspeed = table.weapons[slot].maxspeed;
 	let (mut now, mut recoil) = (0.0f32, 0.0f32);
+	// A hot reload picks up where the previous generation left off.
+	if let Some(bytes) = carried {
+		match state::Carried::restore(bytes) {
+			Ok(c) => {
+				(player, previous, yaw, pitch) = (c.player, c.previous, c.yaw, c.pitch);
+				(fly, fly_eye, money, now) = (c.fly, c.fly_eye, c.money, c.now);
+				console.open = c.console_open;
+				for (owned, carried) in owned.iter_mut().zip(&c.owned) {
+					*owned = *carried;
+				}
+				for (mag, carried) in mags.iter_mut().zip(&c.mags) {
+					*mag = *carried;
+				}
+				for (name, value) in &c.cvars {
+					let _ = cvars.set(name, *value);
+				}
+				if c.slot < table.weapons.len() {
+					slot = c.slot;
+				}
+				armed = Armed::new(&table.weapons[slot], now);
+				if let Err(e) = armed.restore(&c.armed) {
+					console.print(format!(
+						"hot reload: fresh {}: {e}",
+						table.weapons[slot].name
+					));
+				}
+				if let Some(vm) = &mut viewmodels[slot] {
+					vm.start("draw", now, false);
+				}
+				cvars.player_maxspeed = table.weapons[slot].maxspeed;
+			}
+			Err(e) => console.print(format!("hot reload: starting fresh: {e}")),
+		}
+	}
 	let mut shots: Vec<(Shot, f32)> = Vec::new();
 	let mut report = String::new();
-	set_cursor_grab(true);
-	show_mouse(false);
-	let mut last_mouse = mouse_position();
+	window.grab_cursor(true);
 	let mut accumulator = 0.0;
 	// Presses seen between ticks, so a tap shorter than a tick still counts.
 	let mut jump_pressed = false;
 	let (mut tick_count, mut ticks_per_second, mut second) = (0, 0, 0.0);
+	let map_name = map_path
+		.file_name()
+		.unwrap_or_default()
+		.to_string_lossy()
+		.into_owned();
+	let mut profiler =
+		match profiler::Profiler::new(root().join("logs").join("performance"), map_name) {
+			Ok(profiler) => {
+				console.print("automatic performance spike capture armed".to_string());
+				Some(profiler)
+			}
+			Err(error) => {
+				eprintln!("automatic performance capture unavailable: {error}");
+				None
+			}
+		};
 
 	loop {
-		if is_key_pressed(KeyCode::GraveAccent) || is_key_pressed(KeyCode::F1) {
+		// Between frames, a hot reload hands the state to the next generation.
+		if reload() {
+			return Some(
+				state::Carried {
+					player,
+					previous,
+					yaw,
+					pitch,
+					fly,
+					fly_eye,
+					slot,
+					money,
+					owned: owned.to_vec(),
+					mags,
+					armed: armed.save(),
+					now,
+					console_open: console.open,
+					cvars: Cvars::NAMES
+						.iter()
+						.filter_map(|name| Some((name.to_string(), cvars.get(name)?)))
+						.collect(),
+				}
+				.save(),
+			);
+		}
+		let frame_time = window.frame_time();
+		let keys = window.input().clone();
+		let frame_interval_ms = frame_time * 1000.0;
+		let frame_started = std::time::Instant::now();
+		if keys.pressed(Key::Backquote) || keys.pressed(Key::F1) {
 			console.open = !console.open;
-			while get_char_pressed().is_some() {}
+		}
+		// F5 steps through what the trace shows: lit, then its debug views.
+		if keys.pressed(Key::F5) {
+			let gfx = window.gfx();
+			gfx.cycle_view_mode();
+			console.print(format!("view {}", gfx.view_mode()));
 		}
 		let typing = console.open;
 		if typing {
-			if type_into(&mut console) {
+			if type_into(&mut console, &keys) {
 				for action in console.submit(&mut cvars) {
 					match action {
-						Action::Quit => return,
+						Action::Quit => return None,
 						Action::Respawn => {
 							player = Player::spawn(spawn);
 							previous = player;
@@ -422,48 +611,43 @@ pub async fn run() {
 					}
 				}
 			}
-			if is_key_pressed(KeyCode::Escape) {
+			if keys.pressed(Key::Escape) {
 				console.open = false;
 			}
-		} else if is_key_pressed(KeyCode::Escape) {
-			grabbed = false;
-		} else if !grabbed && is_mouse_button_pressed(MouseButton::Left) {
-			grabbed = true;
-		} else if !typing && is_key_pressed(KeyCode::F) {
+		} else if keys.pressed(Key::Escape) && !buy_menu {
+			menu.escape(&mut cvars);
+		} else if !menu.open && keys.pressed(Key::KeyF) {
 			fly = !fly;
 			if fly {
 				fly_eye = player.eye();
 			}
 			console.print(format!("flycam {}", if fly { "on" } else { "off" }));
 		}
-		if !typing && is_key_pressed(KeyCode::F3) {
-			wireframe = !wireframe;
-			console.print(format!(
-				"wireframe {}",
-				if wireframe { "on" } else { "off" }
-			));
-		}
+		let typing = typing || menu.open;
 		// B is the buy menu; there the number keys buy, elsewhere they switch.
-		if !typing && is_key_pressed(KeyCode::B) {
+		if !typing && keys.pressed(Key::KeyB) {
 			buy_menu = !buy_menu;
 		}
-		if buy_menu && (is_key_pressed(KeyCode::Escape) || typing) {
+		if buy_menu && (keys.pressed(Key::Escape) || typing) {
 			buy_menu = false;
 		}
+		// The drawn weapon's report comes from where it sits ahead of the eye.
+		let (draw_forward, draw_right, draw_up) = angle_vectors(yaw, pitch);
+		let draw_at = muzzle(player.eye(), draw_forward, draw_right, draw_up);
 		for (i, key) in [
-			KeyCode::Key1,
-			KeyCode::Key2,
-			KeyCode::Key3,
-			KeyCode::Key4,
-			KeyCode::Key5,
-			KeyCode::Key6,
-			KeyCode::Key7,
-			KeyCode::Key8,
+			Key::Digit1,
+			Key::Digit2,
+			Key::Digit3,
+			Key::Digit4,
+			Key::Digit5,
+			Key::Digit6,
+			Key::Digit7,
+			Key::Digit8,
 		]
 		.iter()
 		.enumerate()
 		{
-			if !is_key_pressed(*key) {
+			if !keys.pressed(*key) {
 				continue;
 			}
 			if buy_menu {
@@ -492,6 +676,8 @@ pub async fn run() {
 						i,
 						now,
 						&mut console,
+						&mut audio,
+						draw_at,
 					);
 				} else {
 					console.print(format!("${} needed for {}", w.price, w.name));
@@ -507,50 +693,45 @@ pub async fn run() {
 					i,
 					now,
 					&mut console,
+					&mut audio,
+					draw_at,
 				);
 			} else if i != slot {
 				console.print(format!("{} not owned; B to buy", table.weapons[i].name));
 			}
 		}
-		let looking = grabbed && !typing;
-		set_cursor_grab(looking);
-		show_mouse(!looking);
+		let looking = !typing && keys.focused();
+		window.grab_cursor(looking);
 
 		// Look: raw counts every frame, never waiting for a tick.
-		let mouse = mouse_position();
+		let (dx, dy) = keys.mouse_delta();
 		if looking {
 			let scale = cvars.sensitivity;
-			yaw = (yaw + (mouse.0 - last_mouse.0) * scale * cvars.m_yaw).rem_euclid(360.0);
-			pitch = (pitch + (mouse.1 - last_mouse.1) * scale * cvars.m_pitch).clamp(-89.0, 89.0);
+			yaw = (yaw + dx * scale * cvars.m_yaw).rem_euclid(360.0);
+			pitch = (pitch + dy * scale * cvars.m_pitch).clamp(-89.0, 89.0);
 		}
-		last_mouse = mouse;
 
-		let down = |k: KeyCode| !typing && is_key_down(k);
-		jump_pressed |= !typing && (is_key_pressed(KeyCode::Space) || mouse_wheel().1 != 0.0);
-		let walk = if down(KeyCode::LeftShift) {
+		let down = |k: Key| !typing && keys.down(k);
+		jump_pressed |= !typing && (keys.pressed(Key::Space) || keys.wheel() != 0.0);
+		let walk = if down(Key::ShiftLeft) {
 			cvars.cl_movespeedkey
 		} else {
 			1.0
 		};
-		let axis = |pos: KeyCode, neg: KeyCode, p: f32, n: f32| {
+		let axis = |pos: Key, neg: Key, p: f32, n: f32| {
 			(if down(pos) { p } else { 0.0 }) - (if down(neg) { n } else { 0.0 })
 		};
-		let duck = down(KeyCode::LeftControl) || down(KeyCode::C);
+		let duck = down(Key::ControlLeft) || down(Key::KeyC);
 		let input = Input {
 			forward: axis(
-				KeyCode::W,
-				KeyCode::S,
+				Key::KeyW,
+				Key::KeyS,
 				cvars.cl_forwardspeed,
 				cvars.cl_backspeed,
 			) * walk,
-			side: axis(
-				KeyCode::D,
-				KeyCode::A,
-				cvars.cl_sidespeed,
-				cvars.cl_sidespeed,
-			) * walk,
+			side: axis(Key::KeyD, Key::KeyA, cvars.cl_sidespeed, cvars.cl_sidespeed) * walk,
 			up: if player.noclip {
-				(if down(KeyCode::Space) {
+				(if down(Key::Space) {
 					cvars.cl_upspeed
 				} else {
 					0.0
@@ -560,11 +741,12 @@ pub async fn run() {
 			},
 			yaw,
 			pitch,
-			jump: down(KeyCode::Space) || jump_pressed,
+			jump: down(Key::Space) || jump_pressed,
 			duck,
 		};
 
 		let dt = 1.0 / cvars.sv_tickrate.clamp(10.0, 1000.0);
+		let vars = movement_vars(&cvars);
 		// The held weapon caps the run speed, the scope further still, as 1.6.
 		let weapon = &table.weapons[slot];
 		cvars.player_maxspeed = if armed.zoom > 0 {
@@ -575,48 +757,88 @@ pub async fn run() {
 		} else {
 			weapon.maxspeed
 		};
-		accumulator += get_frame_time().min(MAX_FRAME);
-		let vars = movement_vars(&cvars);
+		accumulator += frame_time.min(MAX_FRAME);
 		// The flycam moves per frame along the look direction; the player stands
 		// still and is drawn where it was.
 		if fly {
 			let (forward, right, _) = angle_vectors(yaw, pitch);
 			let mut toward = Vec3::ZERO;
-			if down(KeyCode::W) {
+			if down(Key::KeyW) {
 				toward += forward;
 			}
-			if down(KeyCode::S) {
+			if down(Key::KeyS) {
 				toward -= forward;
 			}
-			if down(KeyCode::D) {
+			if down(Key::KeyD) {
 				toward += right;
 			}
-			if down(KeyCode::A) {
+			if down(Key::KeyA) {
 				toward -= right;
 			}
-			if down(KeyCode::Space) {
+			if down(Key::Space) {
 				toward.y += 1.0;
 			}
 			if duck {
 				toward.y -= 1.0;
 			}
 			if toward.length2() > 0.0 {
-				let speed = cvars.cl_forwardspeed * if down(KeyCode::LeftShift) { 2.0 } else { 1.0 };
-				fly_eye += toward.normalize() * speed * get_frame_time().min(MAX_FRAME);
+				let speed = cvars.cl_forwardspeed * if down(Key::ShiftLeft) { 2.0 } else { 1.0 };
+				fly_eye += toward.normalize() * speed * frame_time.min(MAX_FRAME);
 			}
 		}
 		while accumulator >= dt {
 			accumulator -= dt;
 			previous = player;
 			if !fly {
-				player.tick(input, &vars, &world, dt);
+				if let Some(profiler) = &mut profiler {
+					player::movement::begin_collision_query_count();
+					let tick_started = std::time::Instant::now();
+					player.tick(input, &vars, &play.mesh, dt);
+					let elapsed_ms = tick_started.elapsed().as_secs_f32() * 1000.0;
+					let queries = player::movement::take_collision_query_count();
+					if profiler.observe(profiler::Sample::new(
+						0.0,
+						frame_started.elapsed().as_secs_f32() * 1000.0,
+						dt * 1000.0,
+						elapsed_ms,
+						elapsed_ms,
+						1,
+						queries.casts,
+						queries.overlaps,
+						queries.nanos as f32 / 1e6,
+						queries.longest_nanos as f32 / 1e6,
+						&player,
+						input,
+						fly,
+						slot,
+						armed.clip,
+						armed.reserve,
+						money,
+						&vars,
+						cvars.sv_tickrate,
+						accumulator * 1000.0,
+					)) {
+						console
+							.print("movement tick spike detected; recording 16 seconds of follow-up".to_string());
+					}
+				} else {
+					player.tick(input, &vars, &play.mesh, dt);
+				}
 			}
 			jump_pressed = false;
 			tick_count += 1;
 		}
-		second += get_frame_time();
+		second += frame_time;
 		if second >= 1.0 {
 			(ticks_per_second, tick_count, second) = (tick_count, 0, second - 1.0);
+			// The stage times on the console too, for profiling runs.
+			let stages: Vec<String> = window
+				.gfx()
+				.timings()
+				.iter()
+				.map(|(stage, ms)| format!("{stage} {ms:.2}"))
+				.collect();
+			eprintln!("{ticks_per_second} ticks/s  gpu: {}", stages.join("  "));
 		}
 		if player.origin.y < kill_y {
 			player = Player::spawn(spawn);
@@ -630,8 +852,11 @@ pub async fn run() {
 		};
 		let shown = previous.interpolate(&player, alpha);
 		// The view kicks with the punch and bullets leave along it, as in 1.6.
-		let (forward, _, up) = angle_vectors(yaw + armed.punch.1, pitch + armed.punch.0);
-		let up = Quat::from_axis_angle(forward, shown.punch_roll.to_radians()).rotate(up);
+		// The landing roll turns right and up together about forward, so the
+		// basis stays orthonormal.
+		let (forward, right, up) = angle_vectors(yaw + armed.punch.1, pitch + armed.punch.0);
+		let roll = Quat::from_axis_angle(forward, shown.punch_roll.to_radians());
+		let (right, up) = (roll.rotate(right), roll.rotate(up));
 		let eye = if fly { fly_eye } else { shown.eye() };
 		// `fov` is horizontal at 4:3, as in GoldSrc; the scope narrows it.
 		let fov = if armed.zoom > 0 {
@@ -639,13 +864,12 @@ pub async fn run() {
 		} else {
 			cvars.fov
 		};
-		let fovy = 2.0 * ((fov.clamp(10.0, 170.0).to_radians() * 0.5).tan() * 0.75).atan();
-		let (_, right, _) = angle_vectors(yaw + armed.punch.1, pitch + armed.punch.0);
+		let fovy = vertical_fov(fov);
 
 		// Fire: the trigger within the cycle, from the eye, along the punched
 		// view through the heat's cone; the reload stages its sounds, and the
 		// glock's burst rounds fire on their own schedule.
-		let frame = get_frame_time().min(MAX_FRAME);
+		let frame = frame_time.min(MAX_FRAME);
 		now += frame;
 		recoil *= (-10.0 * frame).exp();
 		let ease = (-8.0 * frame).exp();
@@ -654,11 +878,11 @@ pub async fn run() {
 		let tick = armed.tick(weapon, now);
 		for (frac, s) in &guns[slot].reload {
 			if tick.reload_sounds.contains(frac) {
-				macroquad::audio::play_sound_once(s);
+				audio.play(*s, muzzle(eye, forward, right, up), 0.7);
 			}
 		}
 		// R reloads: staged sounds above, the animation here.
-		if looking && is_key_pressed(KeyCode::R) {
+		if looking && keys.pressed(Key::KeyR) {
 			let was = armed.reload_at.is_none();
 			armed.start_reload(weapon, now);
 			if was && armed.reload_at.is_some() {
@@ -669,11 +893,11 @@ pub async fn run() {
 		}
 		// Mouse 2 is the weapon's second use: the AWP's scope, the glock's
 		// burst mode.
-		if looking && is_mouse_button_pressed(MouseButton::Right) {
+		if looking && keys.clicked(MouseButton::Right) {
 			if weapon.zoom.is_some() {
 				if let Some(fov) = armed.toggle_zoom(weapon, now) {
-					if let Some(s) = guns[slot].zoom.as_ref() {
-						macroquad::audio::play_sound_once(s);
+					if let Some(s) = guns[slot].zoom {
+						audio.play(s, muzzle(eye, forward, right, up), 0.5);
 					}
 					console.print(if fov > 0.0 {
 						format!("zoom {fov}")
@@ -695,8 +919,7 @@ pub async fn run() {
 		}
 		let pulled = looking
 			&& !buy_menu
-			&& (is_mouse_button_pressed(MouseButton::Left)
-				|| (weapon.auto && is_mouse_button_down(MouseButton::Left)));
+			&& (keys.clicked(MouseButton::Left) || (weapon.auto && keys.button_down(MouseButton::Left)));
 		let will_dry = pulled && armed.can_fire(now) && armed.clip == 0;
 		if tick.burst || pulled {
 			let grounded = !fly && player.on_ground;
@@ -722,7 +945,7 @@ pub async fn run() {
 					}
 					let dir = used.dir(forward, right, up, spread);
 					let shot = bullets::fire(
-						&world,
+						&play.mesh,
 						&surfaces,
 						eye,
 						dir,
@@ -753,24 +976,25 @@ pub async fn run() {
 						)
 					};
 					if used.melee && distance < used.range - 1.0 {
-						if let Some(s) = guns[slot].wall.as_ref() {
-							macroquad::audio::play_sound_once(s);
+						if let Some(s) = guns[slot].wall {
+							// The knife met the wall at the hit, not in the hand.
+							audio.play(s, shot.end, 0.9);
 						}
 					}
 					let g = &guns[slot];
 					if stab {
-						if let Some(s) = g.stab.as_ref() {
-							macroquad::audio::play_sound_once(s);
+						if let Some(s) = g.stab {
+							audio.play(s, muzzle(eye, forward, right, up), 1.0);
 						}
 					} else if !g.fire.is_empty() {
-						let pick = macroquad::rand::gen_range(0usize, g.fire.len());
-						macroquad::audio::play_sound_once(&g.fire[pick]);
+						let pick = rng::index(g.fire.len());
+						audio.play(g.fire[pick], muzzle(eye, forward, right, up), 1.0);
 					}
 					shots.push((shot, 0.0));
 				}
 				None if will_dry => {
-					if let Some(s) = guns[slot].dry.as_ref() {
-						macroquad::audio::play_sound_once(s);
+					if let Some(s) = guns[slot].dry {
+						audio.play(s, muzzle(eye, forward, right, up), 0.6);
 					}
 				}
 				None => {}
@@ -781,64 +1005,73 @@ pub async fn run() {
 		}
 		shots.retain(|(_, age)| *age < SHOT_LIFE);
 
-		clear_background(map_render::SKY);
-		set_camera(&Camera {
+		// The playground: G throws a sphere ahead of the eye, H clears them.
+		// They collide with the map and each other and rest on it asleep.
+		if looking && keys.pressed(Key::KeyG) {
+			let mut body = physics::Body::default();
+			body.pos = eye + forward * 24.0;
+			body.vel = player.velocity + forward * 700.0;
+			body.radius = 8.0;
+			body.rotates = true;
+			body.friction = 0.5;
+			if play.bodies.len() >= BODY_CAP {
+				play.bodies.remove(0);
+			}
+			play.bodies.push(body);
+		}
+		if looking && keys.pressed(Key::KeyH) {
+			play.bodies.clear();
+		}
+		play.step(frame, true);
+		play.bodies.retain(|b| b.pos.y > kill_y);
+		let spheres: Vec<(Vec3, f32)> = play.bodies.iter().map(|b| (b.pos, b.radius)).collect();
+
+		let fps = window.fps();
+		let gfx = window.gfx();
+		gfx.set_exposure(cvars.r_exposure);
+		gfx.set_bodies(&spheres);
+		gfx.set_voxel(cvars.r_voxel);
+		gfx.set_shell(cvars.r_shell != 0.0);
+		gfx.set_view(View {
 			eye,
-			target: eye + forward,
+			forward,
+			right,
 			up,
 			fovy,
-			near: 1.0,
-			far: 8192.0,
 		});
-		renderer.draw(cvars.r_exposure);
-		if wireframe {
-			renderer.draw_wireframe();
-		}
 		for (shot, age) in &shots {
 			let fade = 1.0 - age / SHOT_LIFE;
-			// macroquad draws in its own Vec3; the game keeps linalg's.
-			let q = |v: Vec3| macroquad::math::Vec3::from(v);
-			draw_line_3d(
-				q(shot.origin),
-				q(shot.end),
-				Color::new(1.0, 0.85, 0.4, fade),
-			);
+			gfx.line_3d(shot.origin, shot.end, Color::new(1.0, 0.85, 0.4, fade));
 			for wall in &shot.walls {
-				draw_line_3d(
-					q(wall.entry),
-					q(wall.exit),
-					Color::new(0.35, 1.0, 0.45, fade),
-				);
-				draw_cube(
-					q(wall.entry),
-					q(vec3(1.0, 1.0, 1.0)),
-					None,
+				gfx.line_3d(wall.entry, wall.exit, Color::new(0.35, 1.0, 0.45, fade));
+				gfx.cube(
+					wall.entry,
+					vec3(1.0, 1.0, 1.0),
 					Color::new(0.02, 0.02, 0.02, fade),
 				);
-				draw_cube(
-					q(wall.exit),
-					q(vec3(1.0, 1.0, 1.0)),
-					None,
+				gfx.cube(
+					wall.exit,
+					vec3(1.0, 1.0, 1.0),
 					Color::new(0.35, 1.0, 0.45, fade),
 				);
 			}
-			draw_cube(
-				q(shot.end),
-				q(vec3(0.8, 0.8, 0.8)),
-				None,
+			gfx.cube(
+				shot.end,
+				vec3(0.8, 0.8, 0.8),
 				Color::new(0.9, 0.25, 0.2, fade),
 			);
 		}
 		if !fly && armed.zoom == 0 {
 			if let Some(vm) = &mut viewmodels[slot] {
 				vm.tick(now);
-				vm.draw(eye, forward, right, up, recoil, now);
+				vm.draw(gfx, eye, forward, right, up, recoil, now);
 			} else {
-				crate::weapons::draw_viewmodel(weapon, eye, forward, right, up, recoil);
+				crate::weapons::draw_viewmodel(gfx, weapon, eye, forward, right, up, recoil);
 			}
 		}
-		set_default_camera();
 		hud(
+			gfx,
+			fps,
 			&cvars,
 			&player,
 			fly,
@@ -848,15 +1081,29 @@ pub async fn run() {
 			money,
 			&report,
 		);
+		let (width, height) = gfx.size();
+		// The version in red at the lower right, with the hot reload count.
+		let version = match generation {
+			0 => format!("v{}", env!("CARGO_PKG_VERSION")),
+			n => format!("v{} #{n}", env!("CARGO_PKG_VERSION")),
+		};
+		let version_width = gfx.text_width(&version, 20.0);
+		gfx.text(
+			&version,
+			width - version_width - 16.0,
+			height - 16.0,
+			20.0,
+			Color::new(1.0, 0.0, 0.0, 1.0),
+		);
 		// The scope: crosshair lines across the screen, as 1.6 draws them.
 		if armed.zoom > 0 {
-			let (cx, cy) = (screen_width() / 2.0, screen_height() / 2.0);
-			draw_line(cx - 9999.0, cy, cx + 9999.0, cy, 1.5, BLACK);
-			draw_line(cx, cy - 9999.0, cx, cy + 9999.0, 1.5, BLACK);
+			let (cx, cy) = (width / 2.0, height / 2.0);
+			gfx.line(cx - 9999.0, cy, cx + 9999.0, cy, 1.5, Color::BLACK);
+			gfx.line(cx, cy - 9999.0, cx, cy + 9999.0, 1.5, Color::BLACK);
 		}
 		// The buy menu: 1.6's list, keyed by number.
 		if buy_menu {
-			draw_rectangle(
+			gfx.rect(
 				40.0,
 				60.0,
 				460.0,
@@ -864,18 +1111,18 @@ pub async fn run() {
 				Color::new(0.05, 0.07, 0.09, 0.85),
 			);
 			let mut y = 92.0;
-			draw_text("BUY  (1-8, B closes)", 56.0, y, 22.0, TEXT);
+			gfx.text("BUY  (1-8, B closes)", 56.0, y, 22.0, TEXT);
 			y += 28.0;
 			for (i, w) in table.weapons.iter().enumerate() {
 				let (color, tag) = if owned[i] {
-					(GREEN, "owned".to_string())
+					(Color::GREEN, "owned".to_string())
 				} else if money >= w.price {
 					(TEXT, format!("${}", w.price))
 				} else {
 					(MUTED, format!("${}", w.price))
 				};
-				draw_text(
-					format!("{}. {:<8} {}", i + 1, w.name, tag),
+				gfx.text(
+					&format!("{}. {:<8} {}", i + 1, w.name, tag),
 					56.0,
 					y,
 					22.0,
@@ -884,16 +1131,68 @@ pub async fn run() {
 				y += 26.0;
 			}
 		}
-		if console.open {
-			draw_console(&console);
+		match menu.frame(gfx, &keys, &mut cvars) {
+			Some(menu::Choice::NewGame) => {
+				player = Player::spawn(spawn);
+				previous = player;
+			}
+			Some(menu::Choice::Console) => console.open = true,
+			Some(menu::Choice::Save) => {
+				console.execute("writeconfig", &mut cvars);
+			}
+			Some(menu::Choice::Quit) => return None,
+			Some(menu::Choice::Resume) | None => {}
 		}
-		next_frame().await;
+		if console.open {
+			draw_console(gfx, &console);
+		}
+		if let Some(profiler) = &mut profiler {
+			if profiler.observe(profiler::Sample::new(
+				frame_interval_ms,
+				frame_started.elapsed().as_secs_f32() * 1000.0,
+				dt * 1000.0,
+				0.0,
+				0.0,
+				0,
+				0,
+				0,
+				0.0,
+				0.0,
+				&player,
+				input,
+				fly,
+				slot,
+				armed.clip,
+				armed.reserve,
+				money,
+				&vars,
+				cvars.sv_tickrate,
+				accumulator * 1000.0,
+			)) {
+				console.print("performance spike detected; recording 16 seconds of follow-up".to_string());
+			}
+			if let Some(remaining_ms) = profiler.capture_remaining_ms() {
+				gfx.text(
+					&format!("PERFORMANCE CAPTURE  {:.1}s", remaining_ms as f32 / 1000.0),
+					16.0,
+					height - 42.0,
+					18.0,
+					Color::new(1.0, 0.72, 0.2, 1.0),
+				);
+			}
+		}
+		// The ears sit at the view; this frame's queued sounds mix and push out.
+		audio.frame(eye, forward, up);
+		if !window.next_frame() {
+			return None;
+		}
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use engine::linalg::Camera;
 
 	#[test]
 	fn defaults_to_dust2_with_its_baked_lightmap() {
@@ -916,5 +1215,36 @@ mod tests {
 				.any(|rgba| rgba[..3] != [128, 128, 128]),
 			"Dust2 BSP has no baked lightmap samples"
 		);
+		let has_albedo = map.render.faces.iter().any(|face| {
+			let x = face.texture.x + face.texture.w / 2;
+			let y = face.texture.y + face.texture.h / 2;
+			let at = ((y * map.render.albedo.side + x) * 4) as usize;
+			let pixel = &map.render.albedo.rgba[at..at + 4];
+			pixel[3] != 0 && pixel[..3].iter().any(|&channel| channel != 0)
+		});
+		assert!(has_albedo, "Dust2 has no visible albedo texels");
+		let eye = Player::spawn(map.spawn).eye();
+		let (forward, right, _) = angle_vectors(map.spawn_yaw, map.spawn_pitch);
+		let camera = Camera {
+			eye,
+			target: eye + forward,
+			up: right.cross(forward),
+			fovy: vertical_fov(90.0),
+			near: 1.0,
+			far: 8192.0,
+		};
+		let view = camera.view_projection(1600.0 / 900.0);
+		let visible = map
+			.render
+			.faces
+			.iter()
+			.filter(|face| {
+				face.verts.iter().any(|v| {
+					let p = view.project_point(v.pos);
+					p.x.abs() <= 1.0 && p.y.abs() <= 1.0 && (-1.0..=1.0).contains(&p.z)
+				})
+			})
+			.count();
+		assert!(visible > 0, "spawn camera sees no Dust2 face from {eye:?}");
 	}
 }

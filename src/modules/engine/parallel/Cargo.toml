@@ -1,0 +1,9 @@
+[package]
+name = "parallel"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "A minimal job-parallelism executor: submit closures to a fixed worker pool and collect results"
+
+[lib]
+path = "lib.rs"

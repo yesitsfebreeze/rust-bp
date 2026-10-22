@@ -1,0 +1,16 @@
+[package]
+name = "hot_game"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Gameplay as the library the hot host loads and swaps"
+
+[lib]
+path = "lib.rs"
+crate-type = ["dylib"]
+test = false
+doctest = false
+
+[dependencies]
+engine_dylib = { path = "../../engine/dylib" }
+gameplay = { path = "../../gameplay" }

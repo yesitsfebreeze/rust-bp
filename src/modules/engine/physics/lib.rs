@@ -13,11 +13,15 @@
 //! bodies stop at thin geometry. Queries walk a bounding-volume hierarchy, and
 //! contacts apply Coulomb friction ([`Body::friction`]).
 
-use linalg::{vec3, Vec3};
+use bvh::Bvh;
+use linalg::{vec3, Quat, Vec3};
 use std::sync::OnceLock;
 
 mod body;
-pub use body::{Body, Platform, World};
+pub mod bvh;
+mod convex;
+pub use body::{Body, Platform, Shape, World};
+pub use convex::{Convex, Hull, Part, PartShape, Parts};
 
 pub type Triangle = [Vec3; 3];
 
@@ -318,7 +322,8 @@ pub struct Contact {
 /// Points closer than this to a triangle are on it.
 const ON_SURFACE: f32 = 1e-4;
 
-fn bounds(tri: &Triangle) -> (Vec3, Vec3) {
+/// The triangle's bounding box, the smallest box containing its corners.
+pub fn triangle_bounds(tri: &Triangle) -> (Vec3, Vec3) {
 	(
 		tri[0].min(tri[1]).min(tri[2]),
 		tri[0].max(tri[1]).max(tri[2]),
@@ -329,82 +334,19 @@ fn overlaps((lo, hi): (Vec3, Vec3), min: Vec3, max: Vec3) -> bool {
 	lo.x <= max.x && hi.x >= min.x && lo.y <= max.y && hi.y >= min.y && lo.z <= max.z && hi.z >= min.z
 }
 
-/// Bounding-volume hierarchy over a mesh's triangles, nodes in depth-first order: an
-/// inner node's left child follows it, `right` names the other. Leaves list
-/// `order[first..first + count]`.
-#[derive(Clone, Debug, Default)]
-struct Bvh {
-	nodes: Vec<Node>,
-	order: Vec<u32>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Node {
-	lo: Vec3,
-	hi: Vec3,
-	/// Leaf: first index into `order`. Inner: index of the right child.
-	first: u32,
-	/// Triangles in a leaf; zero for inner nodes.
-	count: u32,
-}
-
-const LEAF_SIZE: usize = 4;
-
-impl Bvh {
-	fn build(tris: &[Triangle]) -> Bvh {
-		let mut bvh = Bvh {
-			nodes: Vec::new(),
-			order: (0..tris.len() as u32).collect(),
-		};
-		if !tris.is_empty() {
-			bvh.split(tris, 0, tris.len());
-		}
-		bvh
-	}
-
-	/// Median split along the longest axis of the triangle centroids.
-	fn split(&mut self, tris: &[Triangle], start: usize, end: usize) {
-		let items = &mut self.order[start..end];
-		let (mut lo, mut hi) = bounds(&tris[items[0] as usize]);
-		let centroid = |i: u32| {
-			let t = &tris[i as usize];
-			(t[0] + t[1] + t[2]) * (1.0 / 3.0)
-		};
-		let (mut clo, mut chi) = (centroid(items[0]), centroid(items[0]));
-		for &i in items.iter() {
-			let (a, b) = bounds(&tris[i as usize]);
-			(lo, hi) = (lo.min(a), hi.max(b));
-			let c = centroid(i);
-			(clo, chi) = (clo.min(c), chi.max(c));
-		}
-		let at = self.nodes.len();
-		self.nodes.push(Node {
-			lo,
-			hi,
-			first: start as u32,
-			count: (end - start) as u32,
-		});
-		if end - start <= LEAF_SIZE {
-			return;
-		}
-		let e = chi - clo;
-		let axis = |v: Vec3| {
-			if e.x >= e.y && e.x >= e.z {
-				v.x
-			} else if e.y >= e.z {
-				v.y
-			} else {
-				v.z
-			}
-		};
-		let mid = (end - start) / 2;
-		items.select_nth_unstable_by(mid, |&a, &b| {
-			axis(centroid(a)).total_cmp(&axis(centroid(b)))
-		});
-		self.split(tris, start, start + mid);
-		self.nodes[at].first = self.nodes.len() as u32;
-		self.nodes[at].count = 0;
-		self.split(tris, start + mid, end);
+/// The ray's slab interval inside one axis of a box, `(t_enter, t_exit)`. An
+/// axis the ray does not move along spans the whole line inside the slab and
+/// nothing outside it; an empty interval (`enter > exit`) means the ray never
+/// touches the box.
+fn slab(origin: f32, dir: f32, lo: f32, hi: f32) -> (f32, f32) {
+	if dir > 0.0 {
+		((lo - origin) / dir, (hi - origin) / dir)
+	} else if dir < 0.0 {
+		((hi - origin) / dir, (lo - origin) / dir)
+	} else if origin >= lo && origin <= hi {
+		(f32::NEG_INFINITY, f32::INFINITY)
+	} else {
+		(f32::INFINITY, f32::NEG_INFINITY)
 	}
 }
 
@@ -414,7 +356,8 @@ struct Near<'a> {
 	bvh: &'a Bvh,
 	min: Vec3,
 	max: Vec3,
-	stack: Vec<u32>,
+	stack: [u32; bvh::MAX_DEPTH + 2],
+	stack_len: usize,
 	leaf: std::ops::Range<usize>,
 }
 
@@ -424,21 +367,83 @@ impl<'a> Iterator for Near<'a> {
 	fn next(&mut self) -> Option<Self::Item> {
 		loop {
 			if let Some(k) = self.leaf.next() {
-				let i = self.bvh.order[k] as usize;
-				if overlaps(bounds(&self.tris[i]), self.min, self.max) {
+				let i = self.bvh.order()[k] as usize;
+				if overlaps(triangle_bounds(&self.tris[i]), self.min, self.max) {
 					return Some((i, &self.tris[i]));
 				}
 				continue;
 			}
-			let at = self.stack.pop()? as usize;
-			let node = self.bvh.nodes[at];
+			if self.stack_len == 0 {
+				return None;
+			}
+			self.stack_len -= 1;
+			let at = self.stack[self.stack_len] as usize;
+			let node = self.bvh.nodes()[at];
 			if !overlaps((node.lo, node.hi), self.min, self.max) {
 				continue;
 			}
 			if node.count > 0 {
 				self.leaf = node.first as usize..(node.first + node.count) as usize;
 			} else {
-				self.stack.extend([node.first, at as u32 + 1]);
+				self.stack[self.stack_len] = node.first;
+				self.stack[self.stack_len + 1] = at as u32 + 1;
+				self.stack_len += 2;
+			}
+		}
+	}
+}
+
+/// Triangles the ray could touch, found by walking the [`Bvh`]: every leaf
+/// whose box the ray enters. The candidate triangles still need the exact
+/// ray-triangle test; a leaf's triangles all lie inside its box, so a box the
+/// ray misses holds no hit.
+pub struct RayTris<'a> {
+	tris: &'a [Triangle],
+	bvh: &'a Bvh,
+	origin: Vec3,
+	dir: Vec3,
+	stack: [u32; bvh::MAX_DEPTH + 2],
+	stack_len: usize,
+	leaf: std::ops::Range<usize>,
+}
+
+impl<'a> Iterator for RayTris<'a> {
+	type Item = (usize, &'a Triangle);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		loop {
+			if let Some(k) = self.leaf.next() {
+				let i = self.bvh.order()[k] as usize;
+				return Some((i, &self.tris[i]));
+			}
+			if self.stack_len == 0 {
+				return None;
+			}
+			self.stack_len -= 1;
+			let at = self.stack[self.stack_len] as usize;
+			let node = self.bvh.nodes()[at];
+			// The ray's interval inside the node's box: miss, or entirely
+			// behind the ray, means this subtree holds no hit either.
+			let mut enter = f32::NEG_INFINITY;
+			let mut exit = f32::INFINITY;
+			for (o, d, lo, hi) in [
+				(self.origin.x, self.dir.x, node.lo.x, node.hi.x),
+				(self.origin.y, self.dir.y, node.lo.y, node.hi.y),
+				(self.origin.z, self.dir.z, node.lo.z, node.hi.z),
+			] {
+				let (ein, aus) = slab(o, d, lo, hi);
+				enter = enter.max(ein);
+				exit = exit.min(aus);
+			}
+			if enter > exit {
+				continue;
+			}
+			if node.count > 0 {
+				self.leaf = node.first as usize..(node.first + node.count) as usize;
+			} else {
+				self.stack[self.stack_len] = node.first;
+				self.stack[self.stack_len + 1] = at as u32 + 1;
+				self.stack_len += 2;
 			}
 		}
 	}
@@ -455,6 +460,31 @@ pub struct Mesh {
 impl Mesh {
 	pub fn tris(&self) -> &[Triangle] {
 		&self.tris
+	}
+
+	/// The triangles a ray from `origin` along `dir` can hit, in BVH order.
+	/// Bullets and other ray casts walk these instead of testing every
+	/// triangle of the mesh.
+	pub fn ray_tris(&self, origin: Vec3, dir: Vec3) -> RayTris<'_> {
+		let bvh = self.bvh();
+		RayTris {
+			tris: &self.tris,
+			bvh,
+			origin,
+			dir,
+			stack: [0; bvh::MAX_DEPTH + 2],
+			stack_len: usize::from(!bvh.nodes().is_empty()),
+			leaf: 0..0,
+		}
+	}
+
+	/// Builds the collision index before the first query, for example while loading a map.
+	pub fn prepare(&self) {
+		let _ = self.bvh();
+	}
+
+	fn bvh(&self) -> &Bvh {
+		self.bvh.get_or_init(|| Bvh::build(&self.tris))
 	}
 
 	pub fn push_triangle(&mut self, tri: Triangle) {
@@ -529,17 +559,14 @@ impl Mesh {
 	}
 
 	fn near(&self, min: Vec3, max: Vec3) -> Near<'_> {
-		let bvh = self.bvh.get_or_init(|| Bvh::build(&self.tris));
+		let bvh = self.bvh();
 		Near {
 			tris: &self.tris,
 			bvh,
 			min,
 			max,
-			stack: if bvh.nodes.is_empty() {
-				Vec::new()
-			} else {
-				vec![0]
-			},
+			stack: [0; bvh::MAX_DEPTH + 2],
+			stack_len: usize::from(!bvh.nodes().is_empty()),
 			leaf: 0..0,
 		}
 	}
@@ -561,7 +588,9 @@ impl Mesh {
 		first
 	}
 
-	/// Contacts of the capsule `p0`–`p1` with `radius`, deepest first.
+	/// Contacts of the capsule `p0`–`p1` with `radius`, deepest first, into `out`
+	/// (appended to, so a caller merging several queries clears once), so a caller
+	/// stepping many bodies reuses one buffer.
 	///
 	/// With `filter`, an edge or vertex contact at point P is dropped when another
 	/// triangle passing through P is strictly closer to the shape. Then P is not the
@@ -569,24 +598,47 @@ impl Mesh {
 	/// and the closer triangle supplies the real contact. Only point-on-triangle
 	/// queries are used, so unwelded seams and T-junctions need no adjacency data.
 	/// Convex edges survive: every triangle through P is equally far there.
-	pub fn contacts(&self, p0: Vec3, p1: Vec3, radius: f32, filter: bool) -> Vec<Contact> {
+	pub fn contacts_into(
+		&self,
+		p0: Vec3,
+		p1: Vec3,
+		radius: f32,
+		filter: bool,
+		out: &mut Vec<Contact>,
+	) {
 		let r = vec3(radius, radius, radius);
-		let mut out: Vec<Contact> = self
-			.near(p0.min(p1) - r, p0.max(p1) + r)
-			.filter_map(|(tri, t)| {
-				let hit = segment_triangle(p0, p1, t);
-				(hit.dist < radius).then_some(Contact {
-					tri,
-					hit,
-					depth: radius - hit.dist,
-				})
-			})
-			.collect();
+		out.extend(
+			self
+				.near(p0.min(p1) - r, p0.max(p1) + r)
+				.filter_map(|(tri, t)| {
+					let hit = segment_triangle(p0, p1, t);
+					(hit.dist < radius).then_some(Contact {
+						tri,
+						hit,
+						depth: radius - hit.dist,
+					})
+				}),
+		);
 		if filter {
 			out.retain(|c| c.hit.feature == Feature::Face || !self.dominated(c, p0, p1));
 		}
 		out.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+	}
+
+	/// Contacts of the capsule `p0`–`p1` with `radius`, deepest first.
+	pub fn contacts(&self, p0: Vec3, p1: Vec3, radius: f32, filter: bool) -> Vec<Contact> {
+		let mut out = Vec::new();
+		self.contacts_into(p0, p1, radius, filter, &mut out);
 		out
+	}
+
+	/// Bounds over all triangles, from the BVH root.
+	pub fn bounds(&self) -> (Vec3, Vec3) {
+		self
+			.bvh()
+			.nodes()
+			.first()
+			.map_or((Vec3::ZERO, Vec3::ZERO), |n| (n.lo, n.hi))
 	}
 
 	fn dominated(&self, c: &Contact, p0: Vec3, p1: Vec3) -> bool {
@@ -637,79 +689,116 @@ impl Cylinder {
 }
 
 /// A vertex of the GJK simplex: a point of the Minkowski difference and the
-/// cylinder point it came from.
+/// witnesses it came from, one on each shape.
 #[derive(Clone, Copy, Debug)]
 struct Support {
 	w: Vec3,
 	a: Vec3,
+	b: Vec3,
 }
 
 /// Shrinks the simplex `s` to the vertices spanning its point closest to the origin,
 /// with their weights in `l`, and returns that point; `None` when the origin is inside.
-fn reduce(s: &mut Vec<Support>, l: &mut Vec<f32>) -> Option<Vec3> {
-	let all = s.clone();
-	let weights: Vec<(usize, f32)> = match all.len() {
-		1 => vec![(0, 1.0)],
+fn reduce(s: &mut [Support; 4], len: &mut usize, l: &mut [f32; 4]) -> Option<Vec3> {
+	let all = [s[0].w, s[1].w, s[2].w, s[3].w];
+	let mut indices = [0usize; 4];
+	let mut weights = [0.0; 4];
+	let kept = match *len {
+		1 => {
+			indices[0] = 0;
+			weights[0] = 1.0;
+			1
+		}
 		2 => {
-			let (a, b) = (all[0].w, all[1].w);
+			let (a, b) = (all[0], all[1]);
 			let ab = b - a;
 			let t = (-a.dot(ab) / ab.length2().max(EPS * EPS)).clamp(0.0, 1.0);
 			if t <= 0.0 {
-				vec![(0, 1.0)]
+				indices[0] = 0;
+				weights[0] = 1.0;
+				1
 			} else if t >= 1.0 {
-				vec![(1, 1.0)]
+				indices[0] = 1;
+				weights[0] = 1.0;
+				1
 			} else {
-				vec![(0, 1.0 - t), (1, t)]
+				indices[..2].copy_from_slice(&[0, 1]);
+				weights[..2].copy_from_slice(&[1.0 - t, t]);
+				2
 			}
 		}
 		3 => {
-			let w = origin_triangle([all[0].w, all[1].w, all[2].w]);
-			(0..3).filter(|&i| w[i] > 0.0).map(|i| (i, w[i])).collect()
+			let w = origin_triangle([all[0], all[1], all[2]]);
+			keep_face([0, 1, 2], w, &mut indices, &mut weights)
 		}
-		_ => {
+		4 => {
 			// The closest of the faces that see the origin from outside. A tetrahedron
 			// thinner than f32 resolves at its size has no reliable inside: then every
 			// face is a candidate. Thin but resolvable ones, as a small shape against
 			// a large triangle gives, keep their inside.
-			let size = all.iter().fold(1.0f32, |m, p| m.max(p.w.length()));
-			let flat = [(0, 1, 2, 3), (0, 1, 3, 2), (0, 2, 3, 1), (1, 2, 3, 0)]
-				.iter()
-				.any(|&(i, j, k, o)| {
-					let (a, b, c) = (all[i].w, all[j].w, all[k].w);
-					let n = (b - a).cross(c - a);
-					let len = n.length();
-					len <= EPS * size * size || n.dot(all[o].w - a).abs() / len <= 1e-6 * size
-				});
-			let mut best: Option<(f32, Vec<(usize, f32)>)> = None;
-			for (i, j, k, o) in [(0, 1, 2, 3), (0, 1, 3, 2), (0, 2, 3, 1), (1, 2, 3, 0)] {
-				let (a, b, c) = (all[i].w, all[j].w, all[k].w);
-				let n = (b - a).cross(c - a);
-				if !flat && n.dot(-a) * n.dot(all[o].w - a) > 0.0 {
+			const FACES: [(usize, usize, usize, usize); 4] =
+				[(0, 1, 2, 3), (0, 1, 3, 2), (0, 2, 3, 1), (1, 2, 3, 0)];
+			// Each face's normal and the height of the vertex opposite it, which
+			// both the thinness test and the visibility test read.
+			let mut planes = [(Vec3::ZERO, 0.0f32); 4];
+			for (plane, &(i, j, k, o)) in planes.iter_mut().zip(&FACES) {
+				let n = (all[j] - all[i]).cross(all[k] - all[i]);
+				*plane = (n, n.dot(all[o] - all[i]));
+			}
+			let size = all.iter().fold(1.0f32, |m, p| m.max(p.length()));
+			let flat = planes.iter().any(|&(n, side)| {
+				let len = n.length();
+				len <= EPS * size * size || side.abs() / len <= 1e-6 * size
+			});
+			let mut best: Option<(f32, [usize; 3], [f32; 3])> = None;
+			for (&(i, j, k, _), &(n, side)) in FACES.iter().zip(&planes) {
+				let (a, b, c) = (all[i], all[j], all[k]);
+				if !flat && n.dot(-a) * side > 0.0 {
 					continue;
 				}
 				let w = origin_triangle([a, b, c]);
 				let d = (a * w[0] + b * w[1] + c * w[2]).length2();
-				if best.as_ref().is_none_or(|b| d < b.0) {
-					let idx = [i, j, k];
-					best = Some((
-						d,
-						(0..3)
-							.filter(|&m| w[m] > 0.0)
-							.map(|m| (idx[m], w[m]))
-							.collect(),
-					));
+				if best.is_none_or(|b| d < b.0) {
+					best = Some((d, [i, j, k], w));
 				}
 			}
-			best?.1
+			let (_, face, w) = best?;
+			keep_face(face, w, &mut indices, &mut weights)
 		}
+		_ => return None,
 	};
-	*s = weights.iter().map(|&(i, _)| all[i]).collect();
-	*l = weights.iter().map(|&(_, x)| x).collect();
+	// Every branch keeps its vertices in ascending order, so compacting forward
+	// never overwrites one still to be moved.
+	for i in 0..kept {
+		s[i] = s[indices[i]];
+		l[i] = weights[i];
+	}
+	*len = kept;
 	Some(
-		s.iter()
-			.zip(l.iter())
+		s[..kept]
+			.iter()
+			.zip(&l[..kept])
 			.fold(Vec3::ZERO, |p, (v, &x)| p + v.w * x),
 	)
+}
+
+/// The vertices of `face` with a positive weight in `w`, into `indices` and
+/// `weights`; returns how many.
+fn keep_face(
+	face: [usize; 3],
+	w: [f32; 3],
+	indices: &mut [usize; 4],
+	weights: &mut [f32; 4],
+) -> usize {
+	let mut kept = 0;
+	for (&i, &weight) in face.iter().zip(&w) {
+		if weight > 0.0 {
+			indices[kept] = i;
+			weights[kept] = weight;
+			kept += 1;
+		}
+	}
+	kept
 }
 
 /// Barycentric weights of the point of triangle `t` closest to the origin
@@ -749,109 +838,201 @@ fn origin_triangle(t: [Vec3; 3]) -> [f32; 3] {
 	[1.0 - v - w, v, w]
 }
 
+/// Closest points of two shapes GJK-style, from their support functions, with
+/// `hint` the first direction to try (center to center). `None` when the shapes
+/// overlap. Returns `(v, a, b)`: `v` points from B's witness toward A's and its
+/// length is the gap between the shapes.
+pub(crate) fn gjk_pair(
+	hint: Vec3,
+	mut support_a: impl FnMut(Vec3) -> Vec3,
+	mut support_b: impl FnMut(Vec3) -> Vec3,
+) -> Option<(Vec3, Vec3, Vec3)> {
+	let mut pair = |d: Vec3| {
+		let (a, b) = (support_a(d), support_b(-d));
+		Support { w: a - b, a, b }
+	};
+	let mut s = [Support {
+		w: Vec3::ZERO,
+		a: Vec3::ZERO,
+		b: Vec3::ZERO,
+	}; 4];
+	s[0] = pair(if hint.length2() > EPS {
+		hint
+	} else {
+		vec3(0.0, 1.0, 0.0)
+	});
+	let mut l = [0.0; 4];
+	l[0] = 1.0;
+	let mut simplex_len = 1;
+	let mut v = s[0].w;
+	for _ in 0..GJK_ITERATIONS {
+		let next = pair(-v);
+		// No support point comes meaningfully closer: `v` is the closest point.
+		if v.length2() - v.dot(next.w) <= 1e-6 * v.length2()
+			|| s[..simplex_len].iter().any(|p| p.w == next.w)
+		{
+			break;
+		}
+		s[simplex_len] = next;
+		simplex_len += 1;
+		let last = v.length2();
+		v = reduce(&mut s, &mut simplex_len, &mut l)?;
+		// Closer than f32 resolves at the simplex's size: the shapes touch, and the
+		// origin may lie on either side, so call it an overlap.
+		let size = s[..simplex_len]
+			.iter()
+			.fold(1.0f32, |m, p| m.max(p.w.length()));
+		if v.length() <= GJK_TOUCH * size {
+			return None;
+		}
+		// The new vertex did not bring `v` closer: rounding in `v.dot(next.w)` at
+		// this simplex's size hides the gap test above, and every further pass
+		// rebuilds the same simplex (van den Bergen's progress test).
+		if last - v.length2() <= 1e-6 * last {
+			break;
+		}
+	}
+	let a = s[..simplex_len]
+		.iter()
+		.zip(&l[..simplex_len])
+		.fold(Vec3::ZERO, |p, (q, &x)| p + q.a * x);
+	let b = s[..simplex_len]
+		.iter()
+		.zip(&l[..simplex_len])
+		.fold(Vec3::ZERO, |p, (q, &x)| p + q.b * x);
+	Some((v, a, b))
+}
+
 const GJK_ITERATIONS: usize = 64;
 
+/// Closest points nearer than this fraction of the simplex's size read as
+/// touching in [`gjk_pair`]: the finest gap it resolves.
+const GJK_TOUCH: f32 = 1e-5;
+
+/// A triangle clipped by six box planes has at most nine vertices.
+const CLIPPED_TRIANGLE_CAPACITY: usize = 9;
+
 /// `poly` clipped to the box `±half` (Sutherland–Hodgman).
-fn clip_to_box(poly: &[Vec3], half: Vec3) -> Vec<Vec3> {
+fn clip_to_box(poly: [Vec3; 3], half: Vec3) -> ([Vec3; CLIPPED_TRIANGLE_CAPACITY], usize) {
 	let axis = |p: Vec3, k: usize| match k {
 		0 => p.x,
 		1 => p.y,
 		_ => p.z,
 	};
-	let mut out = poly.to_vec();
+	let mut a = [Vec3::ZERO; CLIPPED_TRIANGLE_CAPACITY];
+	let mut b = [Vec3::ZERO; CLIPPED_TRIANGLE_CAPACITY];
+	a[..3].copy_from_slice(&poly);
+	let mut len = 3;
 	for k in 0..3 {
 		for sign in [1.0, -1.0] {
 			let limit = axis(half, k);
-			let input = std::mem::take(&mut out);
-			for (i, &a) in input.iter().enumerate() {
-				let b = input[(i + 1) % input.len()];
-				let (da, db) = (sign * axis(a, k) - limit, sign * axis(b, k) - limit);
-				if da <= 0.0 {
-					out.push(a);
+			let mut out_len = 0;
+			for i in 0..len {
+				let (p, q) = (a[i], a[(i + 1) % len]);
+				let (dp, dq) = (sign * axis(p, k) - limit, sign * axis(q, k) - limit);
+				if dp <= 0.0 {
+					b[out_len] = p;
+					out_len += 1;
 				}
-				if (da <= 0.0) != (db <= 0.0) {
-					out.push(a + (b - a) * (da / (da - db)));
+				if (dp <= 0.0) != (dq <= 0.0) {
+					b[out_len] = p + (q - p) * (dp / (dp - dq));
+					out_len += 1;
 				}
 			}
-			if out.is_empty() {
-				return out;
+			std::mem::swap(&mut a, &mut b);
+			len = out_len;
+			if len == 0 {
+				return (a, len);
 			}
 		}
 	}
-	out
+	(a, len)
 }
 
-/// Closest approach of the cylinder at `center` and `tri`, `None` when they overlap.
-/// `seg_point` is the cylinder's closest point.
+/// Closest approach of the convex `shape` at `center` with `orient` and `tri`,
+/// `None` when they overlap. `seg_point` is the shape's closest point.
 ///
-/// Exact closer than `reach`; farther apart, `dist` is `reach`, a lower bound. GJK
-/// runs on the triangle clipped to a box `reach` around the cylinder, in the
-/// cylinder's frame, so every point stays near the origin: against a triangle much
-/// larger than the cylinder, f32 would otherwise lose the overlap entirely.
-fn cylinder_triangle(center: Vec3, cyl: Cylinder, tri: &Triangle, reach: f32) -> Option<Hit> {
-	let half = vec3(
-		cyl.radius + reach,
-		cyl.half_height + reach,
-		cyl.radius + reach,
-	);
-	let poly = clip_to_box(&[tri[0] - center, tri[1] - center, tri[2] - center], half);
-	if poly.is_empty() {
-		let (q, feature) = closest_point_triangle(center, tri);
+/// Runs in the shape's local frame: the triangle rotates in, witnesses rotate
+/// out. GJK runs on the triangle clipped to a box `reach` around the shape, so
+/// every point stays near the origin: against a triangle much larger than the
+/// shape, f32 would otherwise lose the overlap entirely. Farther apart than
+/// `reach`, `dist` is `reach`, a lower bound. `shrink` erodes the shape by that
+/// distance, a true convex deflation (see [`Convex::support`]), so GJK on
+/// deflated shapes stays exact.
+fn convex_triangle(
+	center: Vec3,
+	orient: Quat,
+	shape: &dyn Convex,
+	tri: &Triangle,
+	reach: f32,
+	shrink: f32,
+) -> Option<Hit> {
+	let back = orient.conjugate();
+	let local = [
+		back.rotate(tri[0] - center),
+		back.rotate(tri[1] - center),
+		back.rotate(tri[2] - center),
+	];
+	let half = shape.half() + vec3(reach, reach, reach);
+	let (poly, poly_len) = clip_to_box(local, half);
+	// A touch at a box corner clips to a zero-area polygon, which reads as
+	// "farther than `reach`" and hides a resting contact; with a reach, fall
+	// back to the unclipped triangle before believing it. The clip only exists
+	// to keep f32 sane against a triangle far larger than the shape, and the
+	// near query has already bounded how far apart they can be.
+	let mut poly = poly;
+	let poly_len = if poly_len == 0 && reach > 0.0 {
+		poly[..3].copy_from_slice(&local);
+		3
+	} else {
+		poly_len
+	};
+	if poly_len == 0 {
+		let (q, feature) = closest_point_triangle(Vec3::ZERO, &local);
+		let n = if q.length2() > EPS {
+			q * (-1.0 / q.length())
+		} else {
+			// The shape's center lies on the triangle's plane: either side.
+			triangle_normal(&local)
+		};
 		return Some(Hit {
 			seg_point: center,
-			tri_point: q,
+			tri_point: center + orient.rotate(q),
 			feature,
 			dist: reach,
-			normal: (center - q).normalize(),
+			normal: orient.rotate(n),
 		});
 	}
-	let support = |d: Vec3| {
-		let b = poly
-			.iter()
-			.copied()
-			.max_by(|p, q| p.dot(-d).total_cmp(&q.dot(-d)))
-			.unwrap();
-		let a = cyl.support(Vec3::ZERO, d);
-		Support { w: a - b, a }
-	};
-	let mut s = vec![support(poly[0])];
-	let mut l = vec![1.0];
-	let mut v = s[0].w;
-	for _ in 0..GJK_ITERATIONS {
-		let next = support(-v);
-		// No support point comes meaningfully closer: `v` is the closest point.
-		if v.length2() - v.dot(next.w) <= 1e-6 * v.length2() || s.iter().any(|p| p.w == next.w) {
-			break;
-		}
-		s.push(next);
-		v = reduce(&mut s, &mut l)?;
-		// Closer than f32 resolves at the simplex's size: the shapes touch, and the
-		// origin may lie on either side, so call it an overlap.
-		let size = s.iter().fold(1.0f32, |m, p| m.max(p.w.length()));
-		if v.length() <= 1e-5 * size {
-			return None;
-		}
-	}
-	let a = center + s.iter().zip(&l).fold(Vec3::ZERO, |p, (q, &x)| p + q.a * x);
-	let tri_point = a - v;
-	let n = triangle_normal(tri);
+	let (v, a, tri_point) = gjk_pair(
+		poly[0],
+		|d| shape.support(d, shrink),
+		|d| {
+			poly[..poly_len]
+				.iter()
+				.copied()
+				.max_by(|p, q| p.dot(d).total_cmp(&q.dot(d)))
+				.unwrap()
+		},
+	)?;
+	let n = triangle_normal(&local);
 	let n = if n.dot(v) < 0.0 { -n } else { n };
-	// Against the inside of a face, the exact answer: the cylinder's deepest point
+	// Against the inside of a face, the exact answer: the shape's deepest point
 	// toward the plane and its height above it. GJK's estimate drifts by a
 	// fraction of a unit against a round rim, enough to read sliding along a slope
 	// as moving into it.
 	if v.normalize().dot(n) > 0.999 {
-		let deepest = cyl.support(center, -n);
-		let dist = n.dot(deepest - tri[0]);
+		let deepest = shape.support(-n, shrink);
+		let dist = n.dot(deepest - local[0]);
 		if dist <= 0.0 {
 			return None;
 		}
+		let seg_point = center + orient.rotate(deepest);
 		return Some(Hit {
-			seg_point: deepest,
-			tri_point: deepest - n * dist,
+			seg_point,
+			tri_point: seg_point - orient.rotate(n) * dist,
 			feature: Feature::Face,
 			dist: dist.min(reach),
-			normal: n,
+			normal: orient.rotate(n),
 		});
 	}
 	// A drifted direction cannot pick the side of the face: flipped by it, the
@@ -859,96 +1040,217 @@ fn cylinder_triangle(center: Vec3, cyl: Cylinder, tri: &Triangle, reach: f32) ->
 	// face as if the hull were sunk into it, and the normal points through the
 	// surface. The face contact is whichever side holds a real separation.
 	let face = |o: Vec3| -> Option<Hit> {
-		let deepest = cyl.support(center, -o);
-		let dist = o.dot(deepest - tri[0]);
-		(dist > 0.0 && closest_point_triangle(deepest - o * dist, tri).1 == Feature::Face).then(|| {
-			Hit {
-				seg_point: deepest,
-				tri_point: deepest - o * dist,
-				feature: Feature::Face,
-				dist: dist.min(reach),
-				normal: o,
-			}
-		})
+		let deepest = shape.support(-o, shrink);
+		let dist = o.dot(deepest - local[0]);
+		(dist > 0.0 && closest_point_triangle(deepest - o * dist, &local).1 == Feature::Face).then(
+			|| {
+				let seg_point = center + orient.rotate(deepest);
+				Hit {
+					seg_point,
+					tri_point: seg_point - orient.rotate(o) * dist,
+					feature: Feature::Face,
+					dist: dist.min(reach),
+					normal: orient.rotate(o),
+				}
+			},
+		)
 	};
 	if let Some(hit) = face(n).or_else(|| face(-n)) {
 		return Some(hit);
 	}
-	let feature = match closest_point_triangle(tri_point, tri).1 {
+	let feature = match closest_point_triangle(tri_point, &local).1 {
 		Feature::Face => Feature::Edge(0),
 		f => f,
 	};
 	Some(Hit {
-		seg_point: a,
-		tri_point,
+		seg_point: center + orient.rotate(a),
+		tri_point: center + orient.rotate(tri_point),
 		feature,
 		dist: v.length().min(reach),
-		normal: v.normalize(),
+		normal: orient.rotate(v.normalize()),
 	})
 }
 
-/// How far `cyl` at `center` sinks into `tri` and the way out, or `None` when they
-/// do not overlap. The cylinder shrinks evenly until it clears the triangle: the
-/// shrink is the depth, exact against a face, and the shrunk cylinder's separating
-/// direction is the way out.
-fn cylinder_penetration(center: Vec3, cyl: Cylinder, tri: &Triangle) -> Option<(Vec3, f32)> {
-	if cylinder_triangle(center, cyl, tri, 0.0).is_some() {
-		return None;
-	}
-	let most = cyl.radius.min(cyl.half_height) * 0.999;
-	let shrunk = |s: f32| Cylinder {
-		radius: cyl.radius - s,
-		half_height: cyl.half_height - s,
-	};
-	let reach = cyl.radius + cyl.half_height;
-	let Some(_) = cylinder_triangle(center, shrunk(most), tri, reach) else {
-		// The axis itself is inside: out along the plane, from its side.
-		let n = triangle_normal(tri);
-		let n = if n.dot(center - tri[0]) < 0.0 { -n } else { n };
-		return Some((n, most + n.dot(tri[0] - center).abs()));
-	};
-	let (mut inside, mut clear) = (0.0, most);
-	for _ in 0..24 {
-		let mid = (inside + clear) * 0.5;
-		match cylinder_triangle(center, shrunk(mid), tri, reach) {
-			Some(_) => clear = mid,
-			None => inside = mid,
+/// The upright-cylinder special case of [`convex_triangle`] the tests probe
+/// distances with.
+#[cfg(test)]
+fn cylinder_triangle(center: Vec3, cyl: Cylinder, tri: &Triangle, reach: f32) -> Option<Hit> {
+	convex_triangle(center, Quat::IDENTITY, &cyl, tri, reach, 0.0)
+}
+
+/// The world bounds of a convex shape at `center` with `orient`.
+pub(crate) fn convex_bounds(center: Vec3, orient: Quat, shape: &dyn Convex) -> (Vec3, Vec3) {
+	let (lo, hi) = shape.bounds();
+	let mut min = center;
+	let mut max = center;
+	for &x in &[lo.x, hi.x] {
+		for &y in &[lo.y, hi.y] {
+			for &z in &[lo.z, hi.z] {
+				let p = center + orient.rotate(vec3(x, y, z));
+				min = min.min(p);
+				max = max.max(p);
+			}
 		}
 	}
-	let hit = cylinder_triangle(center, shrunk(clear), tri, reach)?;
+	(min, max)
+}
+
+/// How far the convex `shape` at `center` with `orient` sinks into `tri` and the
+/// way out, or `None` when they do not overlap. The shape deflates, eroded by a
+/// distance, until it clears the triangle: the deflation is the depth, exact
+/// against a face (both the gap and the deflated-away extent lie along the way
+/// out), and the deflated shape's separating direction is the way out.
+///
+/// That direction is tilted by a corner crossing a face, though, and pushing
+/// along it launches the body; where the shape crosses the triangle's own plane
+/// face-on, the plane's normal and the poke-through distance are exact, so the
+/// plane wins.
+pub(crate) fn convex_penetration(
+	center: Vec3,
+	orient: Quat,
+	shape: &dyn Convex,
+	tri: &Triangle,
+) -> Option<(Vec3, f32)> {
+	if convex_triangle(center, orient, shape, tri, 0.0, 0.0).is_some() {
+		return None;
+	}
+	let back = orient.conjugate();
+	let local = [
+		back.rotate(tri[0] - center),
+		back.rotate(tri[1] - center),
+		back.rotate(tri[2] - center),
+	];
+	// The plane's side facing the shape's center.
+	let facing = {
+		let n = triangle_normal(&local);
+		if n.dot(local[0]) > 0.0 {
+			-n
+		} else {
+			n
+		}
+	};
+	let plane = || {
+		// How far the shape pokes through the plane, and whether that is
+		// through the face rather than past an edge or vertex.
+		let deepest = shape.support(-facing, 0.0);
+		let depth = -facing.dot(deepest - local[0]);
+		let inside = closest_point_triangle(deepest + facing * depth, &local).1 == Feature::Face;
+		(depth > 0.0 && inside).then(|| (orient.rotate(facing), depth))
+	};
+	// The plane wins whenever it holds, so the deflation search below only
+	// runs for a shape past an edge or vertex.
+	if let Some(out) = plane() {
+		return Some(out);
+	}
+	let most = shape.max_shrink();
+	let reach = {
+		let half = shape.half();
+		half.x + half.y + half.z
+	};
+	// Nearly collapsed; still inside from there is the axis itself, out along
+	// the plane from its side.
+	let Some(mut hit) = convex_triangle(center, orient, shape, tri, reach, most) else {
+		return Some((orient.rotate(facing), most + facing.dot(local[0]).abs()));
+	};
+	// Bisect the shrink between overlapping and clear, `hit` the clear end's
+	// answer. Deflating by `s` more moves every point at least `s` inward, so a
+	// clear gap of `hit.dist` puts the overlap's end no shallower than
+	// `clear - hit.dist`, exactly there against a flat side: try one tolerance
+	// past that bound before halving. GJK reads gaps under `GJK_TOUCH` of the
+	// simplex's size as touching, so the end is no sharper than that, and
+	// neither is the search: the simplex spans the shape and the clipped
+	// triangle, which lies within `reach` of the shape's box.
+	let half = shape.half();
+	let tol = GJK_TOUCH * (half.length() + (half + vec3(reach, reach, reach)).length());
+	let (mut inside, mut clear) = (0.0f32, most);
+	for _ in 0..24 {
+		inside = inside.max(clear - hit.dist);
+		for past_bound in [true, false] {
+			if clear - inside <= tol {
+				break;
+			}
+			let s = if past_bound {
+				inside + tol
+			} else {
+				(inside + clear) * 0.5
+			};
+			match convex_triangle(center, orient, shape, tri, reach, s) {
+				Some(h) => (clear, hit) = (s, h),
+				None => inside = s,
+			}
+		}
+	}
 	Some((hit.normal, clear - hit.dist.min(clear)))
 }
 
-/// Conservative advancement of the cylinder along `motion` toward `tri`: the first
-/// fraction at which it comes within `skin`, with the approach there, if before
-/// `limit`. Each step aims at half the skin, which the distance, convex in time,
-/// never passes.
+/// The contact a grazing GJK overlap stands for when the deflation search finds
+/// no real overlap: at an exact touch GJK's answer flips with its clipping
+/// reach, and a wide-reach query can call one an overlap the tight-reach one
+/// clears. The shape rests on the triangle's plane within `margin`, so the way
+/// out is the plane's side facing it and the depth the margin less the
+/// poke-through.
+fn grazing_contact(
+	center: Vec3,
+	orient: Quat,
+	shape: &dyn Convex,
+	tri: &Triangle,
+	margin: f32,
+) -> Option<(Vec3, f32)> {
+	let back = orient.conjugate();
+	let local = [
+		back.rotate(tri[0] - center),
+		back.rotate(tri[1] - center),
+		back.rotate(tri[2] - center),
+	];
+	let n = triangle_normal(&local);
+	let n = if n.dot(local[0]) > 0.0 { -n } else { n };
+	let deepest = shape.support(-n, 0.0);
+	let poke = -n.dot(deepest - local[0]);
+	(poke > -margin).then(|| (orient.rotate(n), margin - poke.max(0.0)))
+}
+
+/// Conservative advancement of the convex `shape` along `motion` toward `tri`:
+/// the first fraction at which it comes within `skin`, with the approach there,
+/// if before `limit`. Each step aims at half the skin, which the distance,
+/// convex in time, never passes.
 ///
 /// Within `skin`, on arrival or from the start, only motion whose tangent line, a
 /// lower bound on the distance, would close past a quarter of the skin is blocked:
 /// one stopped at half the skin slides along the surface despite rounding in the
 /// motion, and one reaching a seam whose normal has turned upright passes. One
 /// overlapping the triangle is blocked outright, as a Quake trace starting in solid.
-fn sweep_cylinder_triangle(
+fn sweep_convex_triangle(
 	center: Vec3,
-	cyl: Cylinder,
+	orient: Quat,
+	shape: &dyn Convex,
 	motion: Vec3,
 	tri: &Triangle,
 	skin: f32,
 	limit: f32,
 ) -> Option<(f32, Hit)> {
 	let reach = motion.length() * limit + skin;
-	let at = |t: f32| cylinder_triangle(center + motion * t, cyl, tri, reach);
+	let at = |t: f32| convex_triangle(center + motion * t, orient, shape, tri, reach, 0.0);
+	// The triangle's side facing `center`, world space.
+	let facing = |tri: &Triangle| {
+		let back = orient.conjugate();
+		let local = [
+			back.rotate(tri[0] - center),
+			back.rotate(tri[1] - center),
+			back.rotate(tri[2] - center),
+		];
+		let n = triangle_normal(&local);
+		let n = if n.dot(local[0]) > 0.0 { -n } else { n };
+		orient.rotate(n)
+	};
 	let Some(mut hit) = at(0.0) else {
-		// Already inside: block only motion that goes deeper, so a cylinder pushed
+		// Already inside: block only motion that goes deeper, so a shape pushed
 		// into a corner by a fast hit can still move out.
-		let Some((normal, _)) = cylinder_penetration(center, cyl, tri) else {
+		let Some((normal, _)) = convex_penetration(center, orient, shape, tri) else {
 			// Not inside after all: GJK called a grazing touch an overlap. Block
 			// only motion into the face, along its outward side; one along it,
-			// away from it, or out of it stays free, instead of wedging a hull
+			// away from it, or out of it stays free, instead of wedging a shape
 			// resting in the skin against the surface it rests on.
-			let n = triangle_normal(tri);
-			let n = if n.dot(center - tri[0]) < 0.0 { -n } else { n };
+			let n = facing(tri);
 			if -motion.dot(n) <= 0.0 {
 				return None;
 			}
@@ -1005,34 +1307,45 @@ fn sweep_cylinder_triangle(
 }
 
 impl Mesh {
-	/// Sweeps `cyl` from `center` along `motion`: the first fraction at which it comes
-	/// within `skin` of a triangle, or `None` when it clears the whole way. It never
-	/// overlaps the mesh where it stops; moving along or away from a surface it rests
-	/// on is free, and one that starts overlapping the mesh stops at once.
+	/// Sweeps the convex `shape` at `center` with `orient` along `motion`: the
+	/// first fraction at which it comes within `skin` of a triangle, or `None`
+	/// when it clears the whole way. It never overlaps the mesh where it stops;
+	/// moving along or away from a surface it rests on is free, and one that
+	/// starts overlapping the mesh stops at once.
 	///
-	/// The flat bottom meets floors and step tops with an upright normal and the
-	/// sides meet walls and step fronts with a level one. Internal-edge contacts are
-	/// skipped as in [`Mesh::contacts`] with `filter`, so seams never catch it.
-	pub fn cast_cylinder(
+	/// Internal-edge contacts are skipped as in [`Mesh::contacts`] with
+	/// `filter`, so seams never catch it.
+	pub fn cast_convex(
 		&self,
 		center: Vec3,
-		cyl: Cylinder,
+		orient: Quat,
+		shape: &dyn Convex,
 		motion: Vec3,
 		skin: f32,
 	) -> Option<Cast> {
-		let grow = vec3(cyl.radius + skin, cyl.half_height + skin, cyl.radius + skin);
 		let end = center + motion;
+		// The shape's box at both ends of the motion: `near` must cover the whole
+		// swept volume, so each endpoint grows by the shape's own extent, not
+		// just the skin, or a fast cast leaves triangles it swept through behind.
+		let (lo, hi) = convex_bounds(center, orient, shape);
+		let (elo, ehi) = convex_bounds(end, orient, shape);
+		let (lo, hi) = (lo.min(elo), hi.max(ehi));
+		let grow = vec3(skin, skin, skin);
 		let mut first: Option<Cast> = None;
-		for (i, t) in self.near(center.min(end) - grow, center.max(end) + grow) {
+		for (i, t) in self.near(lo - grow, hi + grow) {
 			let limit = first.map_or(1.0, |c| c.fraction);
-			let Some((at, mut hit)) = sweep_cylinder_triangle(center, cyl, motion, t, skin, limit) else {
+			let Some((at, mut hit)) =
+				sweep_convex_triangle(center, orient, shape, motion, t, skin, limit)
+			else {
 				continue;
 			};
 			let mut tri = i;
 			if hit.feature != Feature::Face {
 				// An internal-edge hit stands for the closer surface through it: block
 				// only if the rest of the motion would close in on that surface.
-				if let Some((j, closer)) = self.dominated_cylinder(i, &hit, center + motion * at, cyl) {
+				if let Some((j, closer)) =
+					self.dominated_convex(i, &hit, center + motion * at, orient, shape)
+				{
 					let closing = -motion.dot(closer.normal);
 					if !(closing > 0.0 && closer.dist - closing * (limit - at) < skin * 0.25) {
 						continue;
@@ -1049,33 +1362,156 @@ impl Mesh {
 		first
 	}
 
-	/// The deepest overlap of `cyl` at `center` with the mesh: the direction out and
-	/// the depth, or `None` when it overlaps nothing.
-	pub fn cylinder_penetration(&self, center: Vec3, cyl: Cylinder) -> Option<(Vec3, f32)> {
-		let grow = vec3(cyl.radius, cyl.half_height, cyl.radius);
+	/// [`Mesh::cast_convex`] for the upright cylinder the player's movement casts
+	/// with.
+	pub fn cast_cylinder(
+		&self,
+		center: Vec3,
+		cyl: Cylinder,
+		motion: Vec3,
+		skin: f32,
+	) -> Option<Cast> {
+		self.cast_convex(center, Quat::IDENTITY, &cyl, motion, skin)
+	}
+
+	/// Contacts of the convex `shape` at `center` with `orient` within its
+	/// resting `margin`, deepest first, into `out` (appended to, so a caller
+	/// stepping many bodies clears once). With `filter`,
+	/// internal-edge artifacts are dropped as in [`Mesh::contacts`].
+	pub fn convex_contacts_into(
+		&self,
+		center: Vec3,
+		orient: Quat,
+		shape: &dyn Convex,
+		margin: f32,
+		filter: bool,
+		out: &mut Vec<Contact>,
+	) {
+		let (lo, hi) = convex_bounds(center, orient, shape);
+		let m = vec3(margin, margin, margin);
+		let back = orient.conjugate();
+		let mut found = Vec::new();
+		for (tri, t) in self.near(lo - m, hi + m) {
+			let (hit, depth) = match convex_triangle(center, orient, shape, t, margin, 0.0) {
+				// GJK returns nothing when the shape overlaps the triangle: the
+				// contact is the deflation search's way out and depth instead,
+				// or a deep overlap would hide from the solver.
+				None => {
+					let (n, depth) = match convex_penetration(center, orient, shape, t) {
+						Some((n, depth)) => (n, depth + margin),
+						// No real overlap either: a grazing touch GJK flipped on,
+						// the shape resting on the triangle within the margin.
+						None => match grazing_contact(center, orient, shape, t, margin) {
+							Some(contact) => contact,
+							None => continue,
+						},
+					};
+					(
+						Hit {
+							seg_point: center,
+							tri_point: center,
+							feature: Feature::Face,
+							dist: 0.0,
+							normal: n,
+						},
+						depth,
+					)
+				}
+				Some(hit) if hit.dist < margin => (hit, margin - hit.dist),
+				Some(_) => continue,
+			};
+			// A face contact is a region, not the one point GJK happens to
+			// witness: its tangent extremes, where they lie over this triangle,
+			// hold rotation too, or a flat box rocks forever on a point. Only
+			// the extremes level with the witness touch the plane — a cylinder's
+			// side contact spreads along its rim line, not to its equator.
+			if hit.feature == Feature::Face {
+				let n = hit.normal;
+				let ln = back.rotate(n);
+				let local = [
+					back.rotate(t[0] - center),
+					back.rotate(t[1] - center),
+					back.rotate(t[2] - center),
+				];
+				let level = ln.dot(back.rotate(hit.seg_point - center));
+				let helper = if n.x.abs() < 0.9 {
+					vec3(1.0, 0.0, 0.0)
+				} else {
+					vec3(0.0, 1.0, 0.0)
+				};
+				let t1 = n.cross(helper).normalize();
+				let t2 = n.cross(t1);
+				let mut spread = false;
+				for s in [t1 - n, -t1 - n, t2 - n, -t2 - n] {
+					let local_p = shape.support(back.rotate(s), 0.0);
+					// Over this triangle only: its depth is only true here, and
+					// the triangle whose cell holds the point brings its own.
+					if (ln.dot(local_p) - level).abs() <= 2.0 * margin
+						&& closest_point_triangle(local_p - ln * hit.dist, &local).1 == Feature::Face
+					{
+						found.push(Contact {
+							tri,
+							hit: Hit {
+								seg_point: center + orient.rotate(local_p),
+								..hit
+							},
+							depth,
+						});
+						spread = true;
+					}
+				}
+				if !spread {
+					found.push(Contact { tri, hit, depth });
+				}
+			} else {
+				found.push(Contact { tri, hit, depth });
+			}
+		}
+		out.extend(found);
+		if filter {
+			out.retain(|c| {
+				c.hit.feature == Feature::Face
+					|| !self
+						.dominated_convex(c.tri, &c.hit, center, orient, shape)
+						.is_some()
+			});
+		}
+		out.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+	}
+
+	/// The deepest overlap of the convex `shape` at `center` with the mesh: the
+	/// direction out and the depth, or `None` when it overlaps nothing.
+	pub fn convex_penetration(
+		&self,
+		center: Vec3,
+		orient: Quat,
+		shape: &dyn Convex,
+	) -> Option<(Vec3, f32)> {
+		let (lo, hi) = convex_bounds(center, orient, shape);
 		self
-			.near(center - grow, center + grow)
-			.filter_map(|(_, t)| cylinder_penetration(center, cyl, t))
+			.near(lo, hi)
+			.filter_map(|(_, t)| convex_penetration(center, orient, shape, t))
 			.max_by(|a, b| a.1.total_cmp(&b.1))
 	}
 
-	/// Whether `cyl` at `center` overlaps any triangle.
-	pub fn cylinder_overlaps(&self, center: Vec3, cyl: Cylinder) -> bool {
-		let grow = vec3(cyl.radius, cyl.half_height, cyl.radius);
+	/// Whether the convex `shape` at `center` overlaps any triangle.
+	pub fn convex_overlaps(&self, center: Vec3, orient: Quat, shape: &dyn Convex) -> bool {
+		let (lo, hi) = convex_bounds(center, orient, shape);
 		self
-			.near(center - grow, center + grow)
-			.any(|(_, t)| cylinder_triangle(center, cyl, t, 0.0).is_none())
+			.near(lo, hi)
+			.any(|(_, t)| convex_triangle(center, orient, shape, t, 0.0, 0.0).is_none())
 	}
 
-	/// The cylinder's version of `dominated`: a triangle through the hit point that is
-	/// strictly closer, and its approach, making the edge or vertex hit an
+	/// The convex version of `dominated`: a triangle through the hit point that
+	/// is strictly closer, and its approach, making the edge or vertex hit an
 	/// internal-edge artifact.
-	fn dominated_cylinder(
+	fn dominated_convex(
 		&self,
 		tri: usize,
 		hit: &Hit,
 		center: Vec3,
-		cyl: Cylinder,
+		orient: Quat,
+		shape: &dyn Convex,
 	) -> Option<(usize, Hit)> {
 		let p = hit.tri_point;
 		let e = vec3(ON_SURFACE, ON_SURFACE, ON_SURFACE);
@@ -1083,9 +1519,20 @@ impl Mesh {
 			if i == tri || (closest_point_triangle(p, t).0 - p).length() > ON_SURFACE {
 				return None;
 			}
-			let closer = cylinder_triangle(center, cyl, t, hit.dist)?;
+			let closer = convex_triangle(center, orient, shape, t, hit.dist, 0.0)?;
 			(closer.dist < hit.dist - EPS).then_some((i, closer))
 		})
+	}
+
+	/// The deepest overlap of `cyl` at `center` with the mesh: the direction out and
+	/// the depth, or `None` when it overlaps nothing.
+	pub fn cylinder_penetration(&self, center: Vec3, cyl: Cylinder) -> Option<(Vec3, f32)> {
+		self.convex_penetration(center, Quat::IDENTITY, &cyl)
+	}
+
+	/// Whether `cyl` at `center` overlaps any triangle.
+	pub fn cylinder_overlaps(&self, center: Vec3, cyl: Cylinder) -> bool {
+		self.convex_overlaps(center, Quat::IDENTITY, &cyl)
 	}
 }
 
@@ -1289,32 +1736,32 @@ pub mod scenes {
 			bodies: vec![
 				Body {
 					pos: vec3(-0.6, deck_top + 0.35, -0.6),
-					..ball
+					..ball.clone()
 				},
 				Body {
 					pos: vec3(0.5, deck_top + 1.2, 0.4),
-					..ball
+					..ball.clone()
 				},
 				Body {
 					pos: vec3(-0.6, deck_top + 0.65, 0.7),
-					..upright
+					..upright.clone()
 				},
 				Body {
 					pos: vec3(0.7, deck_top + 0.75, -0.6),
 					orient: Quat::from_axis_angle(vec3(0.0, 0.0, 1.0), 0.25),
 					rotates: true,
-					..upright
+					..upright.clone()
 				},
 				Body {
 					pos: vec3(-5.0, 0.35, 4.0),
 					vel: vec3(5.0, 0.0, 0.0),
-					..ball
+					..ball.clone()
 				},
 				Body {
 					pos: vec3(0.0, 0.5, 4.05),
 					radius: 0.5,
 					mass: 3.0,
-					..ball
+					..ball.clone()
 				},
 			],
 			..World::new(floor)
@@ -1331,7 +1778,7 @@ pub mod scenes {
 		[
 			Scene {
 				name: "sphere on grid",
-				world: one(grid(8), sphere),
+				world: one(grid(8), sphere.clone()),
 			},
 			Scene {
 				name: "capsule over T-junctions",
@@ -1342,7 +1789,7 @@ pub mod scenes {
 						vel: vec3(1.5, 0.0, 0.0),
 						half_height: 0.5,
 						radius: 0.4,
-						..sphere
+						..sphere.clone()
 					},
 				),
 			},
@@ -1353,7 +1800,7 @@ pub mod scenes {
 					Body {
 						pos: vec3(1.0, 0.5, 3.3),
 						vel: vec3(6.0, 0.0, 0.0),
-						..sphere
+						..sphere.clone()
 					},
 				),
 			},
@@ -1364,7 +1811,7 @@ pub mod scenes {
 					Body {
 						pos: vec3(4.1, 1.45, 2.0),
 						vel: Vec3::ZERO,
-						..sphere
+						..sphere.clone()
 					},
 				),
 			},
@@ -1378,7 +1825,7 @@ pub mod scenes {
 						half_height: 0.4,
 						radius: 0.4,
 						friction: 0.05,
-						..sphere
+						..sphere.clone()
 					},
 				),
 			},
@@ -1389,7 +1836,7 @@ pub mod scenes {
 					Body {
 						pos: vec3(2.0, 8.0, 2.0),
 						vel: vec3(0.0, -60.0, 0.0),
-						..sphere
+						..sphere.clone()
 					},
 				),
 			},
@@ -1439,7 +1886,7 @@ mod tests {
 			min_vx: f32::MAX,
 			max_vy: 0.0,
 			max_pen: 0.0,
-			end: body,
+			end: body.clone(),
 		};
 		for _ in 0..steps {
 			body.step(mesh, DT, G, filter);
@@ -1560,7 +2007,7 @@ mod tests {
 			sphere(vec3(1.0, 0.5, 3.3), vec3(6.0, 0.0, 0.0)),
 			capsule(vec3(1.0, 0.9, 3.3), vec3(6.0, 0.0, 0.0)),
 		] {
-			let run = slide(&wall(), body, 120, true);
+			let run = slide(&wall(), body.clone(), 120, true);
 			assert!(
 				(run.end.pos.x - (5.0 - body.radius)).abs() < 1e-3,
 				"x {}",
@@ -1576,7 +2023,7 @@ mod tests {
 	fn convex_ledge_edge_still_supports() {
 		// Center just past the edge: only the convex edge holds it, pushing it outward.
 		let body = sphere(vec3(4.1, 1.45, 2.0), Vec3::ZERO);
-		let mut b = body;
+		let mut b = body.clone();
 		b.step(&ledge(), DT, G, true);
 		assert!(b.penetration(&ledge()) < 1e-3);
 		assert!(b.pos.y > 1.4, "fell through edge: {}", b.pos.y);
@@ -1604,7 +2051,7 @@ mod tests {
 			(sphere(vec3(2.0, 8.0, 2.0), vec3(0.0, -60.0, 0.0)), false),
 			(capsule(vec3(2.3, 9.0, 1.7), vec3(0.0, -200.0, 0.0)), true),
 		] {
-			let run = slide(&plates(), body, 60, filter);
+			let run = slide(&plates(), body.clone(), 60, filter);
 			let rest = PLATES[0] + body.radius + body.half_height;
 			assert!((run.end.pos.y - rest).abs() < 1e-3, "y {}", run.end.pos.y);
 			assert!(run.max_pen < 1e-3);
@@ -1638,17 +2085,40 @@ mod tests {
 			let mut got: Vec<usize> = mesh.near(min, max).map(|(i, _)| i).collect();
 			got.sort();
 			let want: Vec<usize> = (0..mesh.tris.len())
-				.filter(|&i| overlaps(bounds(&mesh.tris[i]), min, max))
+				.filter(|&i| overlaps(triangle_bounds(&mesh.tris[i]), min, max))
 				.collect();
 			assert_eq!(got, want);
 		}
 	}
 
 	#[test]
+	fn world_prepares_static_and_animated_meshes_once() {
+		let mut world = World::new(grid(2));
+		assert!(world.mesh.bvh.get().is_some());
+
+		world.platforms.push(Platform {
+			mesh: grid(2),
+			origin: Vec3::ZERO,
+			swing: vec3(1.0, 0.0, 0.0),
+			period: 1.0,
+		});
+		world.prepare();
+		let bvh = world.platforms[0].mesh.bvh.get().unwrap() as *const Bvh;
+		for _ in 0..8 {
+			world.step(DT, true);
+		}
+		assert_eq!(
+			world.platforms[0].mesh.bvh.get().unwrap() as *const Bvh,
+			bvh,
+			"platform animation must reuse its local-space BVH"
+		);
+	}
+
+	#[test]
 	fn friction_decelerates_at_mu_g() {
 		let mut body = sphere(vec3(1.0, 0.5, 2.0), vec3(3.0, 0.0, 0.0));
 		body.friction = 0.5;
-		let run = slide(&grid(8), body, 30, true);
+		let run = slide(&grid(8), body.clone(), 30, true);
 		let expected = 3.0 - 0.5 * 9.81 * 30.0 * DT;
 		assert!(
 			(run.end.vel.x - expected).abs() < 1e-3,
@@ -1666,7 +2136,7 @@ mod tests {
 			.find(|s| s.name.contains("helix"))
 			.unwrap();
 		let mesh = std::mem::take(&mut scene.world.mesh);
-		let mut body = scene.world.bodies[0];
+		let mut body = scene.world.bodies[0].clone();
 		let (inner, outer) = HELIX_RADII;
 		let mut max_pen = 0.0f32;
 		let mut turned = 0.0f32;
@@ -1896,7 +2366,7 @@ mod tests {
 			for p in &w.platforms {
 				let local = Body {
 					pos: b.pos - p.offset(w.time),
-					..*b
+					..b.clone()
 				};
 				deepest = deepest.max(local.penetration(&p.mesh));
 			}
@@ -1928,7 +2398,7 @@ mod tests {
 				assert!(pair_gap(&w, 0, 1) > -1e-3, "overlap {}", pair_gap(&w, 0, 1));
 				assert!(world_penetration(&w) < 1e-3);
 			}
-			let [a, b] = [w.bodies[0], w.bodies[1]];
+			let (a, b) = (w.bodies[0].clone(), w.bodies[1].clone());
 			let momentum = a.vel.x + b.vel.x * heavy;
 			assert!((momentum - 4.0).abs() < 1e-3, "momentum {momentum}");
 			// Contacts remove the approach and nothing more: both end at the shared speed.
@@ -2020,7 +2490,7 @@ mod tests {
 		w.bodies = vec![
 			Body {
 				friction: 1.0,
-				..rider
+				..rider.clone()
 			},
 			Body {
 				pos: vec3(0.0, 1.65, 0.7),

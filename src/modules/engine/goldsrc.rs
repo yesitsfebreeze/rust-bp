@@ -138,21 +138,16 @@ fn axis_pair(b: &[u8], off: usize, k: i32) -> (f32, f32) {
 	let mut k = k;
 	let p = span(b, off, &mut k);
 	let (valid, total) = (b[p] as i32, b[p + 1] as i32);
-	// `value[i]` is the i16 two bytes after the `i`-th anim value header.
+	// The first sample follows the two-byte span header; the header itself is
+	// animation value zero in GoldSrc's union-based indexing.
 	let v = |i: i32| i16_at(b, p + 2 + i as usize * 2) as f32;
 	if valid > k {
-		let a1 = v(k + 1);
-		let a2 = if valid > k + 1 {
-			v(k + 2)
-		} else if total > k + 1 {
-			a1
-		} else {
-			v(valid + 2)
-		};
+		let a1 = v(k);
+		let a2 = if valid > k + 1 { v(k + 1) } else { a1 };
 		(a1, a2)
 	} else {
-		let a1 = v(valid);
-		let a2 = if total > k + 1 { a1 } else { v(valid + 2) };
+		let a1 = v(valid - 1);
+		let a2 = if total > k + 1 { a1 } else { v(valid + 1) };
 		(a1, a2)
 	}
 }
@@ -201,7 +196,7 @@ impl Mdl {
 			i32_at(&b, hdr::SEQINDEX) as usize,
 		);
 		// mstudioseqdesc_t, 176 bytes: label[32], fps, flags, ..., numframes,
-		// ..., animindex, ...; seqgroup 0 models keep their anims in-file.
+		// ..., animindex at byte 124; seqgroup 0 models keep anims in-file.
 		let sequences = (0..nseq)
 			.map(|i| {
 				let at = soff + i * 176;
@@ -342,10 +337,17 @@ impl Mdl {
 	/// World-space bone transforms for frame `f` of `seq`, position and
 	/// rotation per bone, the SDK's `SetUpBones`.
 	pub fn pose(&self, seq: usize, f: f32) -> Vec<(Vec3, Quat)> {
+		self.pose_with_looping(seq, f, self.sequences[seq].looping)
+	}
+
+	/// World-space bone transforms with the caller's loop policy. Weapon idles
+	/// are replayed by GoldSrc even when their sequence descriptor lacks the
+	/// studio-looping flag.
+	pub fn pose_with_looping(&self, seq: usize, f: f32, looping: bool) -> Vec<(Vec3, Quat)> {
 		let s = &self.sequences[seq];
 		// Looping sequences wrap on the last frame, non-looping hold it.
 		let span = (s.numframes.max(1) as f32 - 1.0).max(1.0);
-		let f = if s.looping {
+		let f = if looping {
 			f.rem_euclid(span)
 		} else {
 			f.clamp(0.0, span)
@@ -457,6 +459,31 @@ fn read_tris(b: &[u8], at: usize) -> Vec<[Corner; 3]> {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn animation_samples_start_at_the_first_value_and_interpolate_neighbors() {
+		let mut run = vec![3, 4];
+		for value in [10i16, 20, 30] {
+			run.extend(value.to_le_bytes());
+		}
+
+		assert_eq!(axis_pair(&run, 0, 0), (10.0, 20.0));
+		assert_eq!(axis_pair(&run, 0, 1), (20.0, 30.0));
+		assert_eq!(axis_pair(&run, 0, 2), (30.0, 30.0));
+	}
+
+	#[test]
+	fn animation_samples_hold_through_a_run_and_continue_at_the_next_run() {
+		let mut runs = vec![1, 3];
+		runs.extend(5i16.to_le_bytes());
+		runs.extend([1, 2]);
+		runs.extend(9i16.to_le_bytes());
+
+		assert_eq!(axis_pair(&runs, 0, 0), (5.0, 5.0));
+		assert_eq!(axis_pair(&runs, 0, 1), (5.0, 5.0));
+		assert_eq!(axis_pair(&runs, 0, 2), (5.0, 9.0));
+		assert_eq!(axis_pair(&runs, 0, 3), (9.0, 9.0));
+	}
+
 	/// The local Counter-Strike install, when this machine has one; tests
 	/// that need the real models skip without it.
 	fn cstrike() -> Option<std::path::PathBuf> {
@@ -507,6 +534,42 @@ mod tests {
 			let reload = mdl.sequence("reload").expect(name);
 			let d = mdl.seq_duration(reload);
 			assert!((1.0..=8.0).contains(&d), "{name} reload {d}s");
+		}
+	}
+
+	#[test]
+	fn reads_sequence_animation_index_at_studio_header_offset() {
+		let Some(dir) = cstrike() else {
+			return;
+		};
+		let bytes = std::fs::read(dir.join("models/v_ak47.mdl")).unwrap();
+		let mdl = Mdl::parse(bytes.clone()).unwrap();
+		let seq_index = i32_at(&bytes, hdr::SEQINDEX) as usize;
+		for (i, seq) in mdl.sequences.iter().enumerate() {
+			assert_eq!(seq.anim, i32_at(&bytes, seq_index + i * 176 + 124) as usize);
+			assert!(seq.anim < bytes.len(), "{} animation offset", seq.label);
+		}
+	}
+
+	#[test]
+	fn weapon_idle_can_loop_without_a_studio_loop_flag() {
+		let Some(dir) = cstrike() else {
+			return;
+		};
+		let bytes = std::fs::read(dir.join("models/v_ak47.mdl")).unwrap();
+		let mdl = Mdl::parse(bytes).unwrap();
+		let idle = mdl.sequence("idle").unwrap();
+		assert!(!mdl.sequences[idle].looping);
+		let period = (mdl.sequences[idle].numframes - 1) as f32;
+		let first = mdl.pose_with_looping(idle, 0.0, true);
+		let wrapped = mdl.pose_with_looping(idle, period, true);
+		assert_eq!(first.len(), wrapped.len());
+		for ((p1, q1), (p2, q2)) in first.iter().zip(wrapped.iter()) {
+			assert!((*p1 - *p2).length() < 0.001);
+			assert!((q1.w - q2.w).abs() < 0.001);
+			assert!((q1.x - q2.x).abs() < 0.001);
+			assert!((q1.y - q2.y).abs() < 0.001);
+			assert!((q1.z - q2.z).abs() < 0.001);
 		}
 	}
 

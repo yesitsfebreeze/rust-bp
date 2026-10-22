@@ -1,0 +1,68 @@
+# One weapon's 1.6 numbers, every value from Counter-Strike 1.6 (mp.dll).
+# The game loads this at start and writes it back if missing; edit and rerun.
+#
+# heat.kind:
+#   "shots"  - accuracy = base + shots^power / div, capped; shots count since
+#              deploy/reload, never reset by waiting (1.6 resets only those).
+#   "recover"- pistols: accuracy recovers toward max after firing;
+#              spread states scale with (1 - accuracy).
+#   "none"   - no accuracy factor; spread states are their `add` constants.
+#
+# spread states, spread = mul * factor + add per state, duck_* overriding when
+# ducked and grounded: "air" while airborne; "still" under still_speed;
+# "slow" under slow_speed; "fast" above it. Factor is `accuracy` for "shots"
+# heat, (1 - accuracy) for "recover", and 1 for "none" (use `add`).
+#
+# punch states (mp.dll's KickBack): kick_x, kick_y, growth_x, growth_y,
+# cap_x, cap_y, flip_rand; kick grows with consecutive shots and the
+# horizontal kick flips direction at the flip_rand odds. `punch_x` instead is a
+# fixed vertical kick (AWP, pistols' -2.0 degrees).
+
+name = "m4a1"
+slot = 7
+price = 3100
+ammo_price = 60
+ammo_name = "556nato"
+damage = 33.0
+range = 8192.0
+range_mod = 0.97
+pen = 1
+cycle = 0.0875
+auto = true
+clip = 30
+reserve = 90
+maxspeed = 230.0
+reload = 3.05
+fire1 = "m4a1-1.wav"
+fire2 = "m4a1_unsil-1.wav"
+deploy_sound = "m4a1_deploy.wav"
+dry_sound = "dryfire_rifle.wav"
+reload_sounds = ["m4a1_clipout.wav@0.2", "m4a1_clipin.wav@0.55", "m4a1_boltpull.wav@0.8"]
+
+[heat]
+kind = "shots"
+base = 0.3
+power = 3.0
+div = 220.0
+cap = 1.0
+
+[spread]
+slow_speed = 140.0
+
+[spread.air]
+mul = 0.4
+add = 0.035
+[spread.slow]
+mul = 0.02
+[spread.fast]
+mul = 0.07
+add = 0.035
+
+[punch.air]
+kick = [1.2, 0.5, 0.23, 0.15, 5.5, 3.5, 6.0]
+[punch.move]
+kick = [1.0, 0.45, 0.28, 0.045, 3.75, 3.0, 7.0]
+[punch.duck]
+kick = [0.6, 0.3, 0.2, 0.0125, 3.25, 2.0, 7.0]
+[punch.stand]
+kick = [0.65, 0.35, 0.25, 0.015, 3.5, 2.25, 7.0]

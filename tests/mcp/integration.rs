@@ -380,6 +380,17 @@ fn copy_fixture_sources(root: &Path, directory: &Path) {
 	] {
 		std::fs::copy(root.join(name), directory.join(name)).unwrap();
 	}
+	// The gameplay crate embeds the weapon and money tables at compile time,
+	// so the build closure needs them at their include paths.
+	copy_dir(
+		&root.join("assets/weapons"),
+		&directory.join("assets/weapons"),
+	);
+	std::fs::copy(
+		root.join("assets/money.toml"),
+		directory.join("assets/money.toml"),
+	)
+	.unwrap();
 }
 
 fn env_flag(name: &str) -> bool {

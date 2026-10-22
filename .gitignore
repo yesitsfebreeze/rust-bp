@@ -4,6 +4,10 @@
 # The weapon and money tables are extracted numbers, not game files: they
 # stay tracked so a fresh checkout builds.
 /assets/*
+# The directory must be unignored before its files can be, or git keeps
+# ignoring them through it.
+!/assets/weapons/
 !/assets/weapons/*.toml
 !/assets/money.toml
 REA/
+logs/

@@ -208,6 +208,15 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 		if verts.len() < 3 {
 			continue;
 		}
+		// Wound outward: the fan's cross product points along the face's
+		// plane normal, flipped to its side. The file's edge order is
+		// arbitrary, and the light bake reads the winding as the surface's
+		// normal — flipped faces bake lit walls black and shaded walls lit.
+		let normal = to_our(bsp.plane_normal(f.plane, f.side)?);
+		let cross = (verts[1].pos - verts[0].pos).cross(verts[2].pos - verts[0].pos);
+		if cross.dot(normal) < 0.0 {
+			verts.reverse();
+		}
 		// One lightmap block covering the face's extent on the sample grid.
 		let (s0, t0) = (
 			(s_lo / LM_STEP + LM_EPS).floor(),
@@ -253,18 +262,11 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 				((t - (t0 * LM_STEP + LM_STEP / 2.0)) / LM_STEP).clamp(0.0, h as f32 - 1.0),
 			);
 		}
-		// Physics: fan triangles wound to point along the face's plane normal.
+		// Physics: fan triangles wound outward already, above.
 		let model = face_model.get(i).copied().unwrap_or(0);
 		if solids.get(&model).copied().unwrap_or(true) {
-			let normal = to_our(bsp.plane_normal(f.plane, f.side)?);
 			for k in 1..verts.len() - 1 {
-				let tri = [verts[0].pos, verts[k].pos, verts[k + 1].pos];
-				let cross = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
-				world.push_triangle(if cross.dot(normal) >= 0.0 {
-					tri
-				} else {
-					[tri[0], tri[2], tri[1]]
-				});
+				world.push_triangle([verts[0].pos, verts[k].pos, verts[k + 1].pos]);
 				surfaces.push(bullet_surface(tex_name));
 			}
 		}
@@ -286,6 +288,7 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 	for (i, r) in rects {
 		faces[i].lightmap = r;
 	}
+	world.prepare();
 	let center = (lo + hi) * 0.5;
 	let spawn = spawn.unwrap_or(vec3(center.x, lo.y, center.z));
 	Ok(Map {
@@ -304,7 +307,7 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 }
 
 /// GoldSrc `(x, y, z)` with Z up to this game's Y up.
-fn to_our(p: [f32; 3]) -> Vec3 {
+pub(crate) fn to_our(p: [f32; 3]) -> Vec3 {
 	vec3(p[0], p[2], -p[1])
 }
 
@@ -622,10 +625,26 @@ fn entities(bsp: &Lumps) -> Result<EntityInfo, String> {
 	Ok((spawn, spawn_yaw, spawn_pitch, solids))
 }
 
-/// The value of `"key" "value"` in one entity body.
-fn field(body: &str, key: &str) -> Option<String> {
+/// The value of `"key" "value"` in one entity body; `lightmap` reads lights
+/// and suns from the same entity text, so the parse lives here once.
+pub(crate) fn field(body: &str, key: &str) -> Option<String> {
 	let rest = body.split_once(&format!("\"{key}\" \""))?.1;
 	Some(rest.split_once('"')?.0.to_owned())
+}
+
+/// The entities lump of a BSP30 file, the same text [`parse`] splits into
+/// blocks; `lightmap`'s sun and light reads share it instead of re-parsing.
+pub(crate) fn entity_text(bytes: &[u8]) -> Result<&str, String> {
+	if bytes.len() < 12 || i32_at(bytes, 0)? != 30 {
+		return Err("not a BSP30".to_string());
+	}
+	// The entities lump is index 0.
+	let off = i32_at(bytes, 4)? as usize;
+	let len = i32_at(bytes, 8)? as usize;
+	let lump = bytes
+		.get(off..off + len)
+		.ok_or_else(|| "entities lump past the end".to_string())?;
+	std::str::from_utf8(lump).map_err(|_| "entities are not UTF-8".to_string())
 }
 
 /// The model owning each face: world model 0 for faces no model claims.
@@ -895,14 +914,15 @@ fn pack_lightmaps(blocks: &[Block]) -> Result<(Atlas, Vec<(usize, Rect)>), Strin
 			side,
 			rgba: vec![0; (side * side * 4) as usize],
 		};
-		let mut packer = Packer::new(side, 1);
+		let mut packer = lightbake::pack::Packer::new(side);
 		let mut rects = Vec::with_capacity(blocks.len());
 		let mut full = true;
 		for &(face, w, h, ref block) in blocks {
-			let Some(rect) = packer.push(w, h) else {
+			let Some((x, y)) = packer.place(w, h) else {
 				full = false;
 				break;
 			};
+			let rect = Rect { x, y, w, h };
 			for row in 0..h as usize {
 				for col in 0..w as usize {
 					let at = (row * w as usize + col) * 4;
@@ -919,8 +939,10 @@ fn pack_lightmaps(blocks: &[Block]) -> Result<(Atlas, Vec<(usize, Rect)>), Strin
 	Err("lightmap atlas overflowed 4096 texels".into())
 }
 
-/// Shelf packer: rectangles go left to right on a row, the next row starts
-/// below the tallest. Sizes and origins are multiples of `align`.
+/// Shelf packer for the albedo atlas: rectangles go left to right on a row,
+/// the next row starts below the tallest. Sizes and origins are multiples of
+/// `align`. Lightmaps pack through `lightbake::pack::Packer` instead, whose
+/// one-texel gutter serves the same no-bleed purpose at align 1.
 struct Packer {
 	side: u32,
 	align: u32,

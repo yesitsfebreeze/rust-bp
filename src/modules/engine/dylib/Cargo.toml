@@ -1,0 +1,20 @@
+[package]
+name = "engine_dylib"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "The engine and audio as one Rust dylib, so the hot-reloaded game and its host share one copy"
+
+# A Rust dylib: the `hot` host and each `hot_game` build link it instead of
+# carrying their own engine. Everything that outlives a game generation (the
+# window, GPU objects, the audio device) runs code from here, which never
+# unloads.
+[lib]
+path = "lib.rs"
+crate-type = ["dylib"]
+test = false
+doctest = false
+
+[dependencies]
+audio = { path = "../../audio" }
+engine = { path = ".." }

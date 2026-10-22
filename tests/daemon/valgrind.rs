@@ -6,23 +6,31 @@ use serde_json::json;
 
 #[test]
 fn container_word_maps_host_target_paths() {
-	let rt = "/tmp/rt";
+	let (rt, c) = ("/tmp/rt", "/host-daemon");
 	assert_eq!(
-		container_word("./target/release/leaky", rt),
-		"/tmp/rt/target-linux/release/leaky"
+		container_word("./target/release/leaky", rt, c),
+		"/host-daemon/target-linux/release/leaky"
 	);
 	assert_eq!(
-		container_word("target/release/app", rt),
-		"/tmp/rt/target-linux/release/app"
+		container_word("target/release/app", rt, c),
+		"/host-daemon/target-linux/release/app"
 	);
 	assert_eq!(
-		container_word("target/gen/app/Cargo.toml", rt),
+		container_word("target/gen/app/Cargo.toml", rt, c),
 		"target/gen/app/Cargo.toml"
 	);
-	assert_eq!(container_word("3", rt), "3");
+	assert_eq!(container_word("3", rt, c), "3");
 	assert_eq!(
-		container_word("/repo/target/release/x", rt),
+		container_word("/repo/target/release/x", rt, c),
 		"/repo/target/release/x"
+	);
+	assert_eq!(
+		container_word("/tmp/rt/target-linux/release/x", rt, c),
+		"/host-daemon/target-linux/release/x"
+	);
+	assert_eq!(
+		container_word("/host-daemon/target-linux/release/x", rt, c),
+		"/host-daemon/target-linux/release/x"
 	);
 }
 

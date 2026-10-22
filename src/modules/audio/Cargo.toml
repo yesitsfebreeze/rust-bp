@@ -1,0 +1,12 @@
+[package]
+name = "audio"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Binaural weapon audio: per-voice HRTF convolution, distance falloff and a stereo limiter"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+sokol.workspace = true

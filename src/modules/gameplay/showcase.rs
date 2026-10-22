@@ -112,20 +112,21 @@ pub fn world(arena: &Mesh, g: f32) -> World {
 	let mut w = World::new(arena.clone());
 	w.gravity = vec3(0.0, -g, 0.0);
 	w.platforms = vec![
-		Platform {
-			mesh: boxes_mesh(&DECK),
-			origin: vec3(832.0, 104.0, 672.0),
-			swing: vec3(48.0, 0.0, 0.0),
-			period: 5.0,
-		},
-		Platform {
-			mesh: boxes_mesh(&LIFT),
-			origin: vec3(688.0, 192.0, 768.0),
-			swing: vec3(0.0, 80.0, 0.0),
-			period: 4.0,
-		},
+		Platform::new(
+			boxes_mesh(&DECK),
+			vec3(832.0, 104.0, 672.0),
+			vec3(48.0, 0.0, 0.0),
+			5.0,
+		),
+		Platform::new(
+			boxes_mesh(&LIFT),
+			vec3(688.0, 192.0, 768.0),
+			vec3(0.0, 80.0, 0.0),
+			4.0,
+		),
 	];
 	w.bodies = [yard, pen].concat();
+	w.prepare();
 	w
 }
 

@@ -58,7 +58,13 @@ pub fn run() {
 	let directory = enclosure.0.join("boilerplate");
 	std::fs::create_dir_all(&directory).unwrap();
 	copy_fixture_sources(&root, &directory);
-	std::fs::copy(root.join("src/main.rs"), directory.join("src/main.rs")).unwrap();
+	// The stateful journey exercises the framework's sample app, not the
+	// game: a channels-ticking main that hot-swaps the `counter` module.
+	std::fs::copy(
+		root.join("tests/fixtures/stateful_app.rs"),
+		directory.join("src/main.rs"),
+	)
+	.unwrap();
 	let env = Env {
 		set: vec![],
 		remove: vec![

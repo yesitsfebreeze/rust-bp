@@ -1,0 +1,59 @@
+# One weapon's 1.6 numbers, every value from Counter-Strike 1.6 (mp.dll).
+# The game loads this at start and writes it back if missing; edit and rerun.
+#
+# heat.kind:
+#   "shots"  - accuracy = base + shots^power / div, capped; shots count since
+#              deploy/reload, never reset by waiting (1.6 resets only those).
+#   "recover"- pistols: accuracy recovers toward max after firing;
+#              spread states scale with (1 - accuracy).
+#   "none"   - no accuracy factor; spread states are their `add` constants.
+#
+# spread states, spread = mul * factor + add per state, duck_* overriding when
+# ducked and grounded: "air" while airborne; "still" under still_speed;
+# "slow" under slow_speed; "fast" above it. Factor is `accuracy` for "shots"
+# heat, (1 - accuracy) for "recover", and 1 for "none" (use `add`).
+#
+# punch states (mp.dll's KickBack): kick_x, kick_y, growth_x, growth_y,
+# cap_x, cap_y, flip_rand; kick grows with consecutive shots and the
+# horizontal kick flips direction at the flip_rand odds. `punch_x` instead is a
+# fixed vertical kick (AWP, pistols' -2.0 degrees).
+
+name = "usp"
+slot = 3
+price = 500
+ammo_price = 50
+ammo_name = "45acp"
+damage = 34.0
+range = 8192.0
+range_mod = 0.79
+pen = 1
+cycle = 0.15
+auto = false
+clip = 12
+reserve = 100
+maxspeed = 250.0
+reload = 2.7
+punch_x = -2.0
+fire1 = "usp1.wav"
+fire2 = "usp2.wav"
+dry_sound = "dryfire_pistol.wav"
+reload_sounds = ["usp_clipout.wav@0.25", "usp_clipin.wav@0.55", "usp_sliderelease.wav@0.8"]
+
+[heat]
+kind = "recover"
+window = 0.3
+rate = 0.275
+min = 0.6
+max = 0.92
+
+[spread]
+still_speed = 0.0
+slow_speed = 0.0
+
+[spread.air]
+mul = 1.2
+[spread.still]
+mul = 0.1
+duck_mul = 0.08
+[spread.fast]
+mul = 0.225

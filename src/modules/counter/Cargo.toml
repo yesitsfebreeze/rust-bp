@@ -1,0 +1,12 @@
+[package]
+name = "counter"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+path = "lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+reload = { path = "../../runtime/reload", default-features = false }

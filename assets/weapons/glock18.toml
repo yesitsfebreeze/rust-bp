@@ -1,0 +1,71 @@
+# One weapon's 1.6 numbers, every value from Counter-Strike 1.6 (mp.dll).
+# The game loads this at start and writes it back if missing; edit and rerun.
+#
+# heat.kind:
+#   "shots"  - accuracy = base + shots^power / div, capped; shots count since
+#              deploy/reload, never reset by waiting (1.6 resets only those).
+#   "recover"- pistols: accuracy recovers toward max after firing;
+#              spread states scale with (1 - accuracy).
+#   "none"   - no accuracy factor; spread states are their `add` constants.
+#
+# spread states, spread = mul * factor + add per state, duck_* overriding when
+# ducked and grounded: "air" while airborne; "still" under still_speed;
+# "slow" under slow_speed; "fast" above it. Factor is `accuracy` for "shots"
+# heat, (1 - accuracy) for "recover", and 1 for "none" (use `add`).
+#
+# punch states (mp.dll's KickBack): kick_x, kick_y, growth_x, growth_y,
+# cap_x, cap_y, flip_rand; kick grows with consecutive shots and the
+# horizontal kick flips direction at the flip_rand odds. `punch_x` instead is a
+# fixed vertical kick (AWP, pistols' -2.0 degrees).
+
+name = "glock18"
+slot = 2
+price = 400
+ammo_price = 20
+ammo_name = "9mm"
+damage = 25.0
+range = 8192.0
+range_mod = 0.75
+pen = 1
+cycle = 0.15
+auto = false
+clip = 20
+reserve = 120
+maxspeed = 250.0
+reload = 2.2
+fire1 = "glock18-1.wav"
+fire2 = "glock18-2.wav"
+dry_sound = "dryfire_pistol.wav"
+# The 1.6 install ships no glock clip sounds; the reload is silent.
+
+[heat]
+kind = "recover"
+window = 0.325
+rate = 0.275
+min = 0.6
+max = 0.9
+
+[spread]
+still_speed = 0.0
+slow_speed = 0.0
+
+[spread.air]
+mul = 1.0
+[spread.still]
+mul = 0.1
+duck_mul = 0.075
+[spread.fast]
+mul = 0.165
+
+[burst]
+rounds = 3
+interval = 0.1
+next = 0.5
+
+[burst_spread.air]
+mul = 1.2
+[burst_spread.still]
+mul = 0.3
+duck_mul = 0.095
+[burst_spread.fast]
+mul = 0.185

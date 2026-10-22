@@ -5,12 +5,9 @@
 //! - [`Mat4`]: column-major transforms in OpenGL clip conventions.
 //! - [`Camera`]: a perspective view, as the matrix that draws it.
 //!
-//! Right-handed, y up. With the `macroquad` feature, each type converts into
-//! macroquad's with `.into()` and [`Camera`] can be passed to `set_camera`.
+//! Right-handed, y up.
 
 mod camera;
-#[cfg(feature = "macroquad")]
-mod macroquad;
 mod mat4;
 mod quat;
 mod vec3;

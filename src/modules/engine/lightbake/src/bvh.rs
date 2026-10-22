@@ -1,96 +1,28 @@
-//! Ray queries over a triangle soup: the same median-split, depth-first node
-//! layout `physics` uses for its (private) hierarchy, but answering ray casts
-//! for shadow and gather rays.
+//! Ray queries over a triangle soup on the hierarchy `physics` builds,
+//! answering ray casts for shadow and gather rays.
 
 use crate::Triangle;
 use linalg::{vec3, Vec3};
+use physics::triangle_bounds;
 
-const LEAF_SIZE: usize = 4;
-
+/// [`physics::bvh::Bvh`], the hierarchy the collision queries walk, with the
+/// bake's ray and GPU queries.
 #[derive(Clone, Debug, Default)]
 pub struct Bvh {
-	nodes: Vec<Node>,
-	order: Vec<u32>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Node {
-	lo: Vec3,
-	hi: Vec3,
-	/// Leaf: first index into `order`. Inner: index of the right child.
-	first: u32,
-	/// Triangles in a leaf; zero for inner nodes.
-	count: u32,
-}
-
-fn bounds(tri: &Triangle) -> (Vec3, Vec3) {
-	(
-		tri[0].min(tri[1]).min(tri[2]),
-		tri[0].max(tri[1]).max(tri[2]),
-	)
+	tree: physics::bvh::Bvh,
 }
 
 impl Bvh {
 	pub fn build(tris: &[Triangle]) -> Bvh {
-		let mut bvh = Bvh {
-			nodes: Vec::new(),
-			order: (0..tris.len() as u32).collect(),
-		};
-		if !tris.is_empty() {
-			bvh.split(tris, 0, tris.len());
+		Bvh {
+			tree: physics::bvh::Bvh::build(tris),
 		}
-		bvh
-	}
-
-	/// Median split along the longest axis of the triangle centroids.
-	fn split(&mut self, tris: &[Triangle], start: usize, end: usize) {
-		let items = &mut self.order[start..end];
-		let (mut lo, mut hi) = bounds(&tris[items[0] as usize]);
-		let centroid = |i: u32| {
-			let t = &tris[i as usize];
-			(t[0] + t[1] + t[2]) * (1.0 / 3.0)
-		};
-		let (mut clo, mut chi) = (centroid(items[0]), centroid(items[0]));
-		for &i in items.iter() {
-			let (a, b) = bounds(&tris[i as usize]);
-			(lo, hi) = (lo.min(a), hi.max(b));
-			let c = centroid(i);
-			(clo, chi) = (clo.min(c), chi.max(c));
-		}
-		let at = self.nodes.len();
-		self.nodes.push(Node {
-			lo,
-			hi,
-			first: start as u32,
-			count: (end - start) as u32,
-		});
-		if end - start <= LEAF_SIZE {
-			return;
-		}
-		let e = chi - clo;
-		let axis = |v: Vec3| {
-			if e.x >= e.y && e.x >= e.z {
-				v.x
-			} else if e.y >= e.z {
-				v.y
-			} else {
-				v.z
-			}
-		};
-		let mid = (end - start) / 2;
-		items.select_nth_unstable_by(mid, |&a, &b| {
-			axis(centroid(a)).total_cmp(&axis(centroid(b)))
-		});
-		self.split(tris, start, start + mid);
-		self.nodes[at].first = self.nodes.len() as u32;
-		self.nodes[at].count = 0;
-		self.split(tris, start + mid, end);
 	}
 
 	/// The first triangle the ray from `o` along unit `d` hits before `max_t`,
 	/// two-sided: its index and the distance along `d`.
 	pub fn cast(&self, tris: &[Triangle], o: Vec3, d: Vec3, max_t: f32) -> Option<(usize, f32)> {
-		if self.nodes.is_empty() {
+		if self.tree.nodes().is_empty() {
 			return None;
 		}
 		// Zero components become a huge inverse so the slab test still
@@ -100,13 +32,13 @@ impl Bvh {
 		let mut best = max_t;
 		let mut hit = None;
 		while let Some(at) = stack.pop() {
-			let node = self.nodes[at as usize];
+			let node = self.tree.nodes()[at as usize];
 			if !enters(o, inv, node.lo, node.hi, 0.0, best) {
 				continue;
 			}
 			if node.count > 0 {
 				for k in node.first..node.first + node.count {
-					let i = self.order[k as usize] as usize;
+					let i = self.tree.order()[k as usize] as usize;
 					if let Some(t) = hit_tri(o, d, &tris[i], 1e-4) {
 						if t < best {
 							(best, hit) = (t, Some(i));
@@ -118,6 +50,61 @@ impl Bvh {
 			}
 		}
 		hit.map(|i| (i, best))
+	}
+
+	/// The nodes and triangle order as the GPU bake's storage buffer: each
+	/// node `lo`, `first`, `hi`, `count` little endian, then the order array.
+	#[cfg(feature = "gpu")]
+	pub fn gpu(&self) -> (Vec<u8>, Vec<u32>) {
+		let mut bytes = Vec::with_capacity(self.tree.nodes().len() * 32);
+		for node in self.tree.nodes() {
+			for v in [node.lo.x, node.lo.y, node.lo.z] {
+				bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+			}
+			bytes.extend_from_slice(&node.first.to_le_bytes());
+			for v in [node.hi.x, node.hi.y, node.hi.z] {
+				bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+			}
+			bytes.extend_from_slice(&node.count.to_le_bytes());
+		}
+		(bytes, self.tree.order().to_vec())
+	}
+
+	/// Every triangle whose own bounds meet `lo`..`hi`, walking the same
+	/// hierarchy `cast` does. The GPU bake's occluder sets gather their
+	/// over-approximation from these.
+	#[cfg(feature = "gpu")]
+	pub fn in_box(&self, tris: &[Triangle], lo: Vec3, hi: Vec3) -> Vec<u32> {
+		let mut out = Vec::new();
+		if self.tree.nodes().is_empty() {
+			return out;
+		}
+		let mut stack = vec![0u32];
+		while let Some(at) = stack.pop() {
+			let node = self.tree.nodes()[at as usize];
+			if node.lo.x > hi.x
+				|| node.hi.x < lo.x
+				|| node.lo.y > hi.y
+				|| node.hi.y < lo.y
+				|| node.lo.z > hi.z
+				|| node.hi.z < lo.z
+			{
+				continue;
+			}
+			if node.count > 0 {
+				for k in node.first..node.first + node.count {
+					let i = self.tree.order()[k as usize];
+					let (a, b) = triangle_bounds(&tris[i as usize]);
+					if a.x <= hi.x && b.x >= lo.x && a.y <= hi.y && b.y >= lo.y && a.z <= hi.z && b.z >= lo.z
+					{
+						out.push(i);
+					}
+				}
+			} else {
+				stack.extend([node.first, at + 1]);
+			}
+		}
+		out
 	}
 }
 
@@ -161,41 +148,10 @@ pub fn hit_tri(o: Vec3, d: Vec3, tri: &Triangle, eps: f32) -> Option<f32> {
 	(at > eps).then_some(at)
 }
 
-/// The closest point on `tri` to `point` (Ericson, Real-Time Collision
-/// Detection 5.1.5), used to evaluate chart texels that fall outside their
-/// triangle at the nearest point that lies on it.
+/// The closest point on `tri` to `point`, used to evaluate chart texels that
+/// fall outside their triangle at the nearest point that lies on it.
 pub fn closest_point(point: Vec3, tri: &Triangle) -> Vec3 {
-	let [a, b, c] = *tri;
-	let (ab, ac) = (b - a, c - a);
-	let ap = point - a;
-	let (d1, d2) = (ab.dot(ap), ac.dot(ap));
-	if d1 <= 0.0 && d2 <= 0.0 {
-		return a;
-	}
-	let bp = point - b;
-	let (d3, d4) = (ab.dot(bp), ac.dot(bp));
-	if d3 >= 0.0 && d4 <= d3 {
-		return b;
-	}
-	let vc = d1 * d4 - d3 * d2;
-	if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-		return a + ab * (d1 / (d1 - d3));
-	}
-	let cp = point - c;
-	let (d5, d6) = (ab.dot(cp), ac.dot(cp));
-	if d6 >= 0.0 && d5 <= d6 {
-		return c;
-	}
-	let vb = d5 * d2 - d1 * d6;
-	if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-		return a + ac * (d2 / (d2 - d6));
-	}
-	let va = d3 * d6 - d5 * d4;
-	if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-		return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
-	}
-	let denom = 1.0 / (va + vb + vc);
-	a + ab * (vb * denom) + ac * (vc * denom)
+	physics::closest_point_triangle(point, tri).0
 }
 
 /// Corners of the box spanning `tris`, for ray length bounds.
@@ -203,12 +159,63 @@ pub fn soup_bounds(tris: &[Triangle]) -> (Vec3, Vec3) {
 	let mut lo = vec3(f32::MAX, f32::MAX, f32::MAX);
 	let mut hi = vec3(f32::MIN, f32::MIN, f32::MIN);
 	for t in tris {
-		let (a, b) = bounds(t);
+		let (a, b) = triangle_bounds(t);
 		(lo, hi) = (lo.min(a), hi.max(b));
 	}
 	if lo.x > hi.x {
 		(Vec3::ZERO, Vec3::ZERO)
 	} else {
 		(lo, hi)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A soup of `n` small triangles scattered by a fixed LCG.
+	fn soup(n: usize) -> Vec<Triangle> {
+		let mut seed = 0x2545_F491u32;
+		let mut next = move || {
+			seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+			(seed >> 8) as f32 / (1 << 24) as f32
+		};
+		(0..n)
+			.map(|_| {
+				let c = vec3(next(), next(), next()) * 100.0;
+				let mut corner = || c + vec3(next(), next(), next()) * 4.0;
+				[corner(), corner(), corner()]
+			})
+			.collect()
+	}
+
+	fn depth(bvh: &Bvh, at: usize) -> usize {
+		let node = bvh.tree.nodes()[at];
+		if node.count > 0 {
+			return 0;
+		}
+		1 + depth(bvh, at + 1).max(depth(bvh, node.first as usize))
+	}
+
+	#[test]
+	fn sah_casts_match_brute_force_and_stay_shallow() {
+		let tris = soup(3000);
+		let bvh = Bvh::build(&tris);
+		assert!(depth(&bvh, 0) <= physics::bvh::MAX_DEPTH);
+		let mut sorted = bvh.tree.order().to_vec();
+		sorted.sort_unstable();
+		assert!(sorted.iter().enumerate().all(|(k, &i)| k as u32 == i));
+		for k in 0..200 {
+			let f = k as f32;
+			let o = vec3(-10.0, f * 0.5, 50.0 + (f * 0.37).sin() * 40.0);
+			let d = vec3(1.0, (f * 0.13).cos() * 0.3, (f * 0.07).sin() * 0.3).normalize();
+			let brute = tris
+				.iter()
+				.enumerate()
+				.filter_map(|(i, t)| hit_tri(o, d, t, 1e-4).map(|t| (i, t)))
+				.min_by(|a, b| a.1.total_cmp(&b.1));
+			let cast = bvh.cast(&tris, o, d, f32::MAX);
+			assert_eq!(cast.map(|c| c.1), brute.map(|b| b.1), "ray {k}");
+		}
 	}
 }

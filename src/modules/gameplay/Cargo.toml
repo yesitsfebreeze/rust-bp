@@ -10,5 +10,7 @@ path = "lib.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+# Binaural HRTF weapon audio; the mixer runs at its fixed 44.1 kHz rate.
+audio = { path = "../audio" }
 # The weapon table: `weapons.toml` parses to `toml::Table`, no serde.
 toml = "0.8"

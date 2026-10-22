@@ -1,0 +1,15 @@
+[package]
+name = "hot"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Plays the game in a window that stays open while gameplay rebuilds and reloads"
+
+[[bin]]
+name = "hot"
+path = "main.rs"
+test = false
+
+[dependencies]
+engine_dylib = { path = "../engine/dylib" }
+libloading = "0.8"

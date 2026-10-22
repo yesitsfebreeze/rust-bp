@@ -134,3 +134,153 @@ impl<'a> Unpacker<'a> {
 		}
 	}
 }
+
+/// What one game generation hands the next when the game hot-reloads in an
+/// open window: where the player is and looks, what they carry, and the
+/// cvars by name, so a cvar added or renamed since keeps its default.
+pub struct Carried {
+	pub player: crate::player::Player,
+	pub previous: crate::player::Player,
+	pub yaw: f32,
+	pub pitch: f32,
+	pub fly: bool,
+	pub fly_eye: engine::linalg::Vec3,
+	pub slot: usize,
+	pub money: u32,
+	pub owned: Vec<bool>,
+	pub mags: Vec<(u32, u32)>,
+	/// [`crate::weapons::Armed::save`] of the gun in hand.
+	pub armed: Vec<u8>,
+	pub now: f32,
+	pub console_open: bool,
+	pub cvars: Vec<(String, f32)>,
+}
+
+impl Carried {
+	pub fn save(&self) -> Vec<u8> {
+		let mut p = Packer::new();
+		p.raw(&self.player);
+		p.raw(&self.previous);
+		p.f32(self.yaw);
+		p.f32(self.pitch);
+		p.bool(self.fly);
+		p.raw(&self.fly_eye);
+		p.u32(self.slot as u32);
+		p.u32(self.money);
+		p.u32(self.owned.len() as u32);
+		for owned in &self.owned {
+			p.bool(*owned);
+		}
+		p.u32(self.mags.len() as u32);
+		for (clip, reserve) in &self.mags {
+			p.u32(*clip);
+			p.u32(*reserve);
+		}
+		p.bytes(&self.armed);
+		p.f32(self.now);
+		p.bool(self.console_open);
+		p.u32(self.cvars.len() as u32);
+		for (name, value) in &self.cvars {
+			p.str(name);
+			p.f32(*value);
+		}
+		p.finish()
+	}
+
+	pub fn restore(bytes: &[u8]) -> Result<Carried, Error> {
+		let mut u = Unpacker::new(bytes)?;
+		let player = u.raw()?;
+		let previous = u.raw()?;
+		let (yaw, pitch, fly) = (u.f32()?, u.f32()?, u.bool()?);
+		let fly_eye = u.raw()?;
+		let (slot, money) = (u.u32()? as usize, u.u32()?);
+		let owned = (0..u.u32()?).map(|_| u.bool()).collect::<Result<_, _>>()?;
+		let mags = (0..u.u32()?)
+			.map(|_| Ok((u.u32()?, u.u32()?)))
+			.collect::<Result<_, Error>>()?;
+		let armed = u.bytes()?;
+		let (now, console_open) = (u.f32()?, u.bool()?);
+		let cvars = (0..u.u32()?)
+			.map(|_| Ok((u.str()?, u.f32()?)))
+			.collect::<Result<_, Error>>()?;
+		u.end()?;
+		Ok(Carried {
+			player,
+			previous,
+			yaw,
+			pitch,
+			fly,
+			fly_eye,
+			slot,
+			money,
+			owned,
+			mags,
+			armed,
+			now,
+			console_open,
+			cvars,
+		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::player::Player;
+	use engine::linalg::vec3;
+
+	#[test]
+	fn carried_state_survives_the_round_trip() {
+		let mut player = Player::spawn(vec3(10.0, 20.0, 30.0));
+		player.velocity = vec3(250.0, 0.0, -40.0);
+		let carried = Carried {
+			player,
+			previous: Player::spawn(vec3(9.0, 20.0, 30.0)),
+			yaw: 105.0,
+			pitch: -12.5,
+			fly: true,
+			fly_eye: vec3(1.0, 2.0, 3.0),
+			slot: 5,
+			money: 3150,
+			owned: vec![true, true, false, false, false, true, false, false],
+			mags: vec![(30, 90), (20, 120)],
+			armed: vec![1, 2, 3],
+			now: 42.0,
+			console_open: true,
+			cvars: vec![("fov".into(), 100.0), ("sv_gravity".into(), 600.0)],
+		};
+		let back = Carried::restore(&carried.save()).expect("restore");
+		assert_eq!(back.player, carried.player);
+		assert_eq!(back.previous, carried.previous);
+		assert_eq!((back.yaw, back.pitch, back.fly), (105.0, -12.5, true));
+		assert_eq!(back.fly_eye, carried.fly_eye);
+		assert_eq!((back.slot, back.money, back.now), (5, 3150, 42.0));
+		assert_eq!(back.owned, carried.owned);
+		assert_eq!(back.mags, carried.mags);
+		assert_eq!(back.armed, carried.armed);
+		assert!(back.console_open);
+		assert_eq!(back.cvars, carried.cvars);
+	}
+
+	#[test]
+	fn a_truncated_state_is_refused() {
+		let bytes = Carried {
+			player: Player::spawn(vec3(0.0, 0.0, 0.0)),
+			previous: Player::spawn(vec3(0.0, 0.0, 0.0)),
+			yaw: 0.0,
+			pitch: 0.0,
+			fly: false,
+			fly_eye: vec3(0.0, 0.0, 0.0),
+			slot: 1,
+			money: 800,
+			owned: Vec::new(),
+			mags: Vec::new(),
+			armed: Vec::new(),
+			now: 0.0,
+			console_open: false,
+			cvars: Vec::new(),
+		}
+		.save();
+		assert!(Carried::restore(&bytes[..bytes.len() - 1]).is_err());
+	}
+}

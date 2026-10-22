@@ -1,0 +1,63 @@
+# One weapon's 1.6 numbers, every value from Counter-Strike 1.6 (mp.dll).
+# The game loads this at start and writes it back if missing; edit and rerun.
+#
+# heat.kind:
+#   "shots"  - accuracy = base + shots^power / div, capped; shots count since
+#              deploy/reload, never reset by waiting (1.6 resets only those).
+#   "recover"- pistols: accuracy recovers toward max after firing;
+#              spread states scale with (1 - accuracy).
+#   "none"   - no accuracy factor; spread states are their `add` constants.
+#
+# spread states, spread = mul * factor + add per state, duck_* overriding when
+# ducked and grounded: "air" while airborne; "still" under still_speed;
+# "slow" under slow_speed; "fast" above it. Factor is `accuracy` for "shots"
+# heat, (1 - accuracy) for "recover", and 1 for "none" (use `add`).
+#
+# punch states (mp.dll's KickBack): kick_x, kick_y, growth_x, growth_y,
+# cap_x, cap_y, flip_rand; kick grows with consecutive shots and the
+# horizontal kick flips direction at the flip_rand odds. `punch_x` instead is a
+# fixed vertical kick (AWP, pistols' -2.0 degrees).
+
+name = "mp5"
+slot = 5
+price = 1500
+ammo_price = 20
+ammo_name = "9mm"
+damage = 26.0
+range = 8192.0
+range_mod = 0.84
+pen = 1
+cycle = 0.075
+auto = true
+clip = 30
+reserve = 120
+maxspeed = 250.0
+reload = 2.63
+fire1 = "mp5-1.wav"
+fire2 = "mp5-2.wav"
+dry_sound = "dryfire_rifle.wav"
+reload_sounds = ["mp5_clipout.wav@0.25", "mp5_clipin.wav@0.6", "mp5_slideback.wav@0.85"]
+
+[heat]
+kind = "shots"
+base = 0.45
+power = 2.0
+div = 220.1
+cap = 0.75
+
+[spread]
+slow_speed = 9999.0
+
+[spread.air]
+mul = 0.2
+[spread.slow]
+mul = 0.04
+
+[punch.air]
+kick = [0.9, 0.475, 0.35, 0.0425, 5.0, 3.0, 6.0]
+[punch.move]
+kick = [0.5, 0.275, 0.2, 0.03, 3.0, 2.0, 10.0]
+[punch.duck]
+kick = [0.225, 0.15, 0.1, 0.015, 2.0, 1.0, 10.0]
+[punch.stand]
+kick = [0.25, 0.175, 0.125, 0.02, 2.25, 1.25, 10.0]

@@ -81,6 +81,12 @@ ci:
 serve *args:
     cargo run --release -p daemon -- serve "$@"
 
+# The game in a window that stays open while gameplay hot-reloads: saving a file under src/modules/gameplay rebuilds it and swaps it in between frames, state kept. Engine changes need a restart.
+[group('run')]
+hot:
+    cargo build --locked -p hot -p hot_game
+    cargo run --locked -p hot
+
 # Daemon control: status | reload | stop | dir | channels.
 [group('run')]
 daemon *args:

@@ -18,7 +18,18 @@ The integration tests use `tests/fixtures/workload.rs` in a temporary checkout.
    it ends itself after 30 idle minutes (`serve --detach --idle 0` to stay).
    Replace the child with `daemon serve [--detach] -- <command>`.
 
-2. **Live channels** — the preset profiler channel, in-process:
+2. **Gameplay spike capture** — while playing, the game keeps a bounded,
+   in-memory rolling trace of frame and movement-tick samples. A frame taking
+   at least 50 ms or a player movement tick reaching its fixed-tick budget
+   starts a capture. The CSV contains up to 15 seconds before the spike and 16
+   seconds after it, with player position/velocity, ground/duck state, input,
+   movement cvars, weapon/ammo, frame and tick durations, and movement collision
+   cast/overlap counts. A capture writes on a background thread to
+   `logs/performance/`; an unfinished capture is saved partially when the game
+   exits. Sampling is bounded and memory-only until a spike, so ordinary play
+   does not write profiling data to disk.
+
+3. **Live channels** — the preset profiler channel, in-process:
    `channels::inc("items")`, `channels::timer("op.x").done()`,
    `channels::set("depth", 1.5)`. The executable serves them once at startup:
 
@@ -31,13 +42,13 @@ The integration tests use `tests/fixtures/workload.rs` in a temporary checkout.
    Channel storage is per-process; module-only swaps keep it. After an app
    restart, the starter reports gauges from its restored simulation state.
 
-3. **Memory, native where it runs** — `memory_report` reads the *live*
+4. **Memory, native where it runs** — `memory_report` reads the *live*
    process on this machine (macOS `leaks`, opt-in `heap`): leaked bytes with
    allocation callstacks, the honest view for graphics programs (Metal and
    the window server live in the same process). The pid defaults to the
    supervised app. Nothing containerized.
 
-4. **Valgrind + Jev** — `valgrind_run {name, command, build?, tool?}` runs a
+5. **Valgrind + Jev** — `valgrind_run {name, command, build?, tool?}` runs a
    bounded command under **callgrind** (per-function instruction counts) or
    **memcheck** (memory errors, leak records), native when a valgrind is on
    PATH — same machine, same libc, the exact binary you build — and inside

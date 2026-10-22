@@ -68,7 +68,8 @@ fn ray_tri(origin: Vec3, dir: Vec3, tri: &Triangle) -> Option<(f32, bool)> {
 
 /// The nearest triangle the ray crosses with the wanted side: (how far,
 /// which triangle, front hit). `None` takes either side, `Some(false)` looks
-/// for a wall's far side only.
+/// for a wall's far side only. The BVH prunes to the triangles the ray can
+/// actually touch.
 fn nearest_hit(
 	mesh: &Mesh,
 	origin: Vec3,
@@ -76,7 +77,7 @@ fn nearest_hit(
 	wanted: Option<bool>,
 ) -> Option<(f32, usize, bool)> {
 	let mut best = None;
-	for (i, tri) in mesh.tris().iter().enumerate() {
+	for (i, tri) in mesh.ray_tris(origin, dir) {
 		let Some((t, front)) = ray_tri(origin, dir, tri) else {
 			continue;
 		};

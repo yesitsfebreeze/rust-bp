@@ -8,10 +8,8 @@
 //! the view kick is mp.dll's KickBack, which grows with consecutive shots and
 //! flips its horizontal direction at per-weapon odds.
 
+use engine::gpu::{Color, Gfx};
 use engine::linalg::{self, Vec3};
-use engine::macroquad;
-use engine::macroquad::audio::Sound;
-use engine::macroquad::prelude::*;
 
 /// The built-in weapon files, written to `assets/weapons/` when missing and
 /// the source of the defaults.
@@ -203,8 +201,7 @@ impl Weapon {
 	/// Fire direction: the punched view through the heat-derived cone, as
 	/// GoldSrc's FireBullets mixes two uniform draws per axis into the spread.
 	pub fn dir(&self, forward: Vec3, right: Vec3, up: Vec3, spread: f32) -> Vec3 {
-		let uniform =
-			|| macroquad::rand::gen_range(-0.5f32, 0.5) + macroquad::rand::gen_range(-0.5f32, 0.5);
+		let uniform = || crate::rng::range(-0.5, 0.5) + crate::rng::range(-0.5, 0.5);
 		(forward + right * (uniform() * spread) + up * (uniform() * spread)).normalize()
 	}
 }
@@ -474,7 +471,7 @@ impl Armed {
 			ky += self.shots as f32 * k[3];
 		}
 		self.punch.0 = (self.punch.0 - kx).max(-k[4]);
-		if (macroquad::rand::gen_range(0.0, k[6] + 1.0) as i32) == 0 {
+		if (crate::rng::range(0.0, k[6] + 1.0) as i32) == 0 {
 			self.punch_flip = !self.punch_flip;
 		}
 		let sy = if self.punch_flip { ky } else { -ky };
@@ -765,7 +762,7 @@ pub fn synth_wav(w: &Weapon) -> Vec<u8> {
 	let mut low = 0.0f32;
 	for (i, s) in samples.iter_mut().enumerate() {
 		let t = i as f32 / rate as f32;
-		let noise = macroquad::rand::gen_range(-1.0f32, 1.0f32);
+		let noise = crate::rng::range(-1.0, 1.0);
 		low += brightness * (noise - low);
 		let v = low * gain * (-t / tau).exp();
 		*s = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -789,22 +786,29 @@ pub fn synth_wav(w: &Weapon) -> Vec<u8> {
 }
 
 /// Loads one sound file from the install's `sound/weapons` directory, falling
-/// back to the weapon's synthesized report.
-pub async fn load_sound(dir: Option<&std::path::Path>, file: &str, w: &Weapon) -> Sound {
+/// back to the weapon's synthesized report; the mixer resamples whatever
+/// rate the file carries.
+pub fn load_clip(dir: Option<&std::path::Path>, file: &str, w: &Weapon) -> audio::Clip {
 	if let Some(bytes) = dir.and_then(|d| std::fs::read(d.join(file)).ok()) {
-		if let Ok(s) = macroquad::audio::load_sound_from_bytes(&bytes).await {
-			return s;
+		if let Ok(clip) = audio::Clip::from_wav(&bytes, audio::RATE) {
+			return clip;
 		}
 	}
-	macroquad::audio::load_sound_from_bytes(&synth_wav(w))
-		.await
-		.expect("synth wav")
+	audio::Clip::from_wav(&synth_wav(w), audio::RATE).expect("synth wav")
 }
 
 /// The weapon in the player's hands, drawn as a plain viewmodel in front of
 /// the eye when its GoldSrc model did not load: a body, a barrel and a grip,
 /// kicked back by `recoil` (1 at the shot, eased off by the caller).
-pub fn draw_viewmodel(w: &Weapon, eye: Vec3, forward: Vec3, right: Vec3, up: Vec3, recoil: f32) {
+pub fn draw_viewmodel(
+	gfx: &mut Gfx,
+	w: &Weapon,
+	eye: Vec3,
+	forward: Vec3,
+	right: Vec3,
+	up: Vec3,
+	recoil: f32,
+) {
 	// Slot index reads as size: pistols short, rifles long, the AWP longest.
 	let long = match w.slot {
 		1 => 0.0,
@@ -812,34 +816,29 @@ pub fn draw_viewmodel(w: &Weapon, eye: Vec3, forward: Vec3, right: Vec3, up: Vec
 		5..=7 => 5.0,
 		_ => 6.0,
 	};
-	// macroquad draws in its own Vec3; the game keeps linalg's.
-	let q = |v: Vec3| macroquad::math::Vec3::from(v);
 	// The gun rides low-right, and the shot shoves it toward the eye.
 	let base = eye + forward * (8.0 - recoil * 1.5) - right * 3.0 + up * (-2.5 + recoil * 0.7);
 	let steel = Color::new(0.16, 0.17, 0.18, 1.0);
 	let dark = Color::new(0.1, 0.1, 0.11, 1.0);
 	if long == 0.0 {
 		// A knife: blade ahead of the fist.
-		draw_cube(q(base), q(linalg::vec3(0.6, 1.4, 2.2)), None, steel);
-		draw_cube(
-			q(base - forward * 1.1 + up * 0.4),
-			q(linalg::vec3(1.0, 1.0, 1.6)),
-			None,
+		gfx.front_cube(base, linalg::vec3(0.6, 1.4, 2.2), steel);
+		gfx.front_cube(
+			base - forward * 1.1 + up * 0.4,
+			linalg::vec3(1.0, 1.0, 1.6),
 			dark,
 		);
 		return;
 	}
-	draw_cube(q(base), q(linalg::vec3(1.2, 1.4, 3.0 + long)), None, steel);
-	draw_cube(
-		q(base + forward * (1.5 + long * 0.6) - up * 0.2),
-		q(linalg::vec3(0.5, 0.5, 2.0 + long)),
-		None,
+	gfx.front_cube(base, linalg::vec3(1.2, 1.4, 3.0 + long), steel);
+	gfx.front_cube(
+		base + forward * (1.5 + long * 0.6) - up * 0.2,
+		linalg::vec3(0.5, 0.5, 2.0 + long),
 		dark,
 	);
-	draw_cube(
-		q(base - forward * 1.8 + up * 0.9),
-		q(linalg::vec3(0.8, 2.0, 1.0)),
-		None,
+	gfx.front_cube(
+		base - forward * 1.8 + up * 0.9,
+		linalg::vec3(0.8, 2.0, 1.0),
 		dark,
 	);
 }
@@ -848,7 +847,6 @@ pub fn draw_viewmodel(w: &Weapon, eye: Vec3, forward: Vec3, right: Vec3, up: Vec
 /// the private ones cannot be reached and a raw copy would dangle through
 /// `reload_sounds`' allocation with the old generation's heap.
 impl Armed {
-	#[allow(dead_code)]
 	pub fn save(&self) -> Vec<u8> {
 		let mut p = crate::state::Packer::new();
 		p.u32(self.clip);
@@ -882,7 +880,6 @@ impl Armed {
 		p.finish()
 	}
 
-	#[allow(dead_code)]
 	pub fn restore(&mut self, bytes: &[u8]) -> Result<(), String> {
 		let mut u = crate::state::Unpacker::new(bytes)?;
 		self.clip = u.u32()?;

@@ -1,14 +1,11 @@
-fn conf() -> macroquad::prelude::Conf {
-	macroquad::prelude::Conf {
-		window_title: "player".into(),
-		window_width: 1600,
-		window_height: 900,
-		sample_count: 4,
-		..Default::default()
-	}
-}
+//! The player demo: `gameplay` runs the game; `daemon` reads its live
+//! channels through the socket every session shares.
 
-#[macroquad::main(conf)]
-async fn main() {
-	gameplay::run().await;
+fn main() {
+	// The daemon harness reads live channel data from this socket; serving it
+	// once at startup is the framework contract, and the game loop continues.
+	if let Err(error) = daemon::channels::serve(&daemon::app_socket()) {
+		eprintln!("app: {error}");
+	}
+	gameplay::run();
 }

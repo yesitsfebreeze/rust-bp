@@ -1,4 +1,4 @@
-# Player cvars. Edit here or in the console (` key), then `writeconfig`.
+# Cvars. Edit here or in the console, then `writeconfig`.
 
 # World gravity, units/s².
 sv_gravity = 800.0
@@ -64,22 +64,31 @@ m_yaw = 0.022
 m_pitch = 0.022
 
 # Horizontal field of view at 4:3, degrees; wider screens see more.
-fov = 90.0
+fov = 91.12546
 
 # Draw the player between the last two ticks; 0 draws the last tick.
 cl_interp = 1.0
 
 # Show horizontal speed.
-cl_showspeed = 1.0
+cl_showspeed = 0.0
 
 # Show frame rate and tick rate.
 cl_showfps = 1.0
 
 # Draw the crosshair.
-cl_crosshair = 1.0
+cl_crosshair = 0.0
+
+# Bullets punch through thin walls, losing damage per material.
+sv_penetration = 0.0
 
 # Subsurface scattering strength; 0 renders every surface opaque. Not in CS 1.6.
 r_subsurface = 1.0
 
 # Scene brightness before tone mapping. Not in CS 1.6.
-r_exposure = 1.0
+r_exposure = 0.9146679
+
+# Pixels a voxel of the traced map spans at any distance: smaller is finer and slower. Not in CS 1.6.
+r_voxel = 2.0239854
+
+# March the map voxelized ahead into sparse shells around the eye instead of tracing each hit. Not in CS 1.6.
+r_shell = 1.0

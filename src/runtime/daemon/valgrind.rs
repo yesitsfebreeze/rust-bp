@@ -130,13 +130,15 @@ pub fn run(req: Request) -> Result<Value, String> {
 
 /// Paths every run writes: absolute, under the daemon dir, which the
 /// container mounts at the same path, so host and container agree.
+/// Windows backslash forms break docker's `-v` host:container split and the
+/// container's `sh`, so artifacts carry forward slashes on every platform.
 fn artifacts(name: &str) -> (String, String, String) {
 	let dir = crate::valgrind_dir();
 	let path = |ext: &str| {
 		dir
 			.join(format!("{name}.{ext}"))
 			.to_string_lossy()
-			.into_owned()
+			.replace('\\', "/")
 	};
 	(path("out"), path("log"), path("ann"))
 }
@@ -186,25 +188,43 @@ fn run_native(req: &Request) -> Result<Option<String>, String> {
 	Ok(outcome.err())
 }
 
-/// `./target/release/X` or `target/release/X` names the host build; in the
-/// container the same artifact is `<daemon dir>/target-linux/release/X`.
+/// `./target/release/X`, `target/release/X`, or an absolute path to the
+/// host's or container's `target-linux` artifact all name the container
+/// build, at `<container daemon dir>/target-linux/release/X`.
 #[doc(hidden)]
-pub fn container_word(word: &str, daemon_dir: &str) -> String {
+pub fn container_word(word: &str, host_dir: &str, container_dir: &str) -> String {
+	for prefix in [
+		format!("{host_dir}/target-linux/"),
+		format!("{container_dir}/target-linux/"),
+	] {
+		if let Some(rest) = word.strip_prefix(&prefix) {
+			return format!("{container_dir}/target-linux/{rest}");
+		}
+	}
 	let rest = word
 		.strip_prefix("./target/")
 		.or_else(|| word.strip_prefix("target/"));
 	match rest {
-		Some(rest) if !rest.starts_with("gen/") => format!("{daemon_dir}/target-linux/{rest}"),
+		Some(rest) if !rest.starts_with("gen/") => format!("{container_dir}/target-linux/{rest}"),
 		_ => word.to_string(),
 	}
 }
 
 /// The container runner: the project mounted at /repo, the daemon dir at
-/// its own absolute path, valgrind inside.
+/// [`CONTAINER_DAEMON_DIR`] (its own path where that is a POSIX absolute
+/// path; a Windows drive path is not one), valgrind inside.
+const CONTAINER_DAEMON_DIR: &str = "/host-daemon";
+
 fn run_docker(req: &Request, root: &std::path::Path) -> Result<Option<String>, String> {
 	let (out, log, ann) = artifacts(&req.name);
-	let (out, log, ann) = (shell_word(&out), shell_word(&log), shell_word(&ann));
-	let daemon_dir = crate::dir().to_string_lossy().into_owned();
+	// Forward slashes: docker's `-v` splits host:container at the drive
+	// colon, and backslashes read as escapes in the container's `sh`.
+	let daemon_dir = crate::dir().to_string_lossy().replace('\\', "/");
+	// Everything the container reads or writes under the daemon dir travels
+	// under its container-side path; the host still finds the artifacts at
+	// the daemon dir after the same bind.
+	let inside = |host: &str| shell_word(&host.replace(&daemon_dir, CONTAINER_DAEMON_DIR));
+	let (out, log, ann) = (inside(&out), inside(&log), inside(&ann));
 	docker_up()?;
 	ensure_image()?;
 	// The host's binaries cannot run in the container: a `target/release/X`
@@ -212,7 +232,7 @@ fn run_docker(req: &Request, root: &std::path::Path) -> Result<Option<String>, S
 	let command = req
 		.command
 		.iter()
-		.map(|w| container_word(w, &daemon_dir))
+		.map(|w| container_word(w, &daemon_dir, CONTAINER_DAEMON_DIR))
 		.map(|w| shell_word(&w))
 		.collect::<Vec<_>>()
 		.join(" ");
@@ -247,18 +267,23 @@ fn run_docker(req: &Request, root: &std::path::Path) -> Result<Option<String>, S
 		container.clone(),
 		"--label".to_string(),
 		"valgrind.owned=true".to_string(),
-		"-v".to_string(),
-		format!("{}:/repo", root.display()),
+		// `--mount`, not `-v`: the drive colon in `C:/...:/x` is ambiguous
+		// to docker's `-v` parser on Windows, `--mount` names both sides.
+		"--mount".to_string(),
+		format!(
+			"type=bind,source={},target=/repo",
+			root.to_string_lossy().replace('\\', "/")
+		),
 		"-w".to_string(),
 		"/repo".to_string(),
-		"-v".to_string(),
-		format!("{daemon_dir}:{daemon_dir}"),
+		"--mount".to_string(),
+		format!("type=bind,source={daemon_dir},target={CONTAINER_DAEMON_DIR}"),
 		"-v".to_string(),
 		format!("{CONTAINER_CARGO}:/usr/local/cargo"),
 		"-e".to_string(),
 		"CARGO_HOME=/usr/local/cargo".to_string(),
 		"-e".to_string(),
-		format!("CARGO_TARGET_DIR={daemon_dir}/target-linux"),
+		format!("CARGO_TARGET_DIR={CONTAINER_DAEMON_DIR}/target-linux"),
 		IMAGE.to_string(),
 		"sh".to_string(),
 		"-c".to_string(),

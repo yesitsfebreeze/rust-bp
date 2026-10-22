@@ -20,6 +20,6 @@
 
 [money]
 # 1.6 economy: mp_startmoney 800, kills $300, cap $16000 (not a cvar in 1.6).
-start = 800
+start = 16000
 cap = 16000
 kill = 300

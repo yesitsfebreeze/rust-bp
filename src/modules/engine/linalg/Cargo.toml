@@ -7,10 +7,3 @@ description = "Vectors, quaternions, matrices and cameras shared by physics, mov
 
 [lib]
 path = "lib.rs"
-
-[features]
-# Conversions to macroquad's math types and its `Camera` trait, for drawing.
-macroquad = ["dep:macroquad"]
-
-[dependencies]
-macroquad = { version = "0.4.16", optional = true }

@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Bind `path`, refusing when another process still answers there, and
-/// removing the stale socket file a dead process left behind.
+/// removing the stale socket file a dead process left behind. The listener
+/// never blocks: Winsock's AF_UNIX accept has no reliable blocking mode, so
+/// [`serve_workers`] polls it instead.
 pub fn bind(path: &str) -> std::io::Result<UnixListener> {
 	if UnixStream::connect(path).is_ok() {
 		return Err(std::io::Error::new(
@@ -19,6 +21,7 @@ pub fn bind(path: &str) -> std::io::Result<UnixListener> {
 	}
 	let _ = std::fs::remove_file(path);
 	let listener = UnixListener::bind(path)?;
+	listener.set_nonblocking(true)?;
 	crate::platform::not_inherited(&listener);
 	Ok(listener)
 }
@@ -47,9 +50,7 @@ fn serve_workers(
 	handler: impl Fn(Value) -> Value + Send + Sync + 'static,
 	workers: usize,
 ) {
-	// One thread accepts and a fixed pool answers: several threads blocking
-	// in accept on clones of one socket is not supported everywhere (Winsock
-	// AF_UNIX), while a single acceptor behaves the same on every OS.
+	// One acceptor works on Winsock too; bounded queues limit idle clients.
 	let handler = Arc::new(handler);
 	let (send, receive) = std::sync::mpsc::sync_channel::<UnixStream>(workers * 4);
 	let receive = Arc::new(std::sync::Mutex::new(receive));
@@ -64,13 +65,24 @@ fn serve_workers(
 			}
 		});
 	}
-	std::thread::spawn(move || {
-		for conn in listener.incoming() {
-			let Ok(conn) = conn else { continue };
-			crate::platform::not_inherited(&conn);
-			if send.send(conn).is_err() {
-				break;
+	std::thread::spawn(move || loop {
+		match listener.accept() {
+			Ok((conn, _)) => {
+				crate::platform::not_inherited(&conn);
+				// Winsock inherits the listener mode; request reads must block.
+				if conn.set_nonblocking(false).is_err() {
+					continue;
+				}
+				// A saturated pool rejects the connection instead of blocking
+				// the acceptor.
+				if send.try_send(conn).is_err() {
+					break;
+				}
 			}
+			Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+				std::thread::sleep(Duration::from_millis(20));
+			}
+			Err(_) => break,
 		}
 	});
 }
@@ -98,7 +110,8 @@ pub fn ask(path: &str, request: Value) -> Result<Value, String> {
 
 /// `ask` with its own read timeout, for ops that wait on a build or an index.
 pub fn ask_within(path: &str, request: Value, timeout: Duration) -> Result<Value, String> {
-	let mut stream = UnixStream::connect(path).map_err(|_| format!("no socket answers at {path}"))?;
+	let mut stream =
+		UnixStream::connect(path).map_err(|e| format!("no socket answers at {path}: {e}"))?;
 	crate::platform::not_inherited(&stream);
 	stream.set_read_timeout(Some(timeout)).ok();
 	stream

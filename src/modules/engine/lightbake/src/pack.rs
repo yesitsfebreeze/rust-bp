@@ -22,6 +22,16 @@ impl Packer {
 		}
 	}
 
+	/// The packer's whole state, for a cache file; [`restore`](Self::restore)
+	/// puts it back, so a rebake of a loaded bake allocates like the original.
+	pub fn save(&self) -> [u32; 4] {
+		[self.size, self.x, self.y, self.row]
+	}
+
+	pub fn restore([size, x, y, row]: [u32; 4]) -> Packer {
+		Packer { size, x, y, row }
+	}
+
 	/// Atlas position of the next `w` × `h` rectangle, `None` when it does not
 	/// fit. The returned position is the rectangle's corner; the gutter sits
 	/// outside it, so packing never returns overlapping rectangles.
