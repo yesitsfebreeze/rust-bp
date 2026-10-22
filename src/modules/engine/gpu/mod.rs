@@ -1,6 +1,11 @@
 //! The game's window, input and renderer, on winit and wgpu. The map draws
-//! by tracing: one ray per pixel against its triangles, each hit shown as
-//! the voxel holding it at a size set by distance (see `trace.wgsl`). Over
+//! as its own surfaces, triangle by triangle (see `raster.wgsl`), or as
+//! whole voxels: voxelized ahead of the view into sparse shells around
+//! the eye and marched per pixel (see `shell.wgsl`), or traced per hit
+//! instead (see `trace.wgsl`). The world draws into the frame's own color
+//! and depth, which a full-screen pass then shades darker where the depth
+//! shows matter standing near (see `ao.wgsl`) and carries to the window.
+//! Over
 //! that go world-space lines and boxes, the textured viewmodel, and the
 //! flat HUD with its text.
 //!
@@ -8,15 +13,20 @@
 //! library does: it presents what [`Gfx`] recorded, pumps the window's
 //! events into [`Input`], and returns false once the window closes.
 
+mod ao;
+mod exposure;
 mod overlay;
+mod raster;
 mod scene;
 mod shell;
+#[cfg(test)]
+mod snapshot;
 mod text;
 mod timing;
 mod util;
 mod world;
 
-use linalg::Vec3;
+use linalg::{vec3, Vec3};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,8 +44,8 @@ pub use world::{WorldStats, MAX_DENTS};
 
 /// What the trace can show, in the order [`Gfx::cycle_view_mode`] steps
 /// through: the lit world, then debug views of the cubes it found — depth
-/// (white near, black far), facing normal, albedo, one color per cube, one
-/// color per cube size.
+/// (white near, black far), the BSP plane's normal, albedo, one color per
+/// cube, one color per cube size.
 pub const VIEW_MODES: [&str; 6] = ["lit", "depth", "normal", "albedo", "cubes", "cube size"];
 
 /// The sky the map is drawn against, and lit by in the bake.
@@ -360,6 +370,9 @@ pub struct Gfx {
 	/// Whether shaders must sRGB-encode: the swapchain does not.
 	encode: bool,
 	depth: wgpu::TextureView,
+	/// The frame's own color, drawn by the world pass and read back for its
+	/// ambient occlusion.
+	scene: wgpu::TextureView,
 	world: Option<world::World>,
 	overlay: overlay::Overlay,
 	timer: Option<timing::Timer>,
@@ -371,8 +384,40 @@ pub struct Gfx {
 	voxel: f32,
 	/// Which of [`VIEW_MODES`] the trace shows.
 	view_mode: usize,
+	/// Rays the trace averages per pixel: 1, 2 or 4.
+	rays: u32,
+	/// Whether the frame's edges are smoothed as it is carried to the
+	/// window (FXAA).
+	smooth: bool,
+	/// Whether the map draws as its own surfaces, the triangles it is made
+	/// of, rasterized at the screen's native resolution.
+	surfaces: bool,
 	/// Whether the map is marched through the shell field instead of traced.
 	shell: bool,
+	/// Whether the shell field's cubes draw their edges pink.
+	wire: bool,
+	/// Where the shell field's cube sizes change over distance.
+	lod: world::Lod,
+	/// How the baked ambient light and its occlusion land.
+	indirect: world::Indirect,
+	/// The air the surface view is fogged by.
+	fog: world::Fog,
+	/// The eye's adaptation, and whether it adapts.
+	meter: exposure::Meter,
+	auto_exposure: bool,
+	/// The range every frame's exposure stays in.
+	exposure_range: (f32, f32),
+	/// This frame's dynamic lights and moving shapes, recorded as the
+	/// overlays are and cleared after the frame.
+	lights: Vec<world::DynLight>,
+	occluders: Vec<(Vec3, Vec3, f32)>,
+	/// This frame's loose faces, packed as surface corners.
+	loose: Vec<u8>,
+	/// Whether surfaces reflect by their finish, whether dynamic lights
+	/// light, and whether moving shapes cast shadows.
+	pbr: bool,
+	dynamic_lights: bool,
+	dynamic_shadows: bool,
 }
 
 /// Ends the stage named `label`, when the frame is timed.
@@ -403,7 +448,34 @@ fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
 			sample_count: 1,
 			dimension: wgpu::TextureDimension::D2,
 			format: DEPTH,
-			usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+			// Also bound as a texture by the ambient occlusion pass.
+			usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+			view_formats: &[],
+		})
+		.create_view(&Default::default())
+}
+
+/// The frame's own color, the world pass draws into so its pixels can be
+/// read back and shaded before the window.
+fn scene_view(
+	device: &wgpu::Device,
+	format: wgpu::TextureFormat,
+	width: u32,
+	height: u32,
+) -> wgpu::TextureView {
+	device
+		.create_texture(&wgpu::TextureDescriptor {
+			label: Some("scene"),
+			size: wgpu::Extent3d {
+				width,
+				height,
+				depth_or_array_layers: 1,
+			},
+			mip_level_count: 1,
+			sample_count: 1,
+			dimension: wgpu::TextureDimension::D2,
+			format,
+			usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
 			view_formats: &[],
 		})
 		.create_view(&Default::default())
@@ -426,6 +498,12 @@ impl Gfx {
 			// Stage timings when the adapter can write timestamps between
 			// passes.
 			required_features: adapter.features() & timing::Timer::FEATURES,
+			// The shell's face buffers bind whole: half the shells' faces
+			// stand past the default a storage binding may be.
+			required_limits: wgpu::Limits {
+				max_storage_buffer_binding_size: adapter.limits().max_storage_buffer_binding_size,
+				..Default::default()
+			},
 			..Default::default()
 		}))
 		.map_err(|e| format!("no GPU device: {e}"))?;
@@ -450,6 +528,7 @@ impl Gfx {
 		};
 		surface.configure(&device, &config);
 		let depth = depth_view(&device, config.width, config.height);
+		let scene = scene_view(&device, format, config.width, config.height);
 		let overlay = overlay::Overlay::new(&device, &queue, format, DEPTH)?;
 		let timer = timing::Timer::new(&device, &queue);
 		Ok(Gfx {
@@ -457,6 +536,7 @@ impl Gfx {
 			surface,
 			encode: !format.is_srgb(),
 			depth,
+			scene,
 			world: None,
 			overlay,
 			timer,
@@ -465,7 +545,35 @@ impl Gfx {
 			exposure: 1.0,
 			voxel: 2.0,
 			view_mode: 0,
-			shell: false,
+			rays: 1,
+			smooth: true,
+			surfaces: true,
+			shell: true,
+			wire: false,
+			lod: world::Lod {
+				near: 0.0,
+				curve: 1.0,
+			},
+			indirect: world::Indirect {
+				gi: 1.0,
+				ao: 1.0,
+				radius: 24.0,
+				traced: true,
+			},
+			fog: world::Fog {
+				density: 0.0,
+				height: 512.0,
+				color: vec3(1.0, 1.0, 1.0),
+			},
+			meter: exposure::Meter::new(&device, !format.is_srgb()),
+			auto_exposure: true,
+			exposure_range: (0.25, 4.0),
+			lights: Vec::new(),
+			occluders: Vec::new(),
+			loose: Vec::new(),
+			pbr: true,
+			dynamic_lights: true,
+			dynamic_shadows: true,
 			device,
 			queue,
 			config,
@@ -480,6 +588,7 @@ impl Gfx {
 		self.config.height = height;
 		self.surface.configure(&self.device, &self.config);
 		self.depth = depth_view(&self.device, width, height);
+		self.scene = scene_view(&self.device, self.config.format, width, height);
 	}
 
 	/// GPU milliseconds per stage of recent frames, when the adapter can
@@ -493,8 +602,15 @@ impl Gfx {
 		(self.config.width as f32, self.config.height as f32)
 	}
 
-	/// Traces `map` from now on, lit by the sun and sky `light` describes.
-	pub fn load_world(&mut self, map: &crate::bsp::Map, light: &lightbake::Config) -> WorldStats {
+	/// Draws `map` from now on, lit by the bake `baked` holds: its own
+	/// direct sun, sky and bounces, sampled as lightmaps by the surface
+	/// pass, and by the trace's sun and sky `light` describes.
+	pub fn load_world(
+		&mut self,
+		map: &crate::bsp::Map,
+		light: &lightbake::Config,
+		baked: &lightbake::Baked,
+	) -> WorldStats {
 		let world = world::World::new(
 			&self.device,
 			&self.queue,
@@ -502,6 +618,7 @@ impl Gfx {
 			DEPTH,
 			map,
 			world::Sources::of(light),
+			baked,
 		);
 		let stats = world.stats();
 		self.world = Some(world);
@@ -527,10 +644,160 @@ impl Gfx {
 		self.voxel = pixels.max(0.05);
 	}
 
+	/// Whether the map draws as its own surfaces, the triangles it is made
+	/// of, rasterized and culled at the screen's native resolution, instead
+	/// of voxelized into cubes; the shell and the trace take over without
+	/// it.
+	pub fn set_surfaces(&mut self, surfaces: bool) {
+		self.surfaces = surfaces;
+	}
+
 	/// Whether the map is marched through the shell field, voxelized ahead
 	/// of the view, instead of traced per hit.
 	pub fn set_shell(&mut self, shell: bool) {
 		self.shell = shell;
+	}
+
+	/// Whether the shell field's cubes draw their edges pink over their
+	/// faces.
+	pub fn set_wire(&mut self, wire: bool) {
+		self.wire = wire;
+	}
+
+	/// Where the shell field's cubes grow: the smallest out to `near` world
+	/// units, 0 for where they grow past the voxel setting's pixels, then
+	/// `curve` sizes up per doubling of distance.
+	pub fn set_lod(&mut self, near: f32, curve: f32) {
+		self.lod = world::Lod {
+			near: near.max(0.0),
+			curve: curve.clamp(0.25, 4.0),
+		};
+	}
+
+	/// How the baked light's ambient part — sky, bounces and lamps, all but
+	/// the straight sun — lands: scaled by `gi`, 1 as baked, and darkened by
+	/// the frame's ambient occlusion at strength `ao`, 0 off to 1 full,
+	/// looking `radius` world units around each pixel.
+	pub fn set_indirect(&mut self, gi: f32, ao: f32, radius: f32) {
+		self.indirect = world::Indirect {
+			gi: gi.clamp(0.0, 4.0),
+			ao: ao.clamp(0.0, 1.0),
+			radius: radius.clamp(1.0, 256.0),
+			traced: self.indirect.traced,
+		};
+	}
+
+	/// Whether the sun's shadow is traced per pixel, sharp as the screen,
+	/// or read from the bake, as coarse as its texels and cheaper.
+	pub fn set_traced_shadows(&mut self, traced: bool) {
+		self.indirect.traced = traced;
+	}
+
+	/// Fog over the surface view, `density` squared per thousand world
+	/// units at height 0 — squared so the low end, where fog is subtle,
+	/// gets most of a slider — 0 clear, thinning by e every `height` units
+	/// up, its glow tinted by `color`. The voxel views stay clear.
+	pub fn set_fog(&mut self, density: f32, height: f32, color: Vec3) {
+		let density = density.clamp(0.0, 10.0);
+		self.fog = world::Fog {
+			density: density * density / 1000.0,
+			height: height.clamp(1.0, 1e5),
+			color: vec3(
+				color.x.clamp(0.0, 4.0),
+				color.y.clamp(0.0, 4.0),
+				color.z.clamp(0.0, 4.0),
+			),
+		};
+	}
+
+	/// Whether the exposure adapts to the scene, as an eye does: opening
+	/// up indoors, closing down in the sun. The brightness setting scales
+	/// it either way.
+	pub fn set_auto_exposure(&mut self, adapt: bool) {
+		self.auto_exposure = adapt;
+	}
+
+	/// The range every frame's exposure stays in: the brightness setting
+	/// is held to it, and auto exposure adapts within it — `min` the
+	/// darkest it closes down to in the sun, `max` the brightest it opens
+	/// up to in the dark.
+	pub fn set_exposure_range(&mut self, min: f32, max: f32) {
+		let min = min.max(0.01);
+		self.exposure_range = (min, max.max(min));
+	}
+
+	/// A light for this frame only, at `pos`, of linear radiance `color` a
+	/// quarter of its `reach` away and nothing past the reach: a muzzle
+	/// flash, a lamp the editor placed. Shadowed by the map and by moving
+	/// shapes. Past [`world::MAX_LIGHTS`] in a frame the rest are dropped.
+	pub fn light(&mut self, pos: Vec3, color: Vec3, reach: f32) {
+		self.lights.push(world::DynLight { pos, color, reach });
+	}
+
+	/// A moving shape for this frame only, casting shadows in the sun and
+	/// every dynamic light: the segment `a` to `b` swept by a ball of
+	/// `radius`, a sphere when the two meet. Past [`world::MAX_OCCLUDERS`]
+	/// in a frame the rest are dropped.
+	pub fn occluder(&mut self, a: Vec3, b: Vec3, radius: f32) {
+		self.occluders.push((a, b, radius));
+	}
+
+	/// Faces for this frame only, drawn and lit as the map's own — props,
+	/// things that move — with `ambient`, the light around them, standing
+	/// in for a baked chart. They cast no shadow of their own; give them an
+	/// [`Gfx::occluder`] for that.
+	pub fn faces(&mut self, faces: &[crate::bsp::Face], ambient: Vec3) {
+		scene::loose_corners(faces, ambient, &mut self.loose);
+	}
+
+	/// Whether surfaces reflect physically by their finish — specular
+	/// highlights, metal, relief — or plain diffuse, as the bake lights
+	/// them.
+	pub fn set_pbr(&mut self, pbr: bool) {
+		self.pbr = pbr;
+	}
+
+	/// Whether the frame's dynamic lights light anything.
+	pub fn set_dynamic_lights(&mut self, on: bool) {
+		self.dynamic_lights = on;
+	}
+
+	/// Whether moving shapes cast shadows.
+	pub fn set_dynamic_shadows(&mut self, on: bool) {
+		self.dynamic_shadows = on;
+	}
+
+	/// Whether frames wait for the display's refresh.
+	pub fn set_vsync(&mut self, vsync: bool) {
+		let mode = if vsync {
+			wgpu::PresentMode::AutoVsync
+		} else {
+			wgpu::PresentMode::AutoNoVsync
+		};
+		if self.config.present_mode != mode {
+			self.config.present_mode = mode;
+			self.surface.configure(&self.device, &self.config);
+		}
+	}
+
+	/// Rays the trace averages per pixel, so cubes and edges finer than a
+	/// pixel blend instead of alias: 1, 2 or 4, each costing about as much
+	/// trace time again.
+	pub fn set_rays(&mut self, rays: f32) {
+		self.rays = if rays >= 4.0 {
+			4
+		} else if rays >= 2.0 {
+			2
+		} else {
+			1
+		};
+	}
+
+	/// Whether the frame's edges are smoothed after it is drawn (FXAA):
+	/// stairs of whole pixels blend into the slopes they stand for, at
+	/// the cost of one full-screen pass's reads, whatever draws the map.
+	pub fn set_smooth(&mut self, smooth: bool) {
+		self.smooth = smooth;
 	}
 
 	/// Steps to the next of [`VIEW_MODES`], after the last back to the lit
@@ -598,6 +865,19 @@ impl Gfx {
 		self.overlay.rect(x, y, width, height, color);
 	}
 
+	/// A rectangle shaded between its corners' colors: top left, top right,
+	/// bottom right, bottom left.
+	pub fn gradient(&mut self, x: f32, y: f32, width: f32, height: f32, colors: [Color; 4]) {
+		self.overlay.gradient(x, y, width, height, colors);
+	}
+
+	/// Cuts the flat drawing that follows — rects, lines, text — to `rect`,
+	/// x, y, width, height in pixels; none lets it draw anywhere again. The
+	/// frame starts unclipped.
+	pub fn set_clip(&mut self, rect: Option<[f32; 4]>) {
+		self.overlay.set_clip(rect);
+	}
+
 	/// A line `thickness` pixels wide.
 	pub fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Color) {
 		self.overlay.line(x1, y1, x2, y2, thickness, color);
@@ -619,31 +899,67 @@ impl Gfx {
 			Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
 				self.surface.configure(&self.device, &self.config);
 				self.overlay.clear();
+				self.lights.clear();
+				self.occluders.clear();
+				self.loose.clear();
 				return;
 			}
 			Err(_) => {
 				self.overlay.clear();
+				self.lights.clear();
+				self.occluders.clear();
+				self.loose.clear();
 				return;
 			}
 		};
 		let target = frame.texture.create_view(&Default::default());
 		let size = self.size();
+		// With a world drawn the frame lands in its own color first, to be
+		// shaded by its own depth; without one the sky clears straight to
+		// the window.
+		let occlude = self.world.is_some() && self.view.is_some();
 		let mut encoder = self.device.create_command_encoder(&Default::default());
 		if let Some(timer) = &mut self.timer {
 			timer.begin(&mut encoder);
 		}
-		if self.shell {
+		if self.shell && !self.surfaces {
 			if let (Some(world), Some(view)) = (&mut self.world, &self.view) {
-				world.prepare(&self.queue, &mut encoder, view, size, self.voxel);
+				world.prepare(&self.queue, &mut encoder, view, size, self.voxel, self.lod);
 			}
 			mark(&mut self.timer, &mut encoder, "shell");
 		}
 		let sky = self.sky;
+		// The brightness setting, scaled by the eye's adaptation when it
+		// adapts.
+		let (lo, hi) = self.exposure_range;
+		let base = self.exposure.clamp(lo, hi);
+		self.meter.set_range(lo / base, hi / base);
+		let exposure = base
+			* if self.auto_exposure {
+				self.meter.scale()
+			} else {
+				1.0
+			};
+		if let Some(world) = &mut self.world {
+			world.set_loose(&self.device, &self.queue, &self.loose);
+			let lights: &[world::DynLight] = if self.dynamic_lights {
+				&self.lights
+			} else {
+				&[]
+			};
+			world.set_dynamic(
+				&self.queue,
+				lights,
+				&self.occluders,
+				self.pbr,
+				self.dynamic_shadows,
+			);
+		}
 		{
 			let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
 				label: Some("world"),
 				color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-					view: &target,
+					view: if occlude { &self.scene } else { &target },
 					depth_slice: None,
 					resolve_target: None,
 					ops: wgpu::Operations {
@@ -674,15 +990,42 @@ impl Gfx {
 					view,
 					size,
 					sky,
-					self.exposure,
+					exposure,
 					self.encode,
 					self.voxel,
 					self.view_mode as u32,
+					self.surfaces,
 					self.shell,
+					self.rays,
+					self.wire,
+					self.indirect,
+					if self.surfaces {
+						self.fog
+					} else {
+						world::Fog {
+							density: 0.0,
+							..self.fog
+						}
+					},
+					self.smooth,
 				);
 			}
 		}
 		mark(&mut self.timer, &mut encoder, "trace");
+		if occlude && self.auto_exposure {
+			self.meter.measure(&self.device, &mut encoder, &self.scene);
+		}
+		if let (Some(world), Some(_)) = (&mut self.world, &self.view) {
+			world.occlude(
+				&self.device,
+				&mut encoder,
+				&target,
+				&self.scene,
+				&self.depth,
+				(self.config.width, self.config.height),
+			);
+			mark(&mut self.timer, &mut encoder, "occlusion");
+		}
 		self.overlay.draw(
 			&self.device,
 			&self.queue,
@@ -697,12 +1040,18 @@ impl Gfx {
 			timer.end(&mut encoder);
 		}
 		self.queue.submit([encoder.finish()]);
+		self
+			.meter
+			.collect(&self.device, self.auto_exposure && occlude);
 		if let Some(timer) = &mut self.timer {
 			timer.collect(&self.device);
 		}
 		self.window.pre_present_notify();
 		frame.present();
 		self.overlay.clear();
+		self.lights.clear();
+		self.occluders.clear();
+		self.loose.clear();
 		self.view = None;
 	}
 }

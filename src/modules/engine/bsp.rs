@@ -18,7 +18,7 @@
 //!   them: breakable crates are solid, doors frozen shut. `func_illusionary`
 //!   and trigger volumes render but never collide.
 
-use crate::surface::Surface;
+use crate::surface::{Finish, Surface};
 use linalg::{vec3, Vec3};
 use physics::Mesh;
 
@@ -79,6 +79,9 @@ pub struct MapRender {
 	/// The map's lightmaps packed in one RGBA atlas, one rectangle per face.
 	pub lightmap: Atlas,
 	pub faces: Vec<Face>,
+	/// Every texture the faces use, by name, and its rectangle in
+	/// `albedo`, sorted by name: what new geometry can be dressed in.
+	pub textures: Vec<(String, Rect)>,
 }
 
 /// One RGBA atlas. Row major, row 0 at v = 0.
@@ -104,8 +107,28 @@ pub struct Face {
 	pub lightmap: Rect,
 	/// Whether the face's fan triangles went into the physics mesh.
 	pub solid: bool,
+	/// How the face reflects light, from its texture's name.
+	pub finish: Finish,
 	/// Wound so the cross product of any fan triangle points out of the wall.
 	pub verts: Vec<Vert>,
+}
+
+impl Face {
+	/// The face's outward unit normal, from its fan winding: the first fan
+	/// triangle with any area — a long thin face's first three corners may
+	/// sit on one line, so the fan is scanned for a real triangle.
+	pub fn normal(&self) -> Vec3 {
+		let p = &self.verts;
+		for k in 1..p.len().saturating_sub(1) {
+			let n = (p[k].pos - p[0].pos).cross(p[k + 1].pos - p[0].pos);
+			if n.length2() > 1e-12 {
+				return n.normalize();
+			}
+		}
+		// Every fan triangle flat: the face has no area, so no lighting
+		// depends on the answer.
+		Vec3::Y
+	}
 }
 
 /// One vertex of a [`Face`].
@@ -113,7 +136,8 @@ pub struct Vert {
 	pub pos: Vec3,
 	/// Texture coordinates in whole-texture units; the shader tiles them.
 	pub uv: (f32, f32),
-	/// Lightmap coordinates in texels, clamped into the face's block.
+	/// Lightmap coordinates in texels of the face's block, unclamped at the
+	/// corners; samplers clamp on read.
 	pub lm: (f32, f32),
 }
 
@@ -169,6 +193,7 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 	let mut world = Mesh::default();
 	let mut surfaces = Vec::new();
 	let mut faces = Vec::new();
+	let mut textures = std::collections::BTreeMap::new();
 	let mut blocks: Vec<Block> = Vec::new();
 	let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
 	for i in 0..bsp.face_count() {
@@ -212,8 +237,14 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 		// plane normal, flipped to its side. The file's edge order is
 		// arbitrary, and the light bake reads the winding as the surface's
 		// normal — flipped faces bake lit walls black and shaded walls lit.
+		// The whole polygon's area vector, summed over its fan: its first
+		// three corners alone often stand on one line — a T-junction's
+		// extra vertex — and their cross product's sign is then noise.
 		let normal = to_our(bsp.plane_normal(f.plane, f.side)?);
-		let cross = (verts[1].pos - verts[0].pos).cross(verts[2].pos - verts[0].pos);
+		let p0 = verts[0].pos;
+		let cross = verts.windows(2).skip(1).fold(Vec3::ZERO, |sum, w| {
+			sum + (w[0].pos - p0).cross(w[1].pos - p0)
+		});
 		if cross.dot(normal) < 0.0 {
 			verts.reverse();
 		}
@@ -257,9 +288,12 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 		}
 		for v in &mut verts {
 			let (s, t) = (v.uv.0 * tw as f32, v.uv.1 * th as f32);
+			// Unclamped: the corners of a face's extent sit outside its
+			// block's sample centers, and clamping them would hide the
+			// affine map its light grid runs on. Samplers clamp on read.
 			v.lm = (
-				((s - (s0 * LM_STEP + LM_STEP / 2.0)) / LM_STEP).clamp(0.0, w as f32 - 1.0),
-				((t - (t0 * LM_STEP + LM_STEP / 2.0)) / LM_STEP).clamp(0.0, h as f32 - 1.0),
+				(s - (s0 * LM_STEP + LM_STEP / 2.0)) / LM_STEP,
+				(t - (t0 * LM_STEP + LM_STEP / 2.0)) / LM_STEP,
 			);
 		}
 		// Physics: fan triangles wound outward already, above.
@@ -271,7 +305,11 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 			}
 		}
 		faces.push(Face {
-			texture: albedo.rect(tex.miptex)?,
+			texture: {
+				let rect = albedo.rect(tex.miptex)?;
+				textures.insert(tex_name.to_string(), rect);
+				rect
+			},
 			lightmap: Rect {
 				x: 0,
 				y: 0,
@@ -279,6 +317,7 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 				h: 0,
 			},
 			solid: solids.get(&model).copied().unwrap_or(true),
+			finish: Finish::of(tex_name),
 			verts,
 		});
 		blocks.push((faces.len() - 1, w, h, block));
@@ -298,6 +337,7 @@ fn parse(data: &[u8], name: &str, map: Option<&std::path::Path>) -> Result<Map, 
 			albedo: albedo.atlas,
 			lightmap,
 			faces,
+			textures: textures.into_iter().collect(),
 		},
 		spawn,
 		spawn_yaw,
@@ -1163,8 +1203,9 @@ mod tests {
 		};
 		assert_eq!(at(0, 0), &[10, 20, 30, 255]);
 		assert_eq!(at(1, 1), &[100, 110, 120, 255]);
-		// The quad's corners sit halfway between the block's sample centers.
-		assert_eq!(f.verts[0].lm, (0.0, 0.0));
+		// The quad's corners sit halfway between the block's sample centers:
+		// the first outside them, the third between the inner two.
+		assert_eq!(f.verts[0].lm, (-0.5, -0.5));
 		assert_eq!(f.verts[2].lm, (0.5, 0.5));
 	}
 

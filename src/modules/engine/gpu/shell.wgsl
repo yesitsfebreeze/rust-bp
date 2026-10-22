@@ -3,28 +3,33 @@
 // the trace (trace.wgsl). Prepended with bvh.wgsl, material.wgsl and
 // voxel.wgsl.
 //
-// The trace tests each ray against the triangle it hit, so a cube another
-// triangle fills can be missed: see-through corners, cubes that look
-// inside out. Here every cell is voxelized ahead of time against every
-// triangle that reaches it, and the ray marches the cells themselves.
+// No ray ever tests the mesh to draw: the voxelizer intersects every
+// triangle with the grid of cells around the eye and fills the cells it
+// crosses, ahead of time, ahead of the frame. Drawing is then a march
+// through those cells from the eye along the view direction: one hash
+// lookup a cell, empty blocks skipped whole.
 //
-// A cube `s` wide is only drawn between about R and 2R from the eye, with
-// R = s / (pixel angle · K): nearer, it splits into eight; farther, its
-// parent is drawn whole. So each size keeps only that shell, padded by how
-// far the eye may move before the shell is brought along, and in it only
-// the cells a surface fills: a hash of bricks, 4³ cells as 64 bits. Over
-// it a dense pyramid of bits marks which blocks of 16³, 64³ and 256³
-// cells hold any, so a ray crosses empty space the largest empty block at
-// a time with one load per test, and stops where it leaves the map's
-// bounds. As the eye moves a shell takes in only the cells
-// that entered it; every few moves, or when the dents change, it is built
-// again whole and drops the cells it left behind.
+// A cube `s` wide is drawn only between about R_l and R_{l+1} from the eye,
+// R_l the LOD curve's radius for its size (`lod_r`), with an overlap either
+// side where neighbouring sizes blend. Each size keeps only that shell,
+// padded by how far the eye may move before the shell is brought along, and
+// in it only the cells a surface fills: a hash of bricks, 4^3 cells as 64
+// bits. Over it a dense pyramid of bits marks which blocks of 16, 64 and
+// 256 cells hold any, so a ray crosses empty space the largest empty block
+// at a time with one load per test, and stops where it leaves the map's
+// bounds. As the eye moves a shell takes in only the cells that entered it;
+// every few moves, or when the dents change, it is built again whole and
+// drops the cells it left behind.
 //
-// A cell is filled by the rule the trace walks by: a triangle overlaps
-// the cube, its texel at the cube's center is opaque, and no dent carved
-// the cube away. Cells lining a dent's bowl behind the surface fill too. A cube's
-// color lives in the voxel field (voxel.wgsl), keyed as the trace keys it.
-
+// A cell is filled by the rule the trace walked by: a triangle overlaps the
+// cube, its texel at the cube's center is opaque, and no dent carved the
+// cube away. Cells lining a dent's bowl behind the surface fill too. A
+// cube is drawn one solid color: the light on the BSP plane that fills it
+// — the plane's own normal, never one turned toward the eye, no thickness
+// the mesh has not — stored per voxel, whichever ray reaches it. The
+// playground's spheres march as cells of the size their center wants, lit
+// per pixel. The map's triangles draw as a pink wireframe over the march
+// (`r_wire`).
 // Shells, one per cube size from the smallest voxel up, as `SHELLS` in
 // shell.rs.
 const SHELLS: u32 = 12u;
@@ -46,14 +51,21 @@ const NO_ENTRY: u32 = 0xFFFFFFFFu;
 // one triangle's cells, as `ROW` and `SLICES` in shell.rs.
 const ROW: u32 = 65535u;
 const SLICES: u32 = 16u;
-// Cells and bricks a ray visits at most.
-const MARCH: u32 = 1024u;
+// Cells and bricks a ray visits at most: a ray grazing along matter
+// crosses every cell of every band it runs in, about 1.75 near / s of
+// them per size, so the budget must cover the longest wall at the
+// largest `near` the fov may draw.
+const MARCH: u32 = 8192u;
+// The spheres and the dents their strikes leave, as the world's buffers
+// hold them: uniform arrays hold a fixed count.
+const BODIES: u32 = 64u;
+const DENTS: u32 = 256u;
 // The spheres' matter, as linear albedo, as the trace draws it.
 const BALL: vec3f = vec3f(0.56, 0.38, 0.19);
-// How far a cube's box is nudged down, in sides, as `OWN` in trace.wgsl:
-// it owns its low faces but not its high, so a map face on a cell
-// boundary lands in exactly one cell.
-const SHELL_OWN: f32 = 0.02;
+// How much a cube's box grows for the overlap test, in cube sides, as
+// `GROW` in trace.wgsl: past f32's rounding at the map's far corners for
+// the smallest cubes, small enough to change no shape.
+const SHELL_GROW: f32 = 0.02;
 
 // One brick's cells, 64 bits.
 struct Entry {
@@ -69,6 +81,11 @@ struct Shells {
 	// xyz the brick a shell's keys count from, a multiple of 64, so its
 	// blocks count from a whole one; w 1 once built.
 	origin: array<vec4i, SHELLS>,
+	// Where the sizes change over distance: x the R of the smallest cubes,
+	// world units; y sizes up per doubling of distance; z half the overlap
+	// of neighbouring sizes, a share of the R they switch at; w the most
+	// pixels a cube spans where it is drawn nearest.
+	lod: vec4f,
 }
 
 // What one shell's dispatches take in.
@@ -85,14 +102,22 @@ struct Work {
 }
 
 // The playground's spheres and the dents they left: xyz a center, w its
-// radius, 0 for none.
-@group(0) @binding(12) var<storage, read> bodies: array<vec4f>;
-@group(0) @binding(14) var<storage, read> dents: array<vec4f>;
+// radius, 0 for none. Uniforms, a fixed count each.
+@group(0) @binding(12) var<uniform> bodies: array<vec4f, BODIES>;
+@group(0) @binding(14) var<uniform> dents: array<vec4f, DENTS>;
 @group(0) @binding(15) var<storage, read_write> table: array<Entry>;
 @group(0) @binding(16) var<uniform> shells: Shells;
 @group(0) @binding(17) var<uniform> work: Work;
 // Per shell, the pyramid of blocks holding any filled cell.
 @group(0) @binding(18) var<storage, read_write> pyramid: array<atomic<u32>>;
+// Per pixel, how far its ray goes before it meets a triangle; then the
+// least of that over the pixels around it, where its march starts. And the
+// rows' least, between the two passes that take it.
+@group(0) @binding(19) var<storage, read_write> reach: array<f32>;
+@group(0) @binding(20) var<storage, read_write> reach_rows: array<f32>;
+// Pixels `reach` holds, as `REACH_PIXELS` in shell.rs: a larger screen's
+// rays past it march from the eye.
+const REACH_PIXELS: u32 = 8294400u;
 
 // The key of brick `b` of shell `l`: 0 when the shell's keys do not reach
 // it.
@@ -227,19 +252,25 @@ fn takes_in(center: vec3f) -> bool {
 	return true;
 }
 
-// Whether triangle `t` fills the cell of side `s` centered at `center`.
-// The overlap test costs the most: tested last.
+// Whether triangle `t` fills the cell of side `s` centered at `center`:
+// the cell reaches the triangle and its center lies behind the face, in
+// the matter — as the trace's `filler` counts matter, so no cube hangs
+// out of the mesh past a surface, doubling it up at every edge. The
+// overlap test costs the most: tested last.
 fn fills_cell(t: Tri, center: vec3f, s: f32) -> bool {
-	return albedo(t, center).a >= 0.5 && overlaps_box(t, center - vec3f(SHELL_OWN * s), 0.5 * s);
+	return albedo(t, center).a >= 0.5 && dot(tri_normal(t), center - t.a.xyz) < 0.0 && overlaps_box(t, center, 0.5 * s);
 }
 
-// The first triangle, in the hierarchy's order, that fills the cube of
-// side `s` at `center`, as the trace's `filler` picks it, so both passes
-// color a cube off the same triangle; NO_HIT when none does.
+// The triangle a filled cube of side `s` at `center` shows as, as the
+// trace's `filler` picks it, so both passes color a cube off the same
+// plane: the face it hangs in front of, else the first behind it, in the
+// hierarchy's order; NO_HIT when none does.
 fn shell_filler(center: vec3f, s: f32) -> u32 {
-	let at = center - vec3f(SHELL_OWN * s);
-	let lo = at - 0.5 * s;
-	let hi = at + 0.5 * s;
+	let half = (0.5 + SHELL_GROW) * s;
+	let lo = center - half;
+	let hi = center + half;
+	var behind = NO_HIT;
+	var front = NO_HIT;
 	var stack: array<u32, STACK>;
 	stack[0] = 0u;
 	var top = 1u;
@@ -255,8 +286,24 @@ fn shell_filler(center: vec3f, s: f32) -> u32 {
 		}
 		if (node.count > 0u) {
 			for (var i = node.first; i < node.first + node.count; i += 1u) {
-				if (fills_cell(tris[i], center, s)) {
-					return i;
+				let tri = tris[i];
+				if (!overlaps_box(tri, center, half) || albedo(tri, center).a < 0.5) {
+					continue;
+				}
+				let off = dot(tri_normal(tri), center - tri.a.xyz);
+				if (off < 0.0) {
+					// Behind the face, inside the matter: the first in
+					// the hierarchy's order fills the cube.
+					if (behind == NO_HIT) {
+						behind = i;
+					}
+				} else if (front == NO_HIT) {
+					// In front of the face, its projection falls on the
+					// face itself: its distance to the triangle is its
+					// distance to the plane, not past an edge.
+					if (length(closest_point(center, tri) - center) - off <= 1e-3 * s) {
+						front = i;
+					}
 				}
 			}
 		} else if (top + 2u <= STACK) {
@@ -265,12 +312,20 @@ fn shell_filler(center: vec3f, s: f32) -> u32 {
 			top += 2u;
 		}
 	}
-	return NO_HIT;
+	// A cube inside matter — some face behind it — colors off the plane
+	// behind it: the face in front of a cube in the wall at a floor joint
+	// would paint the floor up it, a doubled plane at every joint. Only a
+	// cube hanging in front of a face, none behind it, shows as that face;
+	// the trace leaves those out.
+	if (behind != NO_HIT) {
+		return behind;
+	}
+	return select(NO_HIT, front, front != NO_HIT);
 }
 
 // Whether a dent carved the point `p` away.
 fn dented(p: vec3f) -> bool {
-	for (var i = 0u; i < arrayLength(&dents); i += 1u) {
+	for (var i = 0u; i < DENTS; i += 1u) {
 		let dent = dents[i];
 		if (dent.w <= 0.0) {
 			break;
@@ -284,7 +339,7 @@ fn dented(p: vec3f) -> bool {
 
 // The dent whose shell the cell of side `s` at `center` lies on, or -1.
 fn dent_shell(center: vec3f, s: f32) -> i32 {
-	for (var i = 0u; i < arrayLength(&dents); i += 1u) {
+	for (var i = 0u; i < DENTS; i += 1u) {
 		let dent = dents[i];
 		if (dent.w <= 0.0) {
 			break;
@@ -294,6 +349,16 @@ fn dent_shell(center: vec3f, s: f32) -> i32 {
 		}
 	}
 	return -1;
+}
+
+// A bowl's cube facing: into the void the dent carved, toward its center;
+// straight up when no dent lines the cube.
+fn bowl_normal(center: vec3f, s: f32) -> vec3f {
+	let dent = dent_shell(center, s);
+	if (dent < 0) {
+		return vec3f(0.0, 1.0, 0.0);
+	}
+	return normalize(dents[dent].xyz - center);
 }
 
 // The triangle nearest `p` among those within `reach` of it, or NO_HIT.
@@ -389,9 +454,9 @@ fn shell_fill(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_ind
 	let v = (a + 2u) % 3u;
 	let span_u = u32(hi[u] - lo[u]) + 1u;
 	let columns = span_u * (u32(hi[v] - lo[v]) + 1u);
-	// Along the facing axis a cube, nudged as it owns its box, overlaps the
-	// plane only while its center lies within this of it.
-	let band = (0.5 + SHELL_OWN) * s * (an.x + an.y + an.z) / an[a];
+	// Along the facing axis a cube overlaps the plane only while its center
+	// lies within this of it.
+	let band = 0.5 * s * (an.x + an.y + an.z) / an[a];
 	let plane = dot(n, t.a.xyz);
 	for (var j = group.y * 64u + k; j < columns; j += 64u * SLICES) {
 		var c = vec3f(0.0);
@@ -417,7 +482,7 @@ fn shell_fill(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_ind
 // each column only where it crosses the sphere's skin.
 @compute @workgroup_size(64)
 fn shell_bowl(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) k: u32) {
-	if (group.x >= arrayLength(&dents)) {
+	if (group.x >= DENTS) {
 		return;
 	}
 	let dent = dents[group.x];
@@ -463,21 +528,73 @@ fn shell_bowl(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_ind
 	}
 }
 
-// The shell whose cubes are drawn around `p`: each cell takes the size its
-// center wants unless its parent's already wants it whole, decided from a
-// few sizes up as the trace's `cube_side` does, so both passes agree.
+// Where size `l` begins, world units from the eye: the curve over
+// distance the sizes follow.
+fn lod_r(l: u32) -> f32 {
+	return shells.lod.x * exp2(f32(l) / shells.lod.y);
+}
+
+fn side(l: u32) -> f32 {
+	return view.sky.w * exp2(f32(l));
+}
+
+// Where in the overlap the cell `c` of side `s` cuts over to its own size,
+// as a share of its R: within the overlap either side of 1, hashed per
+// cell.
+fn cut(c: vec3f, s: f32) -> f32 {
+	let i = vec3i(c);
+	let h = mix_hash(mix_hash(mix_hash(mix_hash(0x7F4A7C15u, u32(i.x)), u32(i.y)), u32(i.z)), bitcast<u32>(s));
+	return 1.0 + shells.lod.z * (2.0 * f32(h & 0xFFFFu) / 65536.0 - 1.0);
+}
+
+// The shell whose cubes are drawn around `p`: from a few sizes up, each
+// cell is drawn whole once its center lies past its cut, else splits; so
+// every point falls in exactly one drawn cube, and neighbouring rays agree.
 fn shell_level(p: vec3f) -> u32 {
-	let base = view.sky.w;
-	var l = wanted_level(length(p - view.eye.xyz)) + 3u;
+	var l = min(level_hi(length(p - view.eye.xyz)) + 1u, SHELLS - 1u);
 	loop {
-		let s = base * exp2(f32(l));
-		let center = (floor(p / s) + 0.5) * s;
-		if (l == 0u || wanted_level(length(center - view.eye.xyz)) >= l) {
+		let s = side(l);
+		let cell = floor(p / s);
+		let center = (cell + 0.5) * s;
+		if (l == 0u || length(center - view.eye.xyz) >= lod_r(l) * cut(cell, s)) {
 			return l;
 		}
 		l -= 1u;
 	}
 	return 0u;
+}
+
+// The coarsest size any cube `dist` from the eye may be drawn at: its cut
+// may lie as near as the overlap's start, a cell's corner either way.
+fn level_hi(dist: f32) -> u32 {
+	let a = shells.lod.z;
+	let guess = floor(shells.lod.y * log2(max(dist / (shells.lod.x * (1.0 - a)), 1e-30))) + 1.0;
+	var l = u32(clamp(guess, 0.0, f32(SHELLS - 1u)));
+	loop {
+		if (l == 0u || lod_r(l) * (1.0 - a) - 2.0 * side(l) <= dist) {
+			return l;
+		}
+		l -= 1u;
+	}
+	return 0u;
+}
+
+// Where shell `l`'s cubes are drawn, from the eye that frame: from its
+// cut, at the nearest the overlap's start before its R, to its parent's at
+// the farthest, give or take a cell's corner — as `near` and `far` in
+// shell.rs, without the pad the shell fills past them by.
+fn band_lo(l: u32, s: f32) -> f32 {
+	if (l == 0u) {
+		return 0.0;
+	}
+	return lod_r(l) * (1.0 - shells.lod.z) - 2.87 * s;
+}
+
+fn band_hi(l: u32, s: f32) -> f32 {
+	if (l >= SHELLS - 1u) {
+		return 1e30;
+	}
+	return lod_r(l + 1u) * (1.0 + shells.lod.z) + 4.87 * s;
 }
 
 // Where along the ray from `o` it leaves the box `lo`..`lo + side`, `inv`
@@ -495,93 +612,120 @@ struct Found {
 	found: bool,
 }
 
-fn march(o: vec3f, d: vec3f) -> Found {
+fn march(o: vec3f, d: vec3f, start: f32) -> Found {
 	let inv = select(vec3f(1e30), vec3f(1.0) / d, abs(d) >= vec3f(1e-12));
-	// R of the smallest cubes: a shell's grows with its side.
-	let unit = 1.0 / (view.eye.w * view.forward.w);
 	// The map's bounds: no cube stands out of them by more than its side.
 	let bound_lo = nodes[0].lo;
 	let bound_hi = nodes[0].hi;
-	var t = 0.0;
-	var steps = 0u; // EXPERIMENT
+	var t = start;
 	for (var i = 0u; i < MARCH; i += 1u) {
-		steps = i; // EXPERIMENT
 		let p = o + d * t;
-		let l = shell_level(p);
-		if (l >= SHELLS || shells.origin[l].w == 0) {
+		// The sizes that may draw a cube here: from the finest this point's
+		// cut picks to the coarsest whose band still holds its distance.
+		let lo = shell_level(p);
+		if (lo >= SHELLS) {
 			break;
 		}
-		let s = view.sky.w * exp2(f32(l));
-		if (any(p < bound_lo - s) || any(p > bound_hi + s)) {
+		let hi = max(min(level_hi(length(p - view.eye.xyz)), SHELLS - 1u), lo);
+		let coarse = side(hi);
+		let fine = side(lo);
+		if (any(p < bound_lo - coarse) || any(p > bound_hi + coarse)) {
 			// Outside the bounds, only a ray heading back in meets matter.
-			let far = max((bound_lo - s - o) * inv, (bound_hi + s - o) * inv);
-			let near = min((bound_lo - s - o) * inv, (bound_hi + s - o) * inv);
+			let far = max((bound_lo - coarse - o) * inv, (bound_hi + coarse - o) * inv);
+			let near = min((bound_lo - coarse - o) * inv, (bound_hi + coarse - o) * inv);
 			let enter = max(max(near.x, near.y), near.z);
 			if (enter <= t || enter > min(min(far.x, far.y), far.z)) {
 				break;
 			}
-			t = enter + 1e-3 * s;
+			t = enter + 1e-3 * fine;
 			continue;
 		}
-		let c = vec3i(floor(p / s));
-		let r = s * unit;
-		// Well inside the band where every cube is this size, empty blocks
-		// are crossed whole, the largest first, never past the band's end;
-		// near a switch of size the ray goes a cell at a time.
-		let band_end = select(2.0 * r - 4.0 * s, 1e30, l == SHELLS - 1u);
-		let inside = (l == 0u || t >= r + s) && t < band_end;
+		let c = vec3i(floor(p / fine));
+		let r = lod_r(lo);
+		// Well inside the band where every legal size draws, empty blocks
+		// are crossed whole, the largest first — a block empty at the
+		// coarsest size is empty at every finer one — never past the band's
+		// end; near a switch of size the ray goes a cell at a time.
+		let band_end = band_hi(lo, fine);
+		let inside = (lo == 0u || t >= r + fine) && t < band_end;
 		if (inside) {
 			var skipped = false;
-			for (var g = 2i; g >= 0; g -= 1) {
-				if (block_empty(l, c, u32(g))) {
-					let side = s * f32(16 << (2u * u32(g)));
-					let lo = floor(p / side) * side;
-					t = max(min(exit_box(o, inv, lo, side), band_end), t) + 1e-3 * s;
-					skipped = true;
-					break;
+			if (shells.origin[hi].w != 0) {
+				// The blocks of the coarsest size are tested at its own
+				// scale: a fine cell's index there would run past the
+				// shell's keys and read empty, skipping matter whole.
+				let ch = vec3i(floor(p / coarse));
+				for (var g = 2i; g >= 0; g -= 1) {
+					if (block_empty(hi, ch, u32(g))) {
+						let span = coarse * f32(16 << (2u * u32(g)));
+						let blo = floor(p / span) * span;
+						t = max(min(exit_box(o, inv, blo, span), band_end), t) + 1e-3 * fine;
+						skipped = true;
+						break;
+					}
 				}
 			}
 			if (skipped) {
 				continue;
 			}
-		} else if (block_empty(l, c, 0u)) {
-			t = max(exit_box(o, inv, vec3f(c) * s, s), t) + 1e-3 * s;
+		} else if (shells.origin[lo].w != 0 && block_empty(lo, c, 0u)) {
+			t = max(exit_box(o, inv, vec3f(c) * fine, fine), t) + 1e-3 * fine;
 			continue;
 		}
+		// Matter near: every size that may draw a cube here, finest first,
+		// and the first cell any of them fills is the cube. A coarse cell
+		// may sit with its center in front of a face its fine children
+		// behind it fill — matter only grows inward — so testing only the
+		// one size the cut picks leaves them out: gaps and moire where the
+		// sizes switch. Testing them all, each ray finds the matter
+		// whichever size holds it, and across a switch every cube stays
+		// whole.
+		var hit = Found(1e30, vec3f(0.0), 0.0, false);
+		var m = lo;
+		loop {
+			if (shells.origin[m].w != 0) {
+				let sm = side(m);
+				let cm = vec3i(floor(p / sm));
+				let em = find_entry(m, key_of(m, cm >> vec3u(2u)));
+				if (em != NO_ENTRY && bit_set(em, cm)) {
+					hit = Found(t, vec3f(cm), sm, true);
+					break;
+				}
+			}
+			if (m >= hi) {
+				break;
+			}
+			m += 1u;
+		}
+		if (hit.found) {
+			return hit;
+		}
+		// Nothing here: on past the finest cell the ray is in, so no
+		// filled cell it later crosses is stepped over.
 		let b = c >> vec3u(2u);
-		let e = find_entry(l, key_of(l, b));
+		let e = find_entry(lo, key_of(lo, b));
 		if (e == NO_ENTRY && inside) {
-			t = max(min(exit_box(o, inv, vec3f(b) * 4.0 * s, 4.0 * s), band_end), t) + 1e-3 * s;
+			t = max(min(exit_box(o, inv, vec3f(b) * 4.0 * fine, 4.0 * fine), band_end), t) + 1e-3 * fine;
 			continue;
 		}
-		if (e != NO_ENTRY && bit_set(e, c)) {
-			return Found(t, vec3f(c), view.sky.w * exp2(f32(steps) / 16.0), true); // EXPERIMENT
-		}
-		t = max(exit_box(o, inv, vec3f(c) * s, s), t) + 1e-3 * s;
+		t = max(exit_box(o, inv, vec3f(c) * fine, fine), t) + 1e-3 * fine;
 	}
 	return Found(1e30, vec3f(0.0), 0.0, false);
 }
 
-// The light of a bowl's cube at `center` in `dent`, cut into triangle
-// `tri` facing `n`, per unit albedo, as the trace lights it: facing the
-// dent's center, the sun reaching in only through the opening.
-fn dent_light(tri: Tri, center: vec3f, n: vec3f, dent: vec4f) -> vec3f {
-	let sun = lighting.sun.xyz;
-	let oc = center - dent.xyz;
-	let b = dot(oc, sun);
-	let leaves = center + sun * (sqrt(max(b * b - dot(oc, oc) + dent.w * dent.w, 0.0)) - b);
-	var blocked = dot(n, leaves - tri.a.xyz) <= 0.0;
-	if (!blocked) {
-		blocked = occluded(leaves + n * OFFSET, sun, 1e30);
-	}
-	return sun_and_sky(normalize(dent.xyz - center), blocked, SHADED);
+// The light of a map cube on the plane of normal `n`, per unit albedo:
+// what the bake left out — a bowl's cubes — lit by the sun where the
+// plane faces it, the sky around. No ray to the mesh; stored per voxel.
+fn cube_light(n: vec3f) -> vec3f {
+	return sun_and_sky(n, dot(n, lighting.sun.xyz) <= 0.0, SHADED);
 }
 
 // A map cube's look, one color whichever ray reaches it: stored in the
-// voxel field, or worked out from the triangle that fills it — its
-// texels lit facing the eye off that surface, or for a bowl's cube facing
-// its dent's center — and stored.
-fn shell_color(d: vec3f, hit: Found) -> vec3f {
+// voxel field, or worked out from the plane that fills it — its face's
+// baked chart, sampled where the cube's center falls on that plane; its
+// texels under that light, its own normal, never one turned toward the
+// eye — and stored.
+fn shell_color(hit: Found) -> vec3f {
 	let stored = stored_color(voxel_key(hit.cell, hit.s));
 	if (stored.found) {
 		return stored.color;
@@ -592,21 +736,46 @@ fn shell_color(d: vec3f, hit: Found) -> vec3f {
 	let near = shell_filler(center, s);
 	if (near != NO_HIT) {
 		let tri = tris[near];
-		let n = facing(tri, d);
-		let light = global_light(center - n * dot(n, center - tri.a.xyz), n, SHADED);
+		let n = tri_normal(tri);
+		// The cube's center falls on the filling plane: the chart's grid is
+		// the plane's own.
+		let p = center - n * dot(n, center - tri.a.xyz);
+		let light = select(cube_light(n), baked_light_at(tri, p), is_baked(tri));
 		color = light * voxel_albedo(tri, center, n, s);
 	} else {
-		let dent = dent_shell(center, s);
-		if (dent >= 0) {
-			let bowl = nearest_tri(center, dents[dent].w * 2.0 + s);
-			if (bowl != NO_HIT) {
-				let tri = tris[bowl];
-				let n = facing(tri, d);
-				color = dent_light(tri, center, n, dents[dent]) * voxel_albedo(tri, center, n, s);
+		// No plane behind it: a cube of a bowl's dent, lit facing into
+		// the bowl.
+		let n = bowl_normal(center, s);
+		color = cube_light(n) * vec3f(0.5);
+	}
+	store_color(stored, color);
+	return color;
+}
+
+// A map cube's lit color, blended toward its parent's across the sizes'
+// overlap: from where the parent first may be drawn whole to where it
+// must be, the fine cube's color thins out into the coarse one's, so a
+// switch keeps every cube whole and the blend follows the eye's distance.
+fn blended_color(hit: Found) -> vec3f {
+	var color = shell_color(hit);
+	let l = u32(round(log2(hit.s / view.sky.w)));
+	if (l + 1u < SHELLS) {
+		let r = lod_r(l + 1u);
+		let a = shells.lod.z;
+		let center = (hit.cell + 0.5) * hit.s;
+		let f = clamp((length(center - view.eye.xyz) - r * (1.0 - a)) / (2.0 * a * r), 0.0, 1.0);
+		if (f > 0.0) {
+			let ps = 2.0 * hit.s;
+			let pc = floor(hit.cell / 2.0);
+			// Only a parent already stored thins the cube: none is filled
+			// just for the blend, so a cube keeps its color the frames
+			// before its parent's own rays store one.
+			let stored = stored_color(voxel_key(pc, ps));
+			if (stored.found) {
+				color = mix(color, stored.color, f);
 			}
 		}
 	}
-	store_color(stored, color);
 	return color;
 }
 
@@ -622,7 +791,7 @@ struct Ball {
 fn ball(o: vec3f, d: vec3f, far: f32) -> Ball {
 	var best = Ball(far, vec3f(0.0), vec4f(0.0), false);
 	let inv = select(vec3f(1e30), vec3f(1.0) / d, abs(d) >= vec3f(1e-12));
-	for (var i = 0u; i < arrayLength(&bodies); i += 1u) {
+	for (var i = 0u; i < BODIES; i += 1u) {
 		let sphere = bodies[i];
 		if (sphere.w <= 0.0) {
 			continue;
@@ -700,16 +869,16 @@ fn shell_inspect(mode: u32, d: vec3f, t: f32, cell: vec3f, s: f32, n: vec3f, alb
 	}
 }
 
-// A map cube's facing and albedo for the debug views: off the triangle
-// that fills it, or flat grey for a bowl's cube.
-fn shell_surface(d: vec3f, hit: Found) -> mat2x3f {
+// A map cube's facing and albedo for the debug views: the plane that
+// fills it, its own normal; into its bowl for a bowl's cube.
+fn shell_surface(hit: Found) -> mat2x3f {
 	let center = (hit.cell + 0.5) * hit.s;
 	let near = shell_filler(center, hit.s);
 	if (near == NO_HIT) {
-		return mat2x3f(-d, vec3f(0.5));
+		return mat2x3f(bowl_normal(center, hit.s), vec3f(0.5));
 	}
 	let tri = tris[near];
-	let n = facing(tri, d);
+	let n = tri_normal(tri);
 	return mat2x3f(n, voxel_albedo(tri, center, n, hit.s));
 }
 
@@ -729,16 +898,88 @@ struct ShellPixel {
 	@builtin(frag_depth) depth: f32,
 }
 
-@fragment
-fn shell_fs(@builtin(position) at: vec4f) -> ShellPixel {
+// The ray through pixel `at`, as the trace's ray through a pixel.
+fn pixel_ray(at: vec2f) -> vec3f {
 	let ndc = vec2f(at.x / view.size.x * 2.0 - 1.0, 1.0 - at.y / view.size.y * 2.0);
-	let d = normalize(view.forward.xyz + view.right.xyz * (ndc.x * view.right.w) + view.up.xyz * (ndc.y * view.up.w));
+	return normalize(view.forward.xyz + view.right.xyz * (ndc.x * view.right.w) + view.up.xyz * (ndc.y * view.up.w));
+}
+
+// Pixels either way a march looks for a nearer triangle: a cube spans up
+// to `K` of them, and a pixel to round.
+fn reach_radius() -> i32 {
+	return clamp(i32(ceil(view.forward.w)) + 1, 1, 8);
+}
+
+// One thread a pixel: how far its ray goes before any triangle.
+@compute @workgroup_size(8, 8)
+fn shell_reach(@builtin(global_invocation_id) id: vec3u) {
+	let w = u32(view.size.x);
+	let i = id.y * w + id.x;
+	if (id.x >= w || id.y >= u32(view.size.y) || i >= REACH_PIXELS) {
+		return;
+	}
+	let hit = trace(view.eye.xyz, pixel_ray(vec2f(id.xy) + 0.5));
+	reach[i] = select(1e30, hit.t, hit.tri != NO_HIT);
+}
+
+// The least reach along each row within the radius.
+@compute @workgroup_size(8, 8)
+fn shell_reach_rows(@builtin(global_invocation_id) id: vec3u) {
+	let w = i32(view.size.x);
+	let i = id.y * u32(w) + id.x;
+	if (i32(id.x) >= w || id.y >= u32(view.size.y) || i >= REACH_PIXELS) {
+		return;
+	}
+	let r = reach_radius();
+	var least = 1e30;
+	for (var dx = -r; dx <= r; dx += 1) {
+		let x = clamp(i32(id.x) + dx, 0, w - 1);
+		least = min(least, reach[id.y * u32(w) + u32(x)]);
+	}
+	reach_rows[i] = least;
+}
+
+// The least of the rows' least within the radius up and down: back into
+// `reach`, where the march reads it.
+@compute @workgroup_size(8, 8)
+fn shell_reach_columns(@builtin(global_invocation_id) id: vec3u) {
+	let w = u32(view.size.x);
+	let h = i32(view.size.y);
+	let i = id.y * w + id.x;
+	if (id.x >= w || i32(id.y) >= h || i >= REACH_PIXELS) {
+		return;
+	}
+	let r = reach_radius();
+	var least = 1e30;
+	for (var dy = -r; dy <= r; dy += 1) {
+		let y = u32(clamp(i32(id.y) + dy, 0, h - 1));
+		if (y * w + id.x < REACH_PIXELS) {
+			least = min(least, reach_rows[y * w + id.x]);
+		}
+	}
+	reach[i] = least;
+}
+
+// The ray through `at` on screen, in pixels: what it shows, as linear
+// light on the screen — tone mapped when lit — and its view depth,
+// reversed as the overlays draw. The debug views' values are as shown:
+// back to light, so they average and encode like the rest.
+fn shell_sample(at: vec2f) -> vec4f {
+	let d = pixel_ray(at);
 	let o = view.eye.xyz;
 	let mode = u32(view.grade.w);
-	let map = march(o, d);
+	// No cube stands nearer than the nearest triangle around, by more than
+	// a few of the cubes there.
+	let i = u32(floor(at.y - 0.5)) * u32(view.size.x) + u32(floor(at.x - 0.5));
+	var near = 0.0;
+	if (i < REACH_PIXELS) {
+		near = reach[i];
+	}
+	var map = Found(1e30, vec3f(0.0), 0.0, false);
+	if (near < 1e29) {
+		map = march(o, d, max(near - 3.0 * side(level_hi(near)), 0.0));
+	}
 	let hit = ball(o, d, map.t);
-	// Lit colors and the albedo view tone-map and encode as the trace's
-	// do; the other debug views are shown as they are.
 	let lit = mode == 0u || mode == SHELL_ALBEDO;
 	var seen = select(vec3f(0.0), view.sky.rgb, lit);
 	var t = 1e30;
@@ -754,9 +995,9 @@ fn shell_fs(@builtin(position) at: vec4f) -> ShellPixel {
 	} else if (map.found) {
 		t = map.t;
 		if (mode == 0u) {
-			seen = shell_inspect(5u, d, t, map.cell, map.s, vec3f(0.0), vec3f(0.0)); // EXPERIMENT
+			seen = blended_color(map);
 		} else {
-			let surface = shell_surface(d, map);
+			let surface = shell_surface(map);
 			seen = shell_inspect(mode, d, t, map.cell, map.s, surface[0], surface[1]);
 		}
 	}
@@ -765,16 +1006,90 @@ fn shell_fs(@builtin(position) at: vec4f) -> ShellPixel {
 		if (mode == 0u) {
 			color = shell_aces(color * view.grade.x);
 		}
-		if (view.grade.y > 0.5) {
-			color = pow(color, vec3f(1.0 / 2.2));
-		}
-	} else if (view.grade.y < 0.5) {
-		// The target encodes to sRGB itself: hand it the shown value as linear.
+	} else {
 		color = pow(color, vec3f(2.2));
 	}
 	var depth = 0.0;
 	if (t < 1e29) {
 		depth = clamp(view.grade.z / max(t * dot(d, view.forward.xyz), 1e-6), 0.0, 1.0);
 	}
+	return vec4f(color, depth);
+}
+
+// Where in the pixel each ray goes, for 2 and 4 rays: as the trace's — a
+// diagonal pair, and a rotated grid, so edges at any angle land between
+// samples.
+const PAIR: array<vec2f, 2> = array<vec2f, 2>(vec2f(-0.25, -0.25), vec2f(0.25, 0.25));
+const GRID: array<vec2f, 4> = array<vec2f, 4>(
+	vec2f(-0.125, -0.375),
+	vec2f(0.375, -0.125),
+	vec2f(0.125, 0.375),
+	vec2f(-0.375, 0.125),
+);
+
+@fragment
+fn shell_fs(@builtin(position) at: vec4f) -> ShellPixel {
+	// Rays a pixel averages: one through its center, or `view.size.z`
+	// spread across it, so cubes smaller than the gaps between pixels
+	// and their edges blend instead of alias.
+	let rays = u32(view.size.z);
+	var sum = vec4f(0.0);
+	var depth = 0.0;
+	var count = 1u;
+	if (rays >= 4u) {
+		count = 4u;
+		for (var i = 0u; i < 4u; i += 1u) {
+			let one = shell_sample(at.xy + GRID[i]);
+			sum += one;
+			depth = max(depth, one.w);
+		}
+	} else if (rays >= 2u) {
+		count = 2u;
+		for (var i = 0u; i < 2u; i += 1u) {
+			let one = shell_sample(at.xy + PAIR[i]);
+			sum += one;
+			depth = max(depth, one.w);
+		}
+	} else {
+		sum = shell_sample(at.xy);
+		depth = sum.w;
+	}
+	var color = sum.rgb / f32(count);
+	if (view.grade.y > 0.5) {
+		color = pow(color, vec3f(1.0 / 2.2));
+	}
+	// The nearest of the rays: overlays hide behind any matter in the pixel.
 	return ShellPixel(vec4f(color, 1.0), depth);
+}
+
+// Projects a world position, reversed and infinite as the overlays draw:
+// near / view depth, the sky clearing to 0.
+fn project(p: vec3f) -> vec4f {
+	let rel = p - view.eye.xyz;
+	let x = dot(rel, view.right.xyz);
+	let y = dot(rel, view.up.xyz);
+	let z = dot(rel, view.forward.xyz);
+	return vec4f(x / view.right.w, y / view.up.w, view.grade.z, z);
+}
+
+// The map's triangles as pink wireframe over whatever the march drew: three
+// edges a triangle, read straight from the trace's triangles. Not
+// depth-tested: a cube fills its whole cell, so it hides the mesh inside it.
+struct WireIn {
+	@builtin(position) clip: vec4f,
+}
+
+@vertex
+fn wire_vs(@builtin(vertex_index) i: u32) -> WireIn {
+	let tri = tris[i / 6u];
+	// v0 v1 v1 v2 v2 v0: three edges, two vertices each.
+	let corner = array<vec4f, 6>(tri.a, tri.b, tri.b, tri.c, tri.c, tri.a)[i % 6u];
+	var out: WireIn;
+	out.clip = project(corner.xyz);
+	return out;
+}
+
+@fragment
+fn wire_fs(in: WireIn) -> @location(0) vec4f {
+	return vec4f(1.0, 0.4, 0.75, 1.0);
 }

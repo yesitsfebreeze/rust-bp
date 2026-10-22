@@ -54,6 +54,31 @@ pub fn texture_entry(binding: u32, stages: wgpu::ShaderStages) -> wgpu::BindGrou
 	}
 }
 
+/// A layout entry for a non-filterable 2D texture seen by `stages`: what
+/// the frame's own color and depth load as, unfiltered.
+pub fn raw_texture_entry(binding: u32, stages: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+	wgpu::BindGroupLayoutEntry {
+		binding,
+		visibility: stages,
+		ty: wgpu::BindingType::Texture {
+			sample_type: wgpu::TextureSampleType::Float { filterable: false },
+			view_dimension: wgpu::TextureViewDimension::D2,
+			multisampled: false,
+		},
+		count: None,
+	}
+}
+
+/// A layout entry for a filtering sampler seen by `stages`.
+pub fn sampler_entry(binding: u32, stages: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+	wgpu::BindGroupLayoutEntry {
+		binding,
+		visibility: stages,
+		ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+		count: None,
+	}
+}
+
 pub const READ: wgpu::BufferBindingType = wgpu::BufferBindingType::Storage { read_only: true };
 pub const WRITE: wgpu::BufferBindingType = wgpu::BufferBindingType::Storage { read_only: false };
 pub const UNIFORM: wgpu::BufferBindingType = wgpu::BufferBindingType::Uniform;
@@ -79,6 +104,57 @@ pub fn storage(device: &wgpu::Device, label: &str, contents: &[u8]) -> wgpu::Buf
 		label: Some(label),
 		contents,
 		usage: wgpu::BufferUsages::STORAGE,
+	})
+}
+
+/// A half-float RGBA texture of `width` × `height` from `rgba`, four
+/// little-endian f16s per texel, filterable.
+pub fn half_image(
+	device: &wgpu::Device,
+	queue: &wgpu::Queue,
+	label: &str,
+	width: u32,
+	height: u32,
+	rgba: &[u8],
+) -> wgpu::TextureView {
+	device
+		.create_texture_with_data(
+			queue,
+			&wgpu::TextureDescriptor {
+				label: Some(label),
+				size: wgpu::Extent3d {
+					width,
+					height,
+					depth_or_array_layers: 1,
+				},
+				mip_level_count: 1,
+				sample_count: 1,
+				dimension: wgpu::TextureDimension::D2,
+				format: wgpu::TextureFormat::Rgba16Float,
+				usage: wgpu::TextureUsages::TEXTURE_BINDING,
+				view_formats: &[],
+			},
+			wgpu::util::TextureDataOrder::LayerMajor,
+			rgba,
+		)
+		.create_view(&Default::default())
+}
+
+/// A uniform buffer holding `contents`.
+pub fn uniform(device: &wgpu::Device, label: &str, contents: &[u8]) -> wgpu::Buffer {
+	device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+		label: Some(label),
+		contents,
+		usage: wgpu::BufferUsages::UNIFORM,
+	})
+}
+
+/// A vertex buffer holding `contents`.
+pub fn vertices(device: &wgpu::Device, label: &str, contents: &[u8]) -> wgpu::Buffer {
+	device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+		label: Some(label),
+		contents,
+		usage: wgpu::BufferUsages::VERTEX,
 	})
 }
 

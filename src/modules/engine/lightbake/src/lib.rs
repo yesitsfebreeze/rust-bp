@@ -1,28 +1,40 @@
-//! Baked lightmaps for static level geometry, reusable across levels: any
-//! triangle soup plus per-triangle diffuse albedo goes in, one atlas and a
-//! chart per triangle come out.
+//! Baked lightmaps for static level geometry, reusable across levels: a
+//! triangle soup plus per-triangle diffuse albedo and one caller-supplied
+//! [`ChartSpec`] per surface goes in, one atlas comes out.
 //!
-//! A chart is a small rectangle of atlas texels holding the diffuse light
-//! arriving at one triangle, projected on the triangle's dominant axis — the
-//! same axis choice the game renderer uses for its tiling textures, so a
-//! renderer maps world positions to chart texels without new vertex data. A
-//! texel stores `S` such that the lit diffuse term is `kd * albedo * S`:
+//! A chart is a rectangle of atlas texels holding the diffuse light
+//! arriving at one surface, on a grid the caller places: the spec names the
+//! world point at texel (0, 0)'s center, the two world step vectors one
+//! texel along the grid, and the surface's normal — so a renderer that
+//! already maps its geometry onto a lightmap grid (a BSP face's luxels, say)
+//! hands that grid to the bake and reads the texels back by the same
+//! mapping. A texel stores `S` such that the lit diffuse term is
+//! `kd * albedo * S`:
 //!
 //! - direct sun, `sun_color · max(n·l, 0) · visibility / π`, visibility raycast
 //!   with the shadowing triangle remembered per texel;
-//! - the sky/ground hemisphere, `mix(ground, sky, n.y · 0.5 + 0.5)`;
+//! - the sky/ground hemisphere, `mix(ground, sky, d.y · 0.5 + 0.5)` along
+//!   each cosine-distributed gather ray `d` that escapes the level, so only
+//!   the sky a texel sees lands: corners, overhangs and interiors darken as
+//!   they close in (with zero `rays`, the open hemisphere around the normal
+//!   lands unoccluded instead);
 //! - the config's [`Light`]s, shadow-rayed per texel and faded by distance;
-//! - `bounces` of indirect light, gathered with cosine-distributed rays whose
-//!   hits sample the charts themselves.
+//! - `bounces` of indirect light, gathered with the same rays, whose hits
+//!   sample the charts themselves: each bounce carries on only the light the
+//!   one before it added, so no order of light is counted twice. The
+//!   gathered light is then smoothed across neighbouring texels on the same
+//!   plane, chart borders and all, so each surface's Monte-Carlo noise does
+//!   not show as blotches that change face by face; direct light stays
+//!   as sharp as its texels.
 //!
 //! Geometry edits keep triangle indices stable: destroyed geometry becomes a
 //! zero-area triangle at the same index, new geometry is appended, and every
-//! created, moved or destroyed index is passed to [`Baked::update`]. It
-//! rebakes only the changed charts and the texels whose sunlight the edit
-//! shadowed or unshadowed, and returns the atlas rectangles that changed, for
-//! a partial texture upload plus a mipmap regeneration. Indirect light from
-//! surfaces beyond the edit is not re-gathered elsewhere; call [`bake`] again
-//! for an exact result.
+//! created, moved or destroyed index is passed to [`Baked::update`] with the
+//! charts recomputed for the edited level. It rebakes only the changed
+//! charts and the texels whose sunlight the edit shadowed or unshadowed, and
+//! returns the atlas rectangles that changed, for a partial texture upload
+//! plus a mipmap regeneration. Indirect light from surfaces beyond the edit
+//! is not re-gathered elsewhere; call [`bake`] again for an exact result.
 
 use linalg::{vec3, Vec3};
 use pack::Packer;
@@ -50,6 +62,10 @@ const NO_SHADOW: u32 = u32::MAX;
 /// Sun and gather rays start this far off the surface, in world units, so
 /// grazing rays do not hit the triangle they were cast from.
 const OFFSET: f32 = 0.1;
+/// How far the gathered light is smoothed, in texels of the config's
+/// `units_per_texel`: the radius of the Gaussian that averages each texel
+/// with its neighbours on the same plane.
+const SMOOTH_TEXELS: f32 = 2.5;
 
 /// A light source baked into the atlas besides the sun. `cone` turns it
 /// into a spotlight: the emission direction (unit) and its half-angle in
@@ -69,7 +85,8 @@ pub struct Light {
 pub struct Config {
 	/// Atlas side in texels; a power of two, so uploaded mips regenerate.
 	pub atlas_size: u32,
-	/// World units one lightmap texel covers.
+	/// World units one lightmap texel covers, for
+	/// [`ChartSpec::fit_triangle`] and callers deriving their own grids.
 	pub units_per_texel: f32,
 	/// Smallest chart side, so tiny triangles still receive light.
 	pub min_chart: u32,
@@ -131,19 +148,73 @@ impl Rect {
 	}
 }
 
-/// One triangle's texels: where they sit in the atlas and how the triangle's
-/// plane maps onto them. `u` and `v` are world axes, so a world point's chart
-/// texel is `((p·u - u_min) / units - 0.5, (p·v - v_min) / units - 0.5)`.
+/// One surface's chart, placed by the caller: a rectangle of atlas texels
+/// and the world plane it samples. `origin` is the world point at texel
+/// `(0, 0)`'s center; `u` and `v` step one texel along the grid, in world
+/// units; `n` is the surface's outward unit normal, which the grid spans.
+///
+/// A world point `p` on the surface sits at chart texel
+/// `lm(p) = (g_u · (p - origin), g_v · (p - origin))`, where `g_u` and `g_v`
+/// are the dual basis [`Chart::grads`] returns; the chart's texel `(i, j)`
+/// conversely centers at `origin + u · i + v · j`.
+#[derive(Clone, Copy, Debug)]
+pub struct ChartSpec {
+	pub origin: Vec3,
+	pub u: Vec3,
+	pub v: Vec3,
+	pub n: Vec3,
+	pub w: u32,
+	pub h: u32,
+}
+
+impl ChartSpec {
+	/// The chart the surface's own triangle makes on its dominant world axis
+	/// — the same axis choice the game renderer uses for its tiling
+	/// textures — sized by the triangle's extent at the config's density,
+	/// never below `min_chart` texels.
+	pub fn fit_triangle(t: &Triangle, config: &Config) -> ChartSpec {
+		Self::fit_points(t, triangle_normal(t), config)
+	}
+
+	/// The chart a set of surface points makes on the dominant world axis of
+	/// their `n`, sized by their extent at the config's density, never
+	/// below `min_chart` texels.
+	pub fn fit_points(points: &[Vec3], n: Vec3, config: &Config) -> ChartSpec {
+		let (u, v, axis) = dominant(n);
+		let units = config.units_per_texel;
+		let (mut s_lo, mut s_hi, mut t_lo, mut t_hi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+		for p in points {
+			let (s, t) = (p.dot(u), p.dot(v));
+			s_lo = s_lo.min(s);
+			s_hi = s_hi.max(s);
+			t_lo = t_lo.min(t);
+			t_hi = t_hi.max(t);
+		}
+		let extent = |lo: f32, hi: f32| {
+			(((hi - lo) / units).ceil() as u32)
+				.max(config.min_chart)
+				.min(config.atlas_size - 1)
+		};
+		ChartSpec {
+			// Texel (0, 0)'s center: half a texel in from the extent corner.
+			origin: u * (s_lo + units * 0.5)
+				+ v * (t_lo + units * 0.5)
+				+ axis * points.first().copied().unwrap_or(Vec3::ZERO).dot(axis),
+			u: u * units,
+			v: v * units,
+			n,
+			w: extent(s_lo, s_hi),
+			h: extent(t_lo, t_hi),
+		}
+	}
+}
+
+/// One chart's texels: where they sit in the atlas and the caller's plane
+/// mapping onto them, as [`ChartSpec`] places it.
 #[derive(Clone)]
 struct Chart {
 	rect: Rect,
-	u: Vec3,
-	v: Vec3,
-	/// The dominant world axis; every point of the triangle has `p·axis = plane`.
-	axis: Vec3,
-	plane: f32,
-	u_min: f32,
-	v_min: f32,
+	spec: ChartSpec,
 	/// The triangle shadowing each texel's sun ray, or [`NO_SHADOW`].
 	shadow: Vec<u32>,
 	/// Every triangle that blocks any of the chart's texels' light rays,
@@ -153,43 +224,59 @@ struct Chart {
 
 impl Chart {
 	/// The world point at the center of texel `(i, j)`.
-	fn world(&self, i: u32, j: u32, units: f32) -> Vec3 {
-		let at = |k: u32, min: f32| min + (k as f32 + 0.5) * units;
-		self.u * at(i, self.u_min) + self.v * at(j, self.v_min) + self.axis * self.plane
+	fn world(&self, i: u32, j: u32) -> Vec3 {
+		self.spec.origin + self.spec.u * (i as f32) + self.spec.v * (j as f32)
 	}
 
-	/// The world box the chart spans; `u`, `v` and `axis` are world axes, so it
-	/// is axis aligned.
-	fn bounds(&self, units: f32) -> (Vec3, Vec3) {
-		let (u0, u1) = (self.u_min, self.u_min + self.rect.w as f32 * units);
-		let (v0, v1) = (self.v_min, self.v_min + self.rect.h as f32 * units);
-		let mut lo = Vec3::ZERO;
-		let mut hi = Vec3::ZERO;
-		for &(a, b) in &[(u0, u1), (v0, v1)] {
-			lo = lo.min(self.u * a + self.v * b).min(self.u * b + self.v * a);
-			hi = hi.max(self.u * a + self.v * b).max(self.u * b + self.v * a);
+	/// The dual basis mapping world points on the chart's plane to texel
+	/// coordinates: `lm_u(p) = g_u · (p - origin)`, `lm_v(p)` likewise.
+	fn grads(&self) -> (Vec3, Vec3) {
+		let d = self.spec.u.cross(self.spec.v).dot(self.spec.n);
+		(
+			self.spec.v.cross(self.spec.n).map(|x| x / d),
+			self.spec.n.cross(self.spec.u).map(|x| x / d),
+		)
+	}
+
+	/// The world box the chart spans: the min and max of its four corners.
+	fn bounds(&self) -> (Vec3, Vec3) {
+		let (w, h) = (self.rect.w as f32, self.rect.h as f32);
+		let mut lo = self.world(0, 0);
+		let mut hi = lo;
+		for &(i, j) in &[(w, 0.0), (0.0, h), (w, h)] {
+			let c = self.spec.origin + self.spec.u * i + self.spec.v * j;
+			lo = lo.min(c);
+			hi = hi.max(c);
 		}
-		(lo + self.axis * self.plane, hi + self.axis * self.plane)
+		(lo, hi)
 	}
 }
 
-/// The atlas mapping of one triangle, for a renderer building per-vertex
-/// lightmap coordinates. A world point `p` on the triangle sits at chart
-/// texel `((p·u - u_min) / units, (p·v - v_min) / units)`.
+/// The atlas mapping of one surface, for a renderer building per-vertex
+/// lightmap coordinates or sampling the chart by world point.
 #[derive(Clone, Copy, Debug)]
 pub struct ChartView {
+	/// The world point at texel `(0, 0)`'s center.
+	pub origin: Vec3,
+	/// The world step one texel along the grid, in each direction.
 	pub u: Vec3,
 	pub v: Vec3,
-	/// The triangle's dominant world axis, on which every point of it has
-	/// `p·axis = plane`.
-	pub axis: Vec3,
-	pub plane: f32,
-	pub u_min: f32,
-	pub v_min: f32,
-	/// World units per texel.
-	pub units: f32,
+	/// The surface's outward unit normal.
+	pub n: Vec3,
 	/// The chart's rectangle, atlas texels.
 	pub rect: Rect,
+}
+
+impl ChartView {
+	/// The dual basis mapping world points on the surface to chart texel
+	/// coordinates.
+	pub fn grads(&self) -> (Vec3, Vec3) {
+		let d = self.u.cross(self.v).dot(self.n);
+		(
+			self.v.cross(self.n).map(|x| x / d),
+			self.n.cross(self.u).map(|x| x / d),
+		)
+	}
 }
 
 /// The level geometry one bake or rebake pass runs against.
@@ -199,9 +286,13 @@ struct Scene<'a> {
 	bvh: &'a bvh::Bvh,
 	/// Every ray's maximum travel.
 	span: f32,
+	/// Each chart's triangles, `(first, count)` into `tris`.
+	chart_tris: &'a [(u32, u32)],
+	/// World units one texel covers, the config's `units_per_texel`.
+	units: f32,
 }
 
-/// A baked level: one atlas of radiance texels and a chart per triangle.
+/// A baked level: one atlas of radiance texels and one chart per surface.
 pub struct Baked {
 	config: Config,
 	side: u32,
@@ -209,18 +300,36 @@ pub struct Baked {
 	/// visibility. Each chart's edges are duplicated into its gutter.
 	texels: Vec<[f32; 4]>,
 	charts: Vec<Option<Chart>>,
+	/// Each triangle's chart, so gather hits and edits find the surface they
+	/// landed on.
+	tri_chart: Vec<u32>,
 	packer: Packer,
 }
 
 /// Bakes `tris` into one atlas under `config`. `albedo` is each triangle's
 /// diffuse albedo, linear, metallic contribution already removed — indirect
-/// rays treat every surface as a diffuse reflector.
-pub fn bake(tris: &[Triangle], albedo: &[Vec3], config: &Config) -> Result<Baked, String> {
+/// rays treat every surface as a diffuse reflector. `charts` places one
+/// chart per surface at whatever density the caller maps geometry with;
+/// `tri_chart` names each triangle's chart.
+pub fn bake(
+	tris: &[Triangle],
+	albedo: &[Vec3],
+	charts: &[ChartSpec],
+	tri_chart: &[u32],
+	config: &Config,
+) -> Result<Baked, String> {
 	if tris.len() != albedo.len() {
 		return Err(format!(
 			"{} triangles but {} albedos",
 			tris.len(),
 			albedo.len()
+		));
+	}
+	if tris.len() != tri_chart.len() {
+		return Err(format!(
+			"{} triangles but {} chart indices",
+			tris.len(),
+			tri_chart.len()
 		));
 	}
 	if config.atlas_size.count_ones() != 1 {
@@ -229,61 +338,123 @@ pub fn bake(tris: &[Triangle], albedo: &[Vec3], config: &Config) -> Result<Baked
 			config.atlas_size
 		));
 	}
-	let (mut baked, order) = packed(tris, config)?;
+	let (mut baked, order) = packed(tris, charts, tri_chart, config)?;
 	let bvh = bvh::Bvh::build(tris);
 	let span = ray_span(tris);
+	let chart_tris = tri_chart_ranges(tri_chart, charts.len())?;
 	let scene = Scene {
 		tris,
 		albedo,
 		bvh: &bvh,
 		span,
+		chart_tris: &chart_tris,
+		units: config.units_per_texel,
 	};
 	let mut rng = config.seed;
-	// Pass 0 writes direct sun and sky. Each later pass gathers one bounce
-	// from what the earlier passes wrote, all of a pass landing in a copy
-	// first so no chart is gathered from its own half-written bounce.
+	// Pass 0 writes direct sun and lights. Each gather pass then adds one
+	// order of light, gathered from only what the pass before it added —
+	// the first from the direct light, and it alone sees the sky — all of
+	// a pass landing in a copy first so no chart is gathered from its own
+	// half-written bounce. Zero bounces still runs the first pass, for the
+	// sky, its hits gathering nothing.
 	for &i in &order {
 		baked.bake_chart(&scene, i, &mut rng, false);
 	}
-	for _ in 0..config.bounces {
-		let mut pass = Vec::with_capacity(order.len());
+	if config.rays > 0 {
+		let mut prev: Vec<Option<Vec<[f32; 4]>>> = vec![None; charts.len()];
 		for &i in &order {
-			pass.push(baked.gather_chart(&scene, i, &mut rng));
+			prev[i] = Some(baked.chart_values(i));
 		}
-		for (&i, values) in order.iter().zip(&pass) {
-			baked.add_values(i, values);
+		let direct = prev.clone();
+		for pass in 0..config.bounces.max(1) {
+			let hits = pass < config.bounces;
+			let mut added: Vec<Option<Vec<[f32; 4]>>> = vec![None; charts.len()];
+			for &i in &order {
+				added[i] =
+					Some(
+						baked.gather_chart(&scene, i, &mut rng, pass == 0, |hit, c, q| {
+							match &prev[hit] {
+								Some(v) if hits => sample_grid(c, q, |x, y| v[(y * c.rect.w + x) as usize]),
+								_ => Vec3::ZERO,
+							}
+						}),
+					);
+			}
+			for &i in &order {
+				baked.add_values(i, added[i].as_ref().unwrap());
+			}
+			prev = added;
 		}
+		baked.smooth(&direct);
 	}
 	Ok(baked)
 }
 
-/// The empty [`Baked`] with every nondegenerate triangle's chart packed,
-/// tallest first so the shelf packer's rows stay shallow, plus the packed
-/// triangle order. The CPU bake and the GPU bake share this setup, so both
-/// place charts identically.
-fn packed(tris: &[Triangle], config: &Config) -> Result<(Baked, Vec<usize>), String> {
+/// The empty [`Baked`] with every live chart packed, tallest first so the
+/// shelf packer's rows stay shallow, plus the packed chart order. The CPU
+/// bake and the GPU bake share this setup, so both place charts identically.
+fn packed(
+	tris: &[Triangle],
+	charts: &[ChartSpec],
+	tri_chart: &[u32],
+	config: &Config,
+) -> Result<(Baked, Vec<usize>), String> {
 	let side = config.atlas_size;
+	let ranges = tri_chart_ranges(tri_chart, charts.len())?;
 	let mut baked = Baked {
 		config: config.clone(),
 		side,
 		texels: vec![[0.0; 4]; (side * side) as usize],
-		charts: vec![None; tris.len()],
+		charts: vec![None; charts.len()],
+		tri_chart: tri_chart.to_vec(),
 		packer: Packer::new(side),
 	};
-	let mut order: Vec<usize> = (0..tris.len())
-		.filter(|&i| area(&tris[i]) > 1e-12)
-		.collect();
-	let size_of = |i: usize| chart_size(config, &tris[i]);
+	// A chart is live when it has triangles and any of them has area; the
+	// rest never sample.
+	let alive = |i: usize| -> bool {
+		let (first, count) = ranges[i];
+		count > 0
+			&& tris[first as usize..(first + count) as usize]
+				.iter()
+				.any(|t| area(t) > 1e-12)
+			&& charts[i].w > 0
+			&& charts[i].h > 0
+	};
+	let mut order: Vec<usize> = (0..charts.len()).filter(|&i| alive(i)).collect();
 	order.sort_by(|&a, &b| {
-		size_of(b)
-			.1
-			.cmp(&size_of(a).1)
-			.then(size_of(b).0.cmp(&size_of(a).0))
+		charts[b]
+			.h
+			.cmp(&charts[a].h)
+			.then(charts[b].w.cmp(&charts[a].w))
 	});
 	for &i in &order {
-		baked.add_chart(tris, i)?;
+		baked.add_chart(i, &charts[i])?;
 	}
 	Ok((baked, order))
+}
+
+/// Each chart's triangles as `(first, count)` into the soup, so a chart
+/// covers one contiguous run of triangles — the fan order every caller
+/// builds its soup in. `Err` when an index is out of range or a chart's
+/// triangles are not contiguous.
+fn tri_chart_ranges(tri_chart: &[u32], charts: usize) -> Result<Vec<(u32, u32)>, String> {
+	let mut out = vec![(0u32, 0u32); charts];
+	for (i, &c) in tri_chart.iter().enumerate() {
+		let Some(slot) = out.get_mut(c as usize) else {
+			return Err(format!("triangle {i} claims chart {c} of {charts}"));
+		};
+		if slot.1 == 0 {
+			*slot = (i as u32, 1);
+		} else if slot.0 + slot.1 == i as u32 {
+			slot.1 += 1;
+		} else {
+			return Err(format!(
+				"chart {c}'s triangles are not contiguous: {i} follows {}",
+				slot.0 + slot.1 - 1
+			));
+		}
+	}
+	Ok(out)
 }
 
 impl Baked {
@@ -292,58 +463,54 @@ impl Baked {
 		(self.side, &self.texels)
 	}
 
-	/// How many triangles hold a chart.
+	/// How many surfaces hold a chart.
 	pub fn charts(&self) -> usize {
 		self.charts.iter().filter(|c| c.is_some()).count()
 	}
 
-	/// Triangle `tri`'s atlas mapping, `None` for degenerate triangles.
-	pub fn chart(&self, tri: usize) -> Option<ChartView> {
-		let c = self.charts[tri].as_ref()?;
+	/// Surface `chart`'s atlas mapping, `None` for surfaces without one —
+	/// past the bake's last surface too, as geometry added since has none.
+	pub fn chart(&self, chart: usize) -> Option<ChartView> {
+		let c = self.charts.get(chart)?.as_ref()?;
 		Some(ChartView {
-			u: c.u,
-			v: c.v,
-			axis: c.axis,
-			plane: c.plane,
-			u_min: c.u_min,
-			v_min: c.v_min,
-			units: self.config.units_per_texel,
+			origin: c.spec.origin,
+			u: c.spec.u,
+			v: c.spec.v,
+			n: c.spec.n,
 			rect: c.rect,
 		})
 	}
 
-	/// Normalized atlas coordinates of world point `p` on triangle `tri`,
+	/// Normalized atlas coordinates of world point `p` on surface `chart`,
 	/// clamped into its chart, at texel centers.
-	pub fn uv(&self, tri: usize, p: Vec3) -> Option<[f32; 2]> {
-		let c = self.charts[tri].as_ref()?;
-		let units = self.config.units_per_texel;
-		let at = |axis: Vec3, min: f32, span: u32| {
-			((p.dot(axis) - min) / units - 0.5).clamp(0.0, span as f32 - 1.0)
-		};
-		let i = at(c.u, c.u_min, c.rect.w);
-		let j = at(c.v, c.v_min, c.rect.h);
+	pub fn uv(&self, chart: usize, p: Vec3) -> Option<[f32; 2]> {
+		let c = self.charts[chart].as_ref()?;
+		let (g_u, g_v) = c.grads();
+		let rel = p - c.spec.origin;
+		let (x, y) = (
+			g_u.dot(rel).clamp(0.0, c.rect.w as f32 - 1.0),
+			g_v.dot(rel).clamp(0.0, c.rect.h as f32 - 1.0),
+		);
 		Some([
-			(c.rect.x as f32 + i + 0.5) / self.side as f32,
-			(c.rect.y as f32 + j + 0.5) / self.side as f32,
+			(c.rect.x as f32 + x + 0.5) / self.side as f32,
+			(c.rect.y as f32 + y + 0.5) / self.side as f32,
 		])
 	}
 
-	/// The triangle under world point `p` and its baked light there, `None`
+	/// The chart under world point `p` and its baked light there, `None`
 	/// away from every surface. A CPU query for gameplay lighting; the shader
 	/// samples the atlas directly.
 	pub fn at(&self, p: Vec3) -> Option<(usize, Vec3)> {
-		let units = self.config.units_per_texel;
-		for (i, c) in self.charts.iter().enumerate() {
-			let Some(c) = c else { continue };
-			if (p.dot(c.axis) - c.plane).abs() > units * 0.75 {
+		for (i, chart) in self.charts.iter().enumerate() {
+			let Some(c) = chart else { continue };
+			let tol = 0.75 * c.spec.u.length().min(c.spec.v.length());
+			if (p - c.spec.origin).dot(c.spec.n).abs() > tol {
 				continue;
 			}
-			let (uu, vv) = (p.dot(c.u), p.dot(c.v));
-			let (u1, v1) = (
-				c.u_min + c.rect.w as f32 * units,
-				c.v_min + c.rect.h as f32 * units,
-			);
-			if uu < c.u_min || uu > u1 || vv < c.v_min || vv > v1 {
+			let (g_u, g_v) = c.grads();
+			let rel = p - c.spec.origin;
+			let (x, y) = (g_u.dot(rel), g_v.dot(rel));
+			if x < 0.0 || x > c.rect.w as f32 - 1.0 || y < 0.0 || y > c.rect.h as f32 - 1.0 {
 				continue;
 			}
 			return Some((i, self.chart_sample(c, p)));
@@ -351,14 +518,17 @@ impl Baked {
 		None
 	}
 
-	/// Rebakes after geometry edits: `changed` lists every triangle index that
-	/// was created, moved, destroyed (replaced by a zero-area triangle) or
-	/// appended to the soup. Returns the atlas rectangles that changed, for
+	/// Rebakes after geometry edits: `changed` lists every triangle index
+	/// that was created, moved, destroyed (replaced by a zero-area triangle)
+	/// or appended to the soup, with `charts` and `tri_chart` recomputed for
+	/// the edited level. Returns the atlas rectangles that changed, for
 	/// partial texture uploads. See the crate docs for the index contract.
 	pub fn update(
 		&mut self,
 		tris: &[Triangle],
 		albedo: &[Vec3],
+		charts: &[ChartSpec],
+		tri_chart: &[u32],
 		changed: &[usize],
 	) -> Result<Vec<Rect>, String> {
 		if tris.len() != albedo.len() {
@@ -368,7 +538,16 @@ impl Baked {
 				albedo.len()
 			));
 		}
-		self.charts.resize(tris.len(), None);
+		if tris.len() != tri_chart.len() {
+			return Err(format!(
+				"{} triangles but {} chart indices",
+				tris.len(),
+				tri_chart.len()
+			));
+		}
+		let chart_tris = tri_chart_ranges(tri_chart, charts.len())?;
+		self.charts.resize(charts.len(), None);
+		self.tri_chart = tri_chart.to_vec();
 		let mut changed: Vec<usize> = changed
 			.iter()
 			.copied()
@@ -383,28 +562,42 @@ impl Baked {
 			albedo,
 			bvh: &bvh,
 			span,
+			chart_tris: &chart_tris,
+			units: self.config.units_per_texel,
 		};
 		let mut rng = self.config.seed.wrapping_mul(2_025_617).wrapping_add(1);
 
-		// Charts of destroyed triangles go black; created ones get packed.
+		// The surfaces the edit touched: alive ones rebake, dead ones free
+		// their chart. A surface dies when every triangle of it did.
+		let mut touched = Vec::new();
+		for &i in &changed {
+			let c = tri_chart[i] as usize;
+			if !touched.contains(&c) {
+				touched.push(c);
+			}
+		}
 		let mut rects = Vec::new();
 		let mut rebuild = Vec::new();
-		for &i in &changed {
-			if area(&tris[i]) > 1e-12 {
-				if self.charts[i].is_none() {
-					self.add_chart(tris, i)?;
+		for &c in &touched {
+			let (first, count) = chart_tris[c];
+			let alive = tris[first as usize..(first + count) as usize]
+				.iter()
+				.any(|t| area(t) > 1e-12);
+			if alive {
+				if self.charts[c].is_none() {
+					self.add_chart(c, &charts[c])?;
 				}
-				rebuild.push(i);
-			} else if let Some(c) = self.charts[i].take() {
-				self.clear_rect(&c.rect);
-				rects.push(c.rect.grown(self.side));
+				rebuild.push(c);
+			} else if let Some(chart) = self.charts[c].take() {
+				self.clear_rect(&chart.rect);
+				rects.push(chart.rect.grown(self.side));
 			}
 		}
 		// Sun visibility recorded per texel names the triangle that shadowed
 		// it; destroying or moving that one unshadows or reshadows the texel.
 		// The per-chart occluder sets do the same for light rays.
-		for (i, c) in self.charts.iter().enumerate() {
-			let Some(c) = c else { continue };
+		for (i, chart) in self.charts.iter().enumerate() {
+			let Some(c) = chart else { continue };
 			if !rebuild.contains(&i)
 				&& (c
 					.shadow
@@ -442,9 +635,9 @@ impl Baked {
 				}
 				sweeps.push((s_lo, s_hi));
 			}
-			for (j, c) in self.charts.iter().enumerate() {
-				let Some(c) = c else { continue };
-				let (a, b) = c.bounds(self.config.units_per_texel);
+			for (j, chart) in self.charts.iter().enumerate() {
+				let Some(c) = chart else { continue };
+				let (a, b) = c.bounds();
 				if sweeps.iter().any(|&(sw_lo, sw_hi)| {
 					a.x <= sw_hi.x
 						&& b.x >= sw_lo.x
@@ -461,18 +654,18 @@ impl Baked {
 		rebuild.sort_unstable();
 		rebuild.dedup();
 		for &i in &rebuild {
-			self.bake_chart(&scene, i, &mut rng, self.config.bounces > 0);
+			self.bake_chart(&scene, i, &mut rng, true);
 			let rect = self.charts[i].as_ref().unwrap().rect;
 			rects.push(rect.grown(self.side));
 		}
 		Ok(rects)
 	}
 
-	/// Direct sun, sky and point lights at one surface point: `S`, sun
+	/// Direct sun and point lights at one surface point: `S`, sun
 	/// visibility, the triangle that shadowed the sun ray, and every triangle
-	/// that blocked a light ray. The sky hemisphere lands even where the sun
-	/// cannot, so walls facing away from it keep their fill instead of going
-	/// black.
+	/// that blocked a light ray. The sky comes from the gather rays; only a
+	/// config without any adds the open hemisphere around `n` here, so walls
+	/// facing away from the sun keep their fill either way.
 	fn direct(
 		&self,
 		s: &Scene,
@@ -481,7 +674,11 @@ impl Baked {
 		lights: &[&Light],
 	) -> ([f32; 3], f32, u32, Vec<u32>) {
 		let c = &self.config;
-		let mut out = c.ground_color.lerp(c.sky_color, n.y * 0.5 + 0.5);
+		let mut out = if c.rays == 0 {
+			c.ground_color.lerp(c.sky_color, n.y * 0.5 + 0.5)
+		} else {
+			Vec3::ZERO
+		};
 		let mut vis = 1.0;
 		let mut shadow = NO_SHADOW;
 		let n_l = n.dot(c.sun_dir).max(0.0);
@@ -505,56 +702,65 @@ impl Baked {
 		([out.x, out.y, out.z], vis, shadow, occluders)
 	}
 
-	/// One bounce of indirect light gathered at every texel of chart `tri`,
-	/// reading the atlas as it stands.
-	fn gather_chart(&self, s: &Scene, tri: usize, rng: &mut u32) -> Vec<[f32; 4]> {
+	/// The light gathered at every texel of chart `chart` by cosine-
+	/// distributed rays: a ray that escapes the level brings the sky when
+	/// `sky`, one that hits a surface brings its albedo times
+	/// `light(chart, view, point)`, the light the gather carries on from
+	/// there.
+	fn gather_chart(
+		&self,
+		s: &Scene,
+		chart: usize,
+		rng: &mut u32,
+		sky: bool,
+		light: impl Fn(usize, &Chart, Vec3) -> Vec3,
+	) -> Vec<[f32; 4]> {
 		let c = &self.config;
-		let chart = self.charts[tri].as_ref().unwrap();
-		let t = &s.tris[tri];
-		let n = triangle_normal(t);
-		let mut out = vec![[0.0f32; 4]; (chart.rect.w * chart.rect.h) as usize];
+		let chart_ref = self.charts[chart].as_ref().unwrap();
+		let n = chart_ref.spec.n;
+		let mut out = vec![[0.0f32; 4]; (chart_ref.rect.w * chart_ref.rect.h) as usize];
 		if c.rays == 0 {
 			return out;
 		}
-		for j in 0..chart.rect.h {
-			for i in 0..chart.rect.w {
-				let p = bvh::closest_point(chart.world(i, j, c.units_per_texel), t);
+		for j in 0..chart_ref.rect.h {
+			for i in 0..chart_ref.rect.w {
+				let p = face_point(s, s.chart_tris[chart], chart_ref.world(i, j));
 				let mut sum = Vec3::ZERO;
 				for _ in 0..c.rays {
 					let d = cosine(n, rng);
 					let o = p + n * OFFSET;
-					let lo = match s.bvh.cast(s.tris, o, d, s.span) {
+					sum += match s.bvh.cast(s.tris, o, d, s.span) {
 						Some((hit, at)) => {
-							let q = o + d * at;
-							self.charts[hit]
+							let h = self.tri_chart[hit] as usize;
+							self.charts[h]
 								.as_ref()
-								.map(|h| mul(s.albedo[hit], self.chart_sample(h, q)))
+								.map(|view| mul(s.albedo[hit], light(h, view, o + d * at)))
 								.unwrap_or_default()
 						}
-						None => c.ground_color.lerp(c.sky_color, d.y * 0.5 + 0.5),
+						None if sky => c.ground_color.lerp(c.sky_color, d.y * 0.5 + 0.5),
+						None => Vec3::ZERO,
 					};
-					sum += lo;
 				}
 				let mean = sum / c.rays as f32;
-				out[(j * chart.rect.w + i) as usize] = [mean.x, mean.y, mean.z, 0.0];
+				out[(j * chart_ref.rect.w + i) as usize] = [mean.x, mean.y, mean.z, 0.0];
 			}
 		}
 		out
 	}
 
-	/// Bakes chart `tri` in place: direct sun, sky, point lights, and
-	/// optionally one gathered bounce, plus the shadow table.
-	fn bake_chart(&mut self, s: &Scene, tri: usize, rng: &mut u32, gather: bool) {
-		let units = self.config.units_per_texel;
-		let (values, indirect, shadow, occluders) = {
+	/// Bakes chart `chart` in place: direct sun and point lights, plus the
+	/// shadow table, and with `gather` the sky and one bounce of the atlas
+	/// as it stands — every order of light it holds at once, the closest a
+	/// lone chart's rebake comes to the full bake's passes.
+	fn bake_chart(&mut self, s: &Scene, chart: usize, rng: &mut u32, gather: bool) {
+		let (mut values, shadow, occluders) = {
 			let c = &self.config;
-			let chart = self.charts[tri].as_ref().unwrap();
-			let t = &s.tris[tri];
-			let n = triangle_normal(t);
-			let count = (chart.rect.w * chart.rect.h) as usize;
+			let chart_ref = self.charts[chart].as_ref().unwrap();
+			let n = chart_ref.spec.n;
+			let count = (chart_ref.rect.w * chart_ref.rect.h) as usize;
 			// Only lights that can reach the chart's bounds are raycast per
 			// texel; the rest are out of range for every texel of it.
-			let (lo, hi) = chart.bounds(units);
+			let (lo, hi) = chart_ref.bounds();
 			let near: Vec<&Light> = c
 				.lights
 				.iter()
@@ -564,60 +770,62 @@ impl Baked {
 				})
 				.collect();
 			let mut values = vec![[0.0f32; 4]; count];
-			let mut indirect = vec![[0.0f32; 3]; count];
 			let mut shadow = vec![NO_SHADOW; count];
 			let mut occluders = Vec::new();
-			for j in 0..chart.rect.h {
-				for i in 0..chart.rect.w {
-					let k = (j * chart.rect.w + i) as usize;
-					let p = bvh::closest_point(chart.world(i, j, units), t);
+			for j in 0..chart_ref.rect.h {
+				for i in 0..chart_ref.rect.w {
+					let k = (j * chart_ref.rect.w + i) as usize;
+					let p = face_point(s, s.chart_tris[chart], chart_ref.world(i, j));
 					let (light, vis, sh, mut blocked) = self.direct(s, p, n, &near);
 					occluders.append(&mut blocked);
 					shadow[k] = sh;
-					if gather && c.rays > 0 {
-						let mut sum = Vec3::ZERO;
-						for _ in 0..c.rays {
-							let d = cosine(n, rng);
-							let o = p + n * OFFSET;
-							let lo = match s.bvh.cast(s.tris, o, d, s.span) {
-								Some((hit, at)) => {
-									let q = o + d * at;
-									self.charts[hit]
-										.as_ref()
-										.map(|h| mul(s.albedo[hit], self.chart_sample(h, q)))
-										.unwrap_or_default()
-								}
-								None => c.ground_color.lerp(c.sky_color, d.y * 0.5 + 0.5),
-							};
-							sum += lo;
-						}
-						let mean = sum / c.rays as f32;
-						indirect[k] = [mean.x, mean.y, mean.z];
-					}
 					values[k] = [light[0], light[1], light[2], vis];
 				}
 			}
 			occluders.sort_unstable();
 			occluders.dedup();
-			(values, indirect, shadow, occluders)
+			(values, shadow, occluders)
 		};
-		let mut values = values;
 		if gather {
+			let bounce = self.config.bounces > 0;
+			let indirect = self.gather_chart(s, chart, rng, true, |_, c, q| {
+				if bounce {
+					self.chart_sample(c, q)
+				} else {
+					Vec3::ZERO
+				}
+			});
 			for (v, g) in values.iter_mut().zip(&indirect) {
 				v[0] += g[0];
 				v[1] += g[1];
 				v[2] += g[2];
 			}
 		}
-		self.commit(tri, &values, &shadow, &occluders);
+		self.commit(chart, &values, &shadow, &occluders);
+	}
+
+	/// Chart `chart`'s texels as the atlas holds them, row major, gutter
+	/// aside.
+	fn chart_values(&self, chart: usize) -> Vec<[f32; 4]> {
+		let rect = self.charts[chart].as_ref().unwrap().rect;
+		(0..rect.h)
+			.flat_map(|j| (0..rect.w).map(move |i| (i, j)))
+			.map(|(i, j)| self.texels[((rect.y + j) * self.side + rect.x + i) as usize])
+			.collect()
 	}
 
 	/// Writes a chart's values and shadow table to the atlas, duplicating its
 	/// edges into the gutter so bilinear filtering stays inside the chart.
-	fn commit(&mut self, tri: usize, values: &[[f32; 4]], shadow: &[u32], occluders: &[u32]) {
-		let rect = self.charts[tri].as_ref().unwrap().rect;
-		self.charts[tri].as_mut().unwrap().shadow = shadow.to_vec();
-		self.charts[tri].as_mut().unwrap().occluders = occluders.to_vec();
+	fn commit(&mut self, chart: usize, values: &[[f32; 4]], shadow: &[u32], occluders: &[u32]) {
+		self.charts[chart].as_mut().unwrap().shadow = shadow.to_vec();
+		self.charts[chart].as_mut().unwrap().occluders = occluders.to_vec();
+		self.write_values(chart, values);
+	}
+
+	/// Writes a chart's values to the atlas, duplicating its edges into the
+	/// gutter.
+	fn write_values(&mut self, chart: usize, values: &[[f32; 4]]) {
+		let rect = self.charts[chart].as_ref().unwrap().rect;
 		for j in 0..rect.h {
 			for i in 0..rect.w {
 				let v = values[(j * rect.w + i) as usize];
@@ -637,9 +845,102 @@ impl Baked {
 		}
 	}
 
+	/// Smooths the gathered light — what each chart's texels hold past
+	/// `direct`, its direct values — with a Gaussian over the texels near
+	/// each one in the world on the same plane, whichever chart holds them,
+	/// so neighbouring surfaces share one smooth field instead of each
+	/// carrying its own noise. Direct light and sun visibility stay as
+	/// they are.
+	fn smooth(&mut self, direct: &[Option<Vec<[f32; 4]>>]) {
+		let units = self.config.units_per_texel;
+		let radius = SMOOTH_TEXELS * units;
+		// Every texel's world point, normal and gathered light, bucketed
+		// by a grid one radius wide so the neighbours are in the 27 cells
+		// around a texel's own.
+		struct Texel {
+			p: Vec3,
+			n: Vec3,
+			gathered: Vec3,
+		}
+		let mut texels = Vec::new();
+		let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>> = Default::default();
+		let cell = |p: Vec3| {
+			(
+				(p.x / radius).floor() as i32,
+				(p.y / radius).floor() as i32,
+				(p.z / radius).floor() as i32,
+			)
+		};
+		for (k, chart) in self.charts.iter().enumerate() {
+			let (Some(c), Some(d)) = (chart, &direct[k]) else {
+				continue;
+			};
+			let rect = c.rect;
+			for j in 0..rect.h {
+				for i in 0..rect.w {
+					let total = self.texels[((rect.y + j) * self.side + rect.x + i) as usize];
+					let d = d[(j * rect.w + i) as usize];
+					let p = c.world(i, j);
+					cells.entry(cell(p)).or_default().push(texels.len() as u32);
+					texels.push(Texel {
+						p,
+						n: c.spec.n,
+						gathered: vec3(total[0] - d[0], total[1] - d[1], total[2] - d[2]),
+					});
+				}
+			}
+		}
+		let sigma2 = (radius * 0.5) * (radius * 0.5);
+		let smoothed: Vec<Vec3> = texels
+			.iter()
+			.map(|t| {
+				let (cx, cy, cz) = cell(t.p);
+				let (mut sum, mut weight) = (Vec3::ZERO, 0.0);
+				for dz in -1..=1 {
+					for dy in -1..=1 {
+						for dx in -1..=1 {
+							let Some(near) = cells.get(&(cx + dx, cy + dy, cz + dz)) else {
+								continue;
+							};
+							for &o in near {
+								let o = &texels[o as usize];
+								let rel = o.p - t.p;
+								let d2 = rel.length2();
+								// Only the same plane: facing alike, and off
+								// it by less than a quarter texel.
+								if d2 > radius * radius || t.n.dot(o.n) < 0.9 || rel.dot(t.n).abs() > units * 0.25 {
+									continue;
+								}
+								let w = (-d2 / (2.0 * sigma2)).exp();
+								sum += o.gathered * w;
+								weight += w;
+							}
+						}
+					}
+				}
+				// A texel always counts itself, so the weight never vanishes.
+				sum / weight
+			})
+			.collect();
+		let mut at = 0;
+		for (k, dk) in direct.iter().enumerate() {
+			let (Some(c), Some(d)) = (&self.charts[k], dk) else {
+				continue;
+			};
+			let values: Vec<[f32; 4]> = d
+				.iter()
+				.zip(&smoothed[at..at + d.len()])
+				.map(|(d, g)| [d[0] + g.x, d[1] + g.y, d[2] + g.z, d[3]])
+				.collect();
+			debug_assert_eq!(d.len(), (c.rect.w * c.rect.h) as usize);
+			at += d.len();
+			self.write_values(k, &values);
+		}
+	}
+
 	/// Adds gathered values to a chart's texels, gutters included.
-	fn add_values(&mut self, tri: usize, values: &[[f32; 4]]) {
-		let rect = self.charts[tri].as_ref().unwrap().rect;
+	fn add_values(&mut self, chart: usize, values: &[[f32; 4]]) {
+		let rect = self.charts[chart].as_ref().unwrap().rect;
 		for j in 0..rect.h {
 			for i in 0..rect.w {
 				let v = values[(j * rect.w + i) as usize];
@@ -670,28 +971,23 @@ impl Baked {
 		}
 	}
 
-	/// Packs and stores triangle `i`'s chart.
-	fn add_chart(&mut self, tris: &[Triangle], i: usize) -> Result<(), String> {
-		let (w, h) = chart_size(&self.config, &tris[i]);
-		let Some((x, y)) = self.packer.place(w, h) else {
+	/// Packs and stores chart `chart`, as the caller's spec places it.
+	fn add_chart(&mut self, chart: usize, spec: &ChartSpec) -> Result<(), String> {
+		let Some((x, y)) = self.packer.place(spec.w, spec.h) else {
 			return Err(format!(
-				"atlas {}×{} full: triangle {i} needs a {}×{} chart",
-				self.side, self.side, w, h
+				"atlas {}×{} full: chart {chart} needs a {}×{} rectangle",
+				self.side, self.side, spec.w, spec.h
 			));
 		};
-		let t = &tris[i];
-		let (u, v, axis) = dominant(triangle_normal(t));
-		let us = [t[0].dot(u), t[1].dot(u), t[2].dot(u)];
-		let vs = [t[0].dot(v), t[1].dot(v), t[2].dot(v)];
-		self.charts[i] = Some(Chart {
-			rect: Rect { x, y, w, h },
-			u,
-			v,
-			axis,
-			plane: t[0].dot(axis),
-			u_min: us[0].min(us[1]).min(us[2]),
-			v_min: vs[0].min(vs[1]).min(vs[2]),
-			shadow: vec![NO_SHADOW; (w * h) as usize],
+		self.charts[chart] = Some(Chart {
+			rect: Rect {
+				x,
+				y,
+				w: spec.w,
+				h: spec.h,
+			},
+			spec: *spec,
+			shadow: vec![NO_SHADOW; (spec.w * spec.h) as usize],
 			occluders: Vec::new(),
 		});
 		Ok(())
@@ -699,38 +995,16 @@ impl Baked {
 
 	/// Bilinear sample of the atlas at world point `p` as seen by chart `c`.
 	fn chart_sample(&self, c: &Chart, p: Vec3) -> Vec3 {
-		let units = self.config.units_per_texel;
-		let at = |axis: Vec3, min: f32| (p.dot(axis) - min) / units - 0.5;
-		let (x, y) = (
-			at(c.u, c.u_min).clamp(0.0, c.rect.w as f32 - 1.0),
-			at(c.v, c.v_min).clamp(0.0, c.rect.h as f32 - 1.0),
-		);
-		let (x0, y0) = (x.floor(), y.floor());
-		let (tx, ty) = (x - x0, y - y0);
-		let (x1, y1) = (
-			(x0 + 1.0).min(c.rect.w as f32 - 1.0),
-			(y0 + 1.0).min(c.rect.h as f32 - 1.0),
-		);
-		let texel = |i: f32, j: f32| {
-			let (a, b) = (c.rect.x as f32 + i, c.rect.y as f32 + j);
-			self.texels[(b as u32 * self.side + a as u32) as usize]
-		};
-		let row = |j: f32| {
-			let (p, q) = (texel(x0, j), texel(x1, j));
-			vec3(
-				p[0] + (q[0] - p[0]) * tx,
-				p[1] + (q[1] - p[1]) * tx,
-				p[2] + (q[2] - p[2]) * tx,
-			)
-		};
-		row(y0).lerp(row(y1), ty)
+		sample_grid(c, p, |i, j| {
+			self.texels[((c.rect.y + j) * self.side + c.rect.x + i) as usize]
+		})
 	}
 
 	/// The bake as bytes for a cache file: the atlas, every chart with its
-	/// shadow table, and the packer cursor, tagged with `key`, the caller's
-	/// identity for the level and config baked. Atlas texels store rounded
-	/// f16 — half the bytes, error below one part in two thousand, past what
-	/// a tone mapped lightmap shows.
+	/// shadow table, the triangle-to-chart map, and the packer cursor, tagged
+	/// with `key`, the caller's identity for the level and config baked.
+	/// Atlas texels store rounded f16 — half the bytes, error below one part
+	/// in two thousand, past what a tone mapped lightmap shows.
 	pub fn to_bytes(&self, key: [u8; 16]) -> Vec<u8> {
 		let mut out = Vec::with_capacity(48 + self.texels.len() * 8);
 		out.extend_from_slice(CACHE_MAGIC);
@@ -757,13 +1031,10 @@ impl Baked {
 			for v in [x, y, w, h] {
 				out.extend_from_slice(&v.to_le_bytes());
 			}
-			for v in [c.u, c.v, c.axis] {
+			for v in [c.spec.origin, c.spec.u, c.spec.v, c.spec.n] {
 				for k in [v.x, v.y, v.z] {
 					out.extend_from_slice(&k.to_bits().to_le_bytes());
 				}
-			}
-			for v in [c.plane, c.u_min, c.v_min] {
-				out.extend_from_slice(&v.to_bits().to_le_bytes());
 			}
 			out.extend_from_slice(&(c.shadow.len() as u64).to_le_bytes());
 			for s in &c.shadow {
@@ -773,6 +1044,10 @@ impl Baked {
 			for s in &c.occluders {
 				out.extend_from_slice(&s.to_le_bytes());
 			}
+		}
+		out.extend_from_slice(&(self.tri_chart.len() as u64).to_le_bytes());
+		for c in &self.tri_chart {
+			out.extend_from_slice(&c.to_le_bytes());
 		}
 		out
 	}
@@ -825,16 +1100,18 @@ impl Baked {
 				h: read.u32("chart h")?,
 			};
 			let vec = |read: &mut Read| -> Result<Vec3, String> {
-				Ok(vec3(read.f32("u")?, read.f32("v")?, read.f32("axis")?))
+				Ok(vec3(read.f32("x")?, read.f32("y")?, read.f32("z")?))
 			};
 			out.push(Some(Chart {
 				rect,
-				u: vec(&mut read)?,
-				v: vec(&mut read)?,
-				axis: vec(&mut read)?,
-				plane: read.f32("plane")?,
-				u_min: read.f32("u_min")?,
-				v_min: read.f32("v_min")?,
+				spec: ChartSpec {
+					origin: vec(&mut read)?,
+					u: vec(&mut read)?,
+					v: vec(&mut read)?,
+					n: vec(&mut read)?,
+					w: rect.w,
+					h: rect.h,
+				},
 				shadow: {
 					let n = read.u64("shadow count")?;
 					if n > read.remaining() / 4 {
@@ -855,6 +1132,18 @@ impl Baked {
 				},
 			}));
 		}
+		let tri_count = read.u64("chart index count")?;
+		if tri_count > read.remaining() / 4 {
+			return Err("truncated cache: chart index table".into());
+		}
+		let tri_chart = (0..tri_count)
+			.map(|_| read.u32("chart index"))
+			.collect::<Result<Vec<_>, _>>()?;
+		for (i, &c) in tri_chart.iter().enumerate() {
+			if c as usize >= out.len() {
+				return Err(format!("triangle {i} claims chart {c} of {}", out.len()));
+			}
+		}
 		if read.at != bytes.len() {
 			return Err("trailing bytes in lightbake cache".into());
 		}
@@ -863,13 +1152,14 @@ impl Baked {
 			side,
 			texels,
 			charts: out,
+			tri_chart,
 			packer,
 		})
 	}
 }
 
 /// The cache file's signature; the digit is the format version.
-const CACHE_MAGIC: &[u8] = b"lightbake-cache-2\n";
+const CACHE_MAGIC: &[u8] = b"lightbake-cache-7\n";
 /// Largest atlas side a cache may claim, so a corrupt length cannot ask for a
 /// wild allocation before the bytes run out.
 const CACHE_MAX_SIDE: u32 = 16384;
@@ -1043,7 +1333,7 @@ impl Read<'_> {
 /// Rounded f16 bits of `v`: half the bytes for a cache, every value within
 /// one part in two thousand of the f32 it came from. Light smaller than an
 /// f16's smallest subnormal is black anyway.
-fn f16_bits(v: f32) -> u16 {
+pub fn f16_bits(v: f32) -> u16 {
 	let bits = v.to_bits();
 	let sign = ((bits >> 16) & 0x8000) as u16;
 	if v.is_nan() {
@@ -1080,9 +1370,75 @@ fn f32_from(h: u16) -> f32 {
 	f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (mant << 13))
 }
 
+/// Bilinear sample at world point `p` of chart `c`'s grid, whose texel
+/// `(i, j)` `texel` reads: the atlas, or a pass's values for the chart
+/// alone.
+fn sample_grid(c: &Chart, p: Vec3, texel: impl Fn(u32, u32) -> [f32; 4]) -> Vec3 {
+	let (g_u, g_v) = c.grads();
+	let rel = p - c.spec.origin;
+	let (x, y) = (
+		g_u.dot(rel).clamp(0.0, c.rect.w as f32 - 1.0),
+		g_v.dot(rel).clamp(0.0, c.rect.h as f32 - 1.0),
+	);
+	let (x0, y0) = (x.floor(), y.floor());
+	let (tx, ty) = (x - x0, y - y0);
+	let (x1, y1) = (
+		(x0 + 1.0).min(c.rect.w as f32 - 1.0),
+		(y0 + 1.0).min(c.rect.h as f32 - 1.0),
+	);
+	let row = |j: f32| {
+		let (p, q) = (texel(x0 as u32, j as u32), texel(x1 as u32, j as u32));
+		vec3(
+			p[0] + (q[0] - p[0]) * tx,
+			p[1] + (q[1] - p[1]) * tx,
+			p[2] + (q[2] - p[2]) * tx,
+		)
+	};
+	row(y0).lerp(row(y1), ty)
+}
+
 /// Component-wise product, what a diffuse reflector does to arriving light.
 fn mul(a: Vec3, b: Vec3) -> Vec3 {
 	vec3(a.x * b.x, a.y * b.y, a.z * b.z)
+}
+
+/// The nearest point to `p` on the chart's own triangles, so texels the
+/// chart's rectangle places outside the surface clamp onto it — and then
+/// [`EDGE_INSET`] of a texel on into the triangle: a clamped point lies on the face's
+/// edge, in the plane of the face meeting it there, and rays cast from it
+/// along that face slip through it and light the corner from outside.
+fn face_point(s: &Scene, tris: (u32, u32), p: Vec3) -> Vec3 {
+	let mut best = p;
+	let mut best_d = f32::INFINITY;
+	let mut centroid = p;
+	for t in &s.tris[tris.0 as usize..(tris.0 + tris.1) as usize] {
+		let q = bvh::closest_point(p, t);
+		let d = (q - p).length2();
+		if d < best_d {
+			best_d = d;
+			best = q;
+			centroid = (t[0] + t[1] + t[2]) * (1.0 / 3.0);
+		}
+	}
+	inset(p, best, centroid, EDGE_INSET * s.units)
+}
+
+/// How far a texel clamped onto its face's edge is moved on into the face,
+/// in texels: a sixteenth, one unit on a GoldSrc luxel.
+const EDGE_INSET: f32 = 1.0 / 16.0;
+
+/// `q`, the face point nearest `p`, moved `by` world units toward its
+/// triangle's `centroid` when `p` lay off the face — never past halfway.
+fn inset(p: Vec3, q: Vec3, centroid: Vec3, by: f32) -> Vec3 {
+	if (q - p).length2() < 1e-6 {
+		return q;
+	}
+	let to = centroid - q;
+	let d = to.length();
+	if d < 1e-6 {
+		return q;
+	}
+	q + to * (by.min(d * 0.5) / d)
 }
 
 /// One light's diffuse radiance arriving at `p`, and the triangle that
@@ -1135,20 +1491,6 @@ fn dominant(n: Vec3) -> (Vec3, Vec3, Vec3) {
 	}
 }
 
-/// A triangle's chart size: its extent on the projection axes, at the baked
-/// density, never below `min_chart`.
-fn chart_size(config: &Config, t: &Triangle) -> (u32, u32) {
-	let (u, v, _) = dominant(triangle_normal(t));
-	let us = [t[0].dot(u), t[1].dot(u), t[2].dot(u)];
-	let vs = [t[0].dot(v), t[1].dot(v), t[2].dot(v)];
-	let extent = |c: [f32; 3]| {
-		(((c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])) / config.units_per_texel).ceil() as u32)
-			.max(config.min_chart)
-			.min(config.atlas_size - 1)
-	};
-	(extent(us), extent(vs))
-}
-
 /// A cosine-distributed direction around `n` from `rng`.
 fn cosine(n: Vec3, rng: &mut u32) -> Vec3 {
 	let (r1, r2) = (rand(rng), rand(rng));
@@ -1197,20 +1539,23 @@ mod tests {
 		}
 	}
 
-	/// Floor tiles and a 2-high slab standing on them at x in [4, 5], z in
-	/// [3, 4]. The sun slants toward +x, so the slab's shadow falls on the
-	/// floor at x in [2, 4], z in [3, 4]. Zero sky, zero bounces: every lit
-	/// texel is pure direct sun. Returns the slab's triangle indices.
+	/// Floor tiles and a 2-high slab standing on them at x = 4, z in
+	/// [2, 5]. The sun slants toward +x, so the slab's shadow falls on the
+	/// floor at x in [2, 4], z in [2, 5] — wider than the [3, 4] band the
+	/// tests read, so a neighbouring tile's chart, whose edge texels reach
+	/// into the band, reads shadow there too. Zero sky, zero bounces:
+	/// every lit texel is pure direct sun. Returns the slab's triangle
+	/// indices.
 	fn shadow_scene() -> (Vec<Triangle>, Vec<usize>) {
 		let mut tris = Vec::new();
 		floor_tiles(&mut tris, 8);
 		let slab = tris.len();
 		quad(
 			&mut tris,
-			vec3(4.0, 0.0, 3.0),
-			vec3(4.0, 2.0, 3.0),
-			vec3(4.0, 2.0, 4.0),
-			vec3(4.0, 0.0, 4.0),
+			vec3(4.0, 0.0, 2.0),
+			vec3(4.0, 2.0, 2.0),
+			vec3(4.0, 2.0, 5.0),
+			vec3(4.0, 0.0, 5.0),
 			vec3(1.0, 0.0, 0.0),
 		);
 		let count = tris.len();
@@ -1237,10 +1582,35 @@ mod tests {
 		vec![vec3(0.8, 0.8, 0.8); tris.len()]
 	}
 
+	/// One chart per triangle, the old default the convenience fit makes.
+	fn specs(tris: &[Triangle], config: &Config) -> Vec<ChartSpec> {
+		tris
+			.iter()
+			.map(|t| ChartSpec::fit_triangle(t, config))
+			.collect()
+	}
+
+	/// Every triangle its own chart, in soup order.
+	fn identity(n: usize) -> Vec<u32> {
+		(0..n as u32).collect()
+	}
+
+	/// The shadow_scene baked, one chart per triangle.
+	fn baked(tris: &[Triangle], config: &Config) -> Baked {
+		bake(
+			tris,
+			&white(tris),
+			&specs(tris, config),
+			&identity(tris.len()),
+			config,
+		)
+		.unwrap()
+	}
+
 	#[test]
 	fn charts_pack_without_overlap() {
 		let (tris, _) = shadow_scene();
-		let baked = bake(&tris, &white(&tris), &config()).unwrap();
+		let baked = baked(&tris, &config());
 		assert_eq!(baked.charts(), tris.len());
 		let rects: Vec<Rect> = (0..tris.len())
 			.filter_map(|i| baked.chart(i).map(|c| c.rect))
@@ -1260,7 +1630,7 @@ mod tests {
 	#[test]
 	fn sun_direct_hits_unshadowed_floor() {
 		let (tris, _) = shadow_scene();
-		let baked = bake(&tris, &white(&tris), &config()).unwrap();
+		let baked = baked(&tris, &config());
 		let (_, s) = baked.at(vec3(1.5, 0.0, 1.5)).unwrap();
 		let want = config().sun_dir.y / PI;
 		assert!(
@@ -1272,7 +1642,7 @@ mod tests {
 	#[test]
 	fn slab_shadows_the_floor_behind_it() {
 		let (tris, _) = shadow_scene();
-		let baked = bake(&tris, &white(&tris), &config()).unwrap();
+		let baked = baked(&tris, &config());
 		let (_, lit) = baked.at(vec3(6.5, 0.0, 3.5)).unwrap();
 		let (_, dark) = baked.at(vec3(3.5, 0.0, 3.5)).unwrap();
 		let want = config().sun_dir.y / PI;
@@ -1284,7 +1654,7 @@ mod tests {
 	fn destroying_the_slab_unshadows_rebaked_texels() {
 		let (tris, slab) = shadow_scene();
 		let config = config();
-		let mut baked = bake(&tris, &white(&tris), &config).unwrap();
+		let mut baked = baked(&tris, &config);
 		let (_, dark) = baked.at(vec3(3.5, 0.0, 3.5)).unwrap();
 		assert!(
 			dark.x < 1e-3,
@@ -1295,7 +1665,15 @@ mod tests {
 		for &i in &slab {
 			edited[i] = [vec3(0.0, -100.0, 0.0); 3];
 		}
-		let rects = baked.update(&edited, &white(&edited), &slab).unwrap();
+		let rects = baked
+			.update(
+				&edited,
+				&white(&edited),
+				&specs(&edited, &config),
+				&identity(edited.len()),
+				&slab,
+			)
+			.unwrap();
 		assert!(!rects.is_empty(), "destruction should dirty the atlas");
 		let (_, lit) = baked.at(vec3(3.5, 0.0, 3.5)).unwrap();
 		let want = config.sun_dir.y / PI;
@@ -1309,22 +1687,31 @@ mod tests {
 	fn adding_an_occluder_shadows_rebaked_texels() {
 		let mut tris = Vec::new();
 		floor_tiles(&mut tris, 8);
-		let mut baked = bake(&tris, &white(&tris), &config()).unwrap();
+		let config = config();
+		let mut baked = baked(&tris, &config);
 		let (_, lit) = baked.at(vec3(3.5, 0.0, 3.5)).unwrap();
-		let want = config().sun_dir.y / PI;
+		let want = config.sun_dir.y / PI;
 		assert!((lit.x - want).abs() < 1e-3, "floor starts lit: {lit:?}");
 		let slab = tris.len();
 		quad(
 			&mut tris,
-			vec3(4.0, 0.0, 3.0),
-			vec3(4.0, 2.0, 3.0),
-			vec3(4.0, 2.0, 4.0),
-			vec3(4.0, 0.0, 4.0),
+			vec3(4.0, 0.0, 2.0),
+			vec3(4.0, 2.0, 2.0),
+			vec3(4.0, 2.0, 5.0),
+			vec3(4.0, 0.0, 5.0),
 			vec3(1.0, 0.0, 0.0),
 		);
 		let albedo = white(&tris);
 		let changed = (slab..tris.len()).collect::<Vec<_>>();
-		let rects = baked.update(&tris, &albedo, &changed).unwrap();
+		let rects = baked
+			.update(
+				&tris,
+				&albedo,
+				&specs(&tris, &config),
+				&identity(tris.len()),
+				&changed,
+			)
+			.unwrap();
 		assert!(!rects.is_empty(), "the new chart should dirty the atlas");
 		let (_, dark) = baked.at(vec3(3.5, 0.0, 3.5)).unwrap();
 		assert!(dark.x < 1e-3, "new slab should shadow: {dark:?}");
@@ -1348,7 +1735,7 @@ mod tests {
 	#[test]
 	fn a_point_light_casts_a_shadow_behind_the_slab() {
 		let (tris, _) = shadow_scene();
-		let baked = bake(&tris, &white(&tris), &light_config()).unwrap();
+		let baked = baked(&tris, &light_config());
 		let (_, lit) = baked.at(vec3(3.5, 0.0, 3.5)).unwrap();
 		// The light one fade away at 45 degrees: the floor under it reads
 		// near the analytic value; `at` may claim a neighboring chart, so
@@ -1366,7 +1753,7 @@ mod tests {
 	fn destroying_the_slab_unshadows_the_point_light() {
 		let (tris, slab) = shadow_scene();
 		let config = light_config();
-		let mut baked = bake(&tris, &white(&tris), &config).unwrap();
+		let mut baked = baked(&tris, &config);
 		let (_, dark) = baked.at(vec3(6.5, 0.0, 3.5)).unwrap();
 		assert!(
 			dark.x < 1e-3,
@@ -1376,7 +1763,15 @@ mod tests {
 		for &i in &slab {
 			edited[i] = [vec3(0.0, -100.0, 0.0); 3];
 		}
-		baked.update(&edited, &white(&edited), &slab).unwrap();
+		baked
+			.update(
+				&edited,
+				&white(&edited),
+				&specs(&edited, &config),
+				&identity(edited.len()),
+				&slab,
+			)
+			.unwrap();
 		let (_, lit) = baked.at(vec3(6.5, 0.0, 3.5)).unwrap();
 		// Straight-line distance from the light, its fade and its cosine;
 		// `at` may claim a neighboring chart, so only the order of
@@ -1400,12 +1795,39 @@ mod tests {
 			fade: 12.0,
 			cone: Some((vec3(0.0, -1.0, 0.0), 30.0)),
 		}];
-		let baked = bake(&tris, &white(&tris), &config).unwrap();
+		let baked = baked(&tris, &config);
 		let (_, lit) = baked.at(vec3(3.5, 0.0, 3.5)).unwrap();
 		assert!(lit.x > 0.05, "cone center should be lit: {lit:?}");
 		// 45 degrees off the axis: outside a 30-degree cone.
 		let (_, dark) = baked.at(vec3(3.5, 0.0, 7.5)).unwrap();
 		assert!(dark.x < 1e-3, "outside the cone should be dark: {dark:?}");
+	}
+
+	#[test]
+	fn open_sky_lands_evenly_across_charts() {
+		// A floor of many small charts under nothing but sky, gathered with
+		// a handful of rays each: every texel's own estimate is noisy, but
+		// the smoothed field lands even across the chart borders.
+		let mut tris = Vec::new();
+		floor_tiles(&mut tris, 8);
+		let mut config = config();
+		config.sun_color = Vec3::ZERO;
+		config.sky_color = vec3(0.3, 0.3, 0.3);
+		config.rays = 4;
+		let baked = baked(&tris, &config);
+		let mut seen = Vec::new();
+		for x in 0..12 {
+			for z in 0..12 {
+				let p = vec3(2.0 + x as f32 * 0.33, 0.0, 2.0 + z as f32 * 0.33);
+				seen.push(baked.at(p).unwrap().1.x);
+			}
+		}
+		let mean = seen.iter().sum::<f32>() / seen.len() as f32;
+		// The cosine-weighted mean of `0.3 · (d.y · 0.5 + 0.5)` up the
+		// normal: 0.3 · (2/3 · 0.5 + 0.5).
+		assert!((mean - 0.25).abs() < 0.02, "mean sky {mean}");
+		let spread = seen.iter().map(|s| (s - mean).abs()).fold(0.0, f32::max);
+		assert!(spread < 0.02, "sky varies by {spread} around {mean}");
 	}
 
 	#[test]
@@ -1424,10 +1846,10 @@ mod tests {
 		);
 		let mut config = config();
 		config.bounces = 0;
-		let flat = bake(&tris, &white(&tris), &config).unwrap();
+		let flat = baked(&tris, &config);
 		config.bounces = 1;
 		config.rays = 64;
-		let bounced = bake(&tris, &white(&tris), &config).unwrap();
+		let bounced = baked(&tris, &config);
 		let (_, s) = flat.at(vec3(6.99, 2.0, 3.5)).unwrap();
 		let (_, t) = bounced.at(vec3(6.99, 2.0, 3.5)).unwrap();
 		assert!(s.x < 1e-3, "the sun misses the wall: {s:?}");
@@ -1437,15 +1859,15 @@ mod tests {
 	#[test]
 	fn uv_maps_chart_points_into_the_chart() {
 		let (tris, _) = shadow_scene();
-		let baked = bake(&tris, &white(&tris), &config()).unwrap();
+		let config = config();
+		let baked = baked(&tris, &config);
 		for (i, tri) in tris.iter().enumerate() {
 			let Some(view) = baked.chart(i) else { continue };
 			// The world point at the chart's middle, clamped onto the
 			// triangle, maps to atlas coordinates inside the chart.
-			let mid = |span: u32, min: f32| min + span as f32 * 0.5 * view.units;
-			let world = view.u * mid(view.rect.w, view.u_min)
-				+ view.v * mid(view.rect.h, view.v_min)
-				+ view.axis * view.plane;
+			let world = view.origin
+				+ view.u * ((view.rect.w - 1) as f32 * 0.5)
+				+ view.v * ((view.rect.h - 1) as f32 * 0.5);
 			let q = bvh::closest_point(world, tri);
 			let uv = baked.uv(i, q).unwrap();
 			assert!(
@@ -1466,8 +1888,9 @@ mod tests {
 	#[test]
 	fn same_seed_bakes_identically() {
 		let (tris, _) = shadow_scene();
-		let a = bake(&tris, &white(&tris), &config()).unwrap();
-		let b = bake(&tris, &white(&tris), &config()).unwrap();
+		let config = config();
+		let a = baked(&tris, &config);
+		let b = baked(&tris, &config);
 		assert_eq!(a.atlas().1, b.atlas().1);
 	}
 
@@ -1503,12 +1926,13 @@ mod tests {
 				cone: Some((vec3(0.0, -1.0, 0.0), 30.0)),
 			},
 		];
-		let baked = bake(&tris, &white(&tris), &config).unwrap();
+		let baked = baked(&tris, &config);
 		let key = config.cache_key(b"the level");
 		let bytes = baked.to_bytes(key);
 		let back = Baked::from_bytes(&bytes, key).unwrap();
 		assert_eq!(back.charts(), baked.charts());
 		assert_eq!(back.atlas().0, baked.atlas().0);
+		assert_eq!(back.tri_chart, baked.tri_chart);
 		for (a, b) in back.atlas().1.iter().zip(baked.atlas().1) {
 			for (a, b) in a.iter().zip(b) {
 				assert!(
@@ -1540,17 +1964,33 @@ mod tests {
 	fn a_loaded_bake_rebakes_like_a_fresh_one() {
 		let (tris, slab) = shadow_scene();
 		let config = config();
-		let baked = bake(&tris, &white(&tris), &config).unwrap();
+		let first = baked(&tris, &config);
 		let key = config.cache_key(b"the level");
-		let mut loaded = Baked::from_bytes(&baked.to_bytes(key), key).unwrap();
+		let mut loaded = Baked::from_bytes(&first.to_bytes(key), key).unwrap();
 		// Destroyed geometry: zero-area triangles at the same indices.
 		let mut edited = tris.clone();
 		for &i in &slab {
 			edited[i] = [vec3(0.0, -100.0, 0.0); 3];
 		}
-		let mut fresh = bake(&tris, &white(&tris), &config).unwrap();
-		let loaded_rects = loaded.update(&edited, &white(&edited), &slab).unwrap();
-		let fresh_rects = fresh.update(&edited, &white(&edited), &slab).unwrap();
+		let mut fresh = baked(&tris, &config);
+		let loaded_rects = loaded
+			.update(
+				&edited,
+				&white(&edited),
+				&specs(&edited, &config),
+				&identity(edited.len()),
+				&slab,
+			)
+			.unwrap();
+		let fresh_rects = fresh
+			.update(
+				&edited,
+				&white(&edited),
+				&specs(&edited, &config),
+				&identity(edited.len()),
+				&slab,
+			)
+			.unwrap();
 		assert!(!loaded_rects.is_empty() && !fresh_rects.is_empty());
 		let (_, lit) = loaded.at(vec3(3.5, 0.0, 3.5)).unwrap();
 		let want = config.sun_dir.y / PI;

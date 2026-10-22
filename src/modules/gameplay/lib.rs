@@ -48,7 +48,7 @@ use engine::cvar::Registry;
 use engine::gpu::{self, Color, Gfx, Key, MouseButton, View, Window};
 use engine::linalg::{vec3, Quat, Vec3};
 use engine::{bsp, lightmap, physics};
-use player::movement::angle_vectors;
+use player::movement::{angle_vectors, clamp_wish};
 use player::{Input, Player};
 
 use crate::bullets::Shot;
@@ -59,6 +59,18 @@ use audio::{Binaural, Clip};
 
 /// How long a fired bullet's tracer and holes stay drawn, seconds.
 const SHOT_LIFE: f32 = 2.0;
+/// How long a shot's muzzle flash lights the world, seconds, and its
+/// light: warm, reaching this far, world units.
+const FLASH_LIFE: f32 = 0.05;
+const FLASH_COLOR: Vec3 = Vec3 {
+	x: 6.0,
+	y: 4.2,
+	z: 2.0,
+};
+const FLASH_REACH: f32 = 400.0;
+/// The player's shape for shadows: a capsule slimmer than the hull, as a
+/// body is narrower than its collision box.
+const BODY_RADIUS: f32 = 11.0;
 /// Spheres in the physics playground at most; past it, the oldest goes.
 const BODY_CAP: usize = 64;
 
@@ -379,16 +391,32 @@ pub fn play(
 		map.world.tris().len(),
 		map.spawn
 	));
-	// The BSP's embedded GoldSrc lightdata is the fallback; our own bake at
-	// 2 units per texel is sharper and caches beside the map after the first
-	// bake.
 	// The sun and sky the map's entities describe; the raycast voxel field
 	// stores each voxel's light from them as the view draws it.
 	let light = lightmap::config(&map_path).unwrap_or_else(|e| {
 		console.print(format!("map light unreadable, using defaults: {e}"));
 		engine::lightbake::Config::default()
 	});
-	let traced = window.gfx().load_world(&map, &light);
+	// The map's own baked light: direct sun, sky and bounces, 2 units per
+	// texel, cached beside the map after the first bake. The surface pass
+	// samples it as lightmaps, so its shadows and ambient light are the
+	// bake's, sharp.
+	let (baked, from_cache) = match lightmap::bake_or_load(&map, &map_path) {
+		Ok(baked) => baked,
+		Err(e) => {
+			eprintln!("{e}");
+			std::process::exit(1);
+		}
+	};
+	console.print(if from_cache {
+		format!(
+			"light bake: loaded from {}",
+			map_path.with_extension("lightbake").display()
+		)
+	} else {
+		"light bake: baked fresh".into()
+	});
+	let traced = window.gfx().load_world(&map, &light, &baked);
 	console.print(format!("traced world: {} triangles", traced.triangles));
 	// The map's collision mesh, with the physics playground's spheres in it.
 	let (mut play, surfaces, spawn, spawn_yaw, spawn_pitch, kill_y) = (
@@ -529,6 +557,8 @@ pub fn play(
 		}
 	}
 	let mut shots: Vec<(Shot, f32)> = Vec::new();
+	// The muzzle flash's time left, and where it is.
+	let mut flash: (f32, Vec3) = (0.0, Vec3::ZERO);
 	let mut report = String::new();
 	window.grab_cursor(true);
 	let mut accumulator = 0.0;
@@ -652,16 +682,21 @@ pub fn play(
 			}
 			if buy_menu {
 				let w = &table.weapons[i];
+				let rich = cvars.sv_infinite_money != 0.0;
 				if owned[i] {
 					// Buying a gun already owned fills its ammo, as 1.6's
 					// buyammo does.
-					if w.ammo_price > 0 && money >= w.ammo_price && mags[i].1 < w.reserve {
-						money -= w.ammo_price;
+					if w.ammo_price > 0 && (rich || money >= w.ammo_price) && mags[i].1 < w.reserve {
+						if !rich {
+							money -= w.ammo_price;
+						}
 						mags[i].1 = w.reserve;
 						console.print(format!("{} ammo full (${})", w.ammo_name, w.ammo_price));
 					}
-				} else if money >= w.price {
-					money -= w.price;
+				} else if rich || money >= w.price {
+					if !rich {
+						money -= w.price;
+					}
 					owned[i] = true;
 					mags[i] = (w.clip, w.reserve);
 					console.print(format!("bought {} for ${}", w.name, w.price));
@@ -713,24 +748,20 @@ pub fn play(
 
 		let down = |k: Key| !typing && keys.down(k);
 		jump_pressed |= !typing && (keys.pressed(Key::Space) || keys.wheel() != 0.0);
-		let walk = if down(Key::ShiftLeft) {
-			cvars.cl_movespeedkey
-		} else {
-			1.0
-		};
 		let axis = |pos: Key, neg: Key, p: f32, n: f32| {
 			(if down(pos) { p } else { 0.0 }) - (if down(neg) { n } else { 0.0 })
 		};
 		let duck = down(Key::ControlLeft) || down(Key::KeyC);
-		let input = Input {
-			forward: axis(
+		let vars = movement_vars(&cvars);
+		let (forward, side, up) = clamp_wish(
+			axis(
 				Key::KeyW,
 				Key::KeyS,
 				cvars.cl_forwardspeed,
 				cvars.cl_backspeed,
-			) * walk,
-			side: axis(Key::KeyD, Key::KeyA, cvars.cl_sidespeed, cvars.cl_sidespeed) * walk,
-			up: if player.noclip {
+			),
+			axis(Key::KeyD, Key::KeyA, cvars.cl_sidespeed, cvars.cl_sidespeed),
+			if player.noclip {
 				(if down(Key::Space) {
 					cvars.cl_upspeed
 				} else {
@@ -739,6 +770,14 @@ pub fn play(
 			} else {
 				0.0
 			},
+			down(Key::ShiftLeft),
+			vars.maxspeed,
+			cvars.cl_movespeedkey,
+		);
+		let input = Input {
+			forward,
+			side,
+			up,
 			yaw,
 			pitch,
 			jump: down(Key::Space) || jump_pressed,
@@ -746,7 +785,6 @@ pub fn play(
 		};
 
 		let dt = 1.0 / cvars.sv_tickrate.clamp(10.0, 1000.0);
-		let vars = movement_vars(&cvars);
 		// The held weapon caps the run speed, the scope further still, as 1.6.
 		let weapon = &table.weapons[slot];
 		cvars.player_maxspeed = if armed.zoom > 0 {
@@ -990,6 +1028,9 @@ pub fn play(
 						let pick = rng::index(g.fire.len());
 						audio.play(g.fire[pick], muzzle(eye, forward, right, up), 1.0);
 					}
+					if !stab {
+						flash = (FLASH_LIFE, muzzle(eye, forward, right, up));
+					}
 					shots.push((shot, 0.0));
 				}
 				None if will_dry => {
@@ -1032,6 +1073,36 @@ pub fn play(
 		gfx.set_bodies(&spheres);
 		gfx.set_voxel(cvars.r_voxel);
 		gfx.set_shell(cvars.r_shell != 0.0);
+		gfx.set_surfaces(cvars.r_surface != 0.0);
+		gfx.set_wire(cvars.r_wire != 0.0);
+		gfx.set_lod(cvars.r_lod_near, cvars.r_lod_curve);
+		gfx.set_rays(cvars.r_aa);
+		gfx.set_smooth(cvars.r_fxaa != 0.0);
+		gfx.set_indirect(cvars.r_gi, cvars.r_ao, cvars.r_ao_radius);
+		gfx.set_traced_shadows(cvars.r_shadows != 0.0);
+		gfx.set_fog(
+			cvars.r_fog,
+			cvars.r_fog_height,
+			vec3(cvars.r_fog_r, cvars.r_fog_g, cvars.r_fog_b),
+		);
+		gfx.set_auto_exposure(cvars.r_autoexposure != 0.0);
+		gfx.set_exposure_range(cvars.r_exposure_min, cvars.r_exposure_max);
+		gfx.set_vsync(cvars.r_vsync != 0.0);
+		gfx.set_pbr(cvars.r_pbr != 0.0);
+		gfx.set_dynamic_lights(cvars.r_dlights != 0.0);
+		gfx.set_dynamic_shadows(cvars.r_dynshadows != 0.0);
+		// The player's body casts its shadow, and the playground's spheres
+		// theirs.
+		let hull = shown.hull();
+		let reach = Vec3::Y * (hull.half_height - BODY_RADIUS);
+		gfx.occluder(shown.origin - reach, shown.origin + reach, BODY_RADIUS);
+		for &(center, radius) in &spheres {
+			gfx.occluder(center, center, radius);
+		}
+		if flash.0 > 0.0 {
+			gfx.light(flash.1, FLASH_COLOR * (flash.0 / FLASH_LIFE), FLASH_REACH);
+			flash.0 -= frame;
+		}
 		gfx.set_view(View {
 			eye,
 			forward,
@@ -1116,7 +1187,7 @@ pub fn play(
 			for (i, w) in table.weapons.iter().enumerate() {
 				let (color, tag) = if owned[i] {
 					(Color::GREEN, "owned".to_string())
-				} else if money >= w.price {
+				} else if cvars.sv_infinite_money != 0.0 || money >= w.price {
 					(TEXT, format!("${}", w.price))
 				} else {
 					(MUTED, format!("${}", w.price))

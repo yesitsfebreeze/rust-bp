@@ -39,11 +39,55 @@ fn bytes(vertices: &[Vertex]) -> &[u8] {
 	unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), std::mem::size_of_val(vertices)) }
 }
 
-/// Two triangles over a screen quad's corners.
-fn quad(screen: &mut Vec<Vertex>, corners: [[f32; 2]; 4], uv: [[f32; 2]; 4], color: Color) {
-	for i in [0, 1, 2, 0, 2, 3] {
-		let [x, y] = corners[i];
-		screen.push(Vertex::new(vec3(x, y, 0.0), uv[i], color));
+/// A screen quad's corners, cut to `clip` — x0, y0, x1, y1 — when there
+/// is one, as triangles: the polygon left after each of the clip's four
+/// edges cuts it, fanned from its first corner, its texture coordinates
+/// and colors carried along each cut. A quad wholly outside leaves nothing.
+fn quad(
+	screen: &mut Vec<Vertex>,
+	corners: [[f32; 2]; 4],
+	uv: [[f32; 2]; 4],
+	colors: [Color; 4],
+	clip: Option<[f32; 4]>,
+) {
+	let vertex = |i: usize| {
+		let c = colors[i];
+		[corners[i][0], corners[i][1], uv[i][0], uv[i][1], c.r, c.g, c.b, c.a]
+	};
+	let mut poly: Vec<[f32; 8]> = (0..4).map(vertex).collect();
+	if let Some([x0, y0, x1, y1]) = clip {
+		// Each edge as (axis, bound, keep below it).
+		for (axis, bound, below) in [(0, x0, false), (0, x1, true), (1, y0, false), (1, y1, true)] {
+			let inside = |v: &[f32; 8]| if below { v[axis] <= bound } else { v[axis] >= bound };
+			let mut out = Vec::with_capacity(poly.len() + 2);
+			for k in 0..poly.len() {
+				let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+				if inside(&a) {
+					out.push(a);
+				}
+				if inside(&a) != inside(&b) {
+					let t = (bound - a[axis]) / (b[axis] - a[axis]);
+					let mut m = [0.0; 8];
+					for j in 0..8 {
+						m[j] = a[j] + (b[j] - a[j]) * t;
+					}
+					out.push(m);
+				}
+			}
+			poly = out;
+			if poly.len() < 3 {
+				return;
+			}
+		}
+	}
+	for k in 1..poly.len() - 1 {
+		for v in [poly[0], poly[k], poly[k + 1]] {
+			screen.push(Vertex {
+				pos: [v[0], v[1], 0.0],
+				uv: [v[2], v[3]],
+				color: [v[4], v[5], v[6], v[7]],
+			});
+		}
 	}
 }
 
@@ -93,6 +137,8 @@ pub struct Overlay {
 	mesh_vertices: Vec<Vertex>,
 	meshes: Vec<(TextureId, Range<u32>)>,
 	screen: Vec<Vertex>,
+	/// Where screen drawing is cut to, x0, y0, x1, y1; none draws anywhere.
+	clip: Option<[f32; 4]>,
 	/// The frame's batches end to end, and the buffer they go up in.
 	all: Vec<Vertex>,
 	vertices: Option<wgpu::Buffer>,
@@ -322,6 +368,7 @@ impl Overlay {
 			mesh_vertices: Vec::new(),
 			meshes: Vec::new(),
 			screen: Vec::new(),
+			clip: None,
 			all: Vec::new(),
 			vertices: None,
 		})
@@ -396,7 +443,25 @@ impl Overlay {
 			[x + width, y + height],
 			[x, y + height],
 		];
-		quad(&mut self.screen, corners, Self::solid_uv(), color);
+		quad(&mut self.screen, corners, Self::solid_uv(), [color; 4], self.clip);
+	}
+
+	/// A rectangle shaded between its corners' colors: top left, top right,
+	/// bottom right, bottom left.
+	pub fn gradient(&mut self, x: f32, y: f32, width: f32, height: f32, colors: [Color; 4]) {
+		let corners = [
+			[x, y],
+			[x + width, y],
+			[x + width, y + height],
+			[x, y + height],
+		];
+		quad(&mut self.screen, corners, Self::solid_uv(), colors, self.clip);
+	}
+
+	/// Cuts the screen drawing that follows to `rect`, x, y, width, height,
+	/// or lets it draw anywhere again with none.
+	pub fn set_clip(&mut self, rect: Option<[f32; 4]>) {
+		self.clip = rect.map(|[x, y, w, h]| [x, y, x + w, y + h]);
 	}
 
 	pub fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Color) {
@@ -412,7 +477,7 @@ impl Overlay {
 			[x2 - nx, y2 - ny],
 			[x1 - nx, y1 - ny],
 		];
-		quad(&mut self.screen, corners, Self::solid_uv(), color);
+		quad(&mut self.screen, corners, Self::solid_uv(), [color; 4], self.clip);
 	}
 
 	pub fn text(&mut self, queue: &wgpu::Queue, line: &str, x: f32, y: f32, size: f32, color: Color) {
@@ -437,7 +502,7 @@ impl Overlay {
 					[(gx + w) / side, (gy + h) / side],
 					[gx / side, (gy + h) / side],
 				];
-				quad(&mut self.screen, corners, uv, color);
+				quad(&mut self.screen, corners, uv, [color; 4], self.clip);
 			}
 			pen += g.advance;
 		}
@@ -455,6 +520,7 @@ impl Overlay {
 		self.mesh_vertices.clear();
 		self.meshes.clear();
 		self.screen.clear();
+		self.clip = None;
 	}
 
 	/// Draws the frame's batches: with a view, the world overlays and then
@@ -642,5 +708,28 @@ mod tests {
 	#[test]
 	fn vertices_pack_without_padding() {
 		assert_eq!(std::mem::size_of::<Vertex>(), 36);
+	}
+	#[test]
+	fn clipped_quads_stay_inside_and_keep_their_texture_mapping() {
+		let corners = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+		let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+		let white = [Color::new(1.0, 1.0, 1.0, 1.0); 4];
+		// Unclipped: the two triangles.
+		let mut out = Vec::new();
+		quad(&mut out, corners, uv, white, None);
+		assert_eq!(out.len(), 6);
+		// Cut to its right half: every vertex inside, the texture coordinate
+		// following the position.
+		let mut out = Vec::new();
+		quad(&mut out, corners, uv, white, Some([5.0, -1.0, 20.0, 20.0]));
+		assert!(!out.is_empty());
+		for v in &out {
+			assert!(v.pos[0] >= 5.0 - 1e-4 && v.pos[0] <= 10.0 + 1e-4);
+			assert!((v.uv[0] - v.pos[0] / 10.0).abs() < 1e-5);
+		}
+		// Wholly outside: nothing.
+		let mut out = Vec::new();
+		quad(&mut out, corners, uv, white, Some([20.0, 20.0, 30.0, 30.0]));
+		assert!(out.is_empty());
 	}
 }

@@ -3,21 +3,25 @@
 //!
 //! The CPU keeps everything deterministic and cheap — chart packing, the
 //! BVH build, occluder sets, the cache format — and the GPU computes texel
-//! values: direct pass (sun, sky, point lights, shadow tables) then one
-//! bounce pass per configured bounce, ping-ponging the atlas with the same
-//! manual bilinear chart sampling the CPU gathers with.
+//! values: direct pass (sun, point lights, shadow tables) then one gather
+//! pass per configured bounce — the first also bringing the sky its rays
+//! escape to — each adding to the atlas only what it gathers from the
+//! light the pass before it added, ping-ponged between two compact
+//! buffers with the same manual bilinear chart sampling the CPU gathers
+//! with. The gathered light is smoothed on the CPU after, as the CPU bake
+//! smooths it.
 //!
-//! Sun, sky, light and shadow values are the same arithmetic as the CPU
+//! Sun, light and shadow values are the same arithmetic as the CPU
 //! path, to rounding. Only the gather rays differ: the CPU walks one seeded
 //! sequence across all texels, the GPU hashes a seed per texel and ray, so
-//! bounced light agrees within Monte-Carlo noise, not bitwise.
+//! sky and bounced light agree within Monte-Carlo noise, not bitwise.
 //!
 //! The atlas and worklist buffers are sized for the configured atlas, so a
 //! GPU with too small a storage binding reports it instead of baking a
 //! partial map.
 
-use crate::{bvh, Config, Triangle};
-use crate::{packed, ray_span};
+use crate::{bvh, ChartSpec, Config, Triangle};
+use crate::{packed, ray_span, tri_chart_ranges};
 use linalg::Vec3;
 
 fn push3(out: &mut Vec<u8>, v: Vec3) {
@@ -36,12 +40,14 @@ fn push4(out: &mut Vec<u8>, v: Vec3, w: f32) {
 const COMMON: &str = r#"
 const PI: f32 = 3.14159265;
 const OFFSET: f32 = 0.1;
+// A sixteenth of a texel, as the CPU bake's `EDGE_INSET`.
+const EDGE_INSET: f32 = 1.0 / 16.0;
 const NO_SHADOW: u32 = 0xFFFFFFFFu;
 
 struct Cfg {
 	counts: vec4<u32>,  // atlas side, packed charts, texels, lights
 	floats: vec4<f32>,  // units per texel, ray span, seed, rays
-	sun_dir: vec4<f32>,
+	sun_dir: vec4<f32>,  // w 1 when gather hits carry light on, 0 with no bounces
 	sun_color: vec4<f32>,
 	sky: vec4<f32>,
 	ground: vec4<f32>,
@@ -55,10 +61,11 @@ struct Tri {
 struct Node { lo: vec3<f32>, first: u32, hi: vec3<f32>, count: u32 }
 struct Chart {
 	rx: u32, ry: u32, rw: u32, rh: u32,
-	u: vec3<f32>, tri: u32,
-	v: vec3<f32>, plane: f32,
-	axis: vec3<f32>, off: u32,
-	umin: f32, vmin: f32, pad0: f32, pad1: f32,
+	origin: vec4<f32>,
+	u: vec4<f32>,
+	v: vec4<f32>,
+	n: vec4<f32>,
+	first: u32, count: u32, off: u32, pad: u32,
 };
 struct Light {
 	pos: vec3<f32>, fade: f32,
@@ -206,27 +213,37 @@ fn albedo_of(i: u32) -> vec3<f32> {
 	return tris[i].alb.xyz;
 }
 
-fn atlas_at(x: u32, y: u32) -> vec4<f32> {
-	return atlas[(y * cfg.counts.x) + x];
-}
-
-fn chart_sample(c: Chart, p: vec3<f32>) -> vec3<f32> {
-	let units = cfg.floats.x;
-	let x = clamp((dot(p, c.u) - c.umin) / units - 0.5, 0.0, f32(c.rw) - 1.0);
-	let y = clamp((dot(p, c.v) - c.vmin) / units - 0.5, 0.0, f32(c.rh) - 1.0);
-	let x0 = floor(x);
-	let y0 = floor(y);
-	let tx = x - x0;
-	let ty = y - y0;
-	let x1 = min(x0 + 1.0, f32(c.rw) - 1.0);
-	let y1 = min(y0 + 1.0, f32(c.rh) - 1.0);
-	let p00 = atlas_at(c.rx + u32(x0), c.ry + u32(y0));
-	let p10 = atlas_at(c.rx + u32(x1), c.ry + u32(y0));
-	let p01 = atlas_at(c.rx + u32(x0), c.ry + u32(y1));
-	let p11 = atlas_at(c.rx + u32(x1), c.ry + u32(y1));
-	let r0 = mix(p00, p10, vec4<f32>(tx));
-	let r1 = mix(p01, p11, vec4<f32>(tx));
-	return mix(r0, r1, vec4<f32>(ty)).xyz;
+// The nearest point to `p` on the chart's own triangles, so texels the
+// chart's rectangle places outside the surface clamp onto it.
+fn face_point(p: vec3<f32>, first: u32, count: u32) -> vec3<f32> {
+	var best = p;
+	var best_d = 1e30;
+	var centroid = p;
+	var k = first;
+	loop {
+		if k >= first + count {
+			break;
+		}
+		let q = closest_point(p, k);
+		let d = dot(q - p, q - p);
+		if d < best_d {
+			best_d = d;
+			best = q;
+			centroid = (tris[k].a.xyz + tris[k].b.xyz + tris[k].c.xyz) / 3.0;
+		}
+		k = k + 1u;
+	}
+	// A point clamped onto the face's edge moves `EDGE_INSET` of a texel
+	// on into its
+	// triangle, as the CPU bake's `inset`: on the edge it lies in the
+	// plane of the face meeting it there, and rays along that face slip
+	// through it.
+	let to = centroid - best;
+	let len = length(to);
+	if best_d < 1e-6 || len < 1e-6 {
+		return best;
+	}
+	return best + to * (min(EDGE_INSET * cfg.floats.x, len * 0.5) / len);
 }
 
 fn pcg(v: u32) -> u32 {
@@ -266,10 +283,13 @@ fn chart_of_texel(id: u32) -> u32 {
 }
 "#;
 
-/// The direct pass: sun, sky and lights per texel, plus the sun shadow
-/// table. One workgroup item per chart texel.
+/// The direct pass: sun and lights per texel — the sky too when no gather
+/// ray will bring it — plus the sun shadow table, and the same light into
+/// the compact buffer the first gather samples. One workgroup item per
+/// chart texel.
 const DIRECT: &str = r#"
 @group(0) @binding(6) var<storage, read_write> shadow: array<u32>;
+@group(0) @binding(8) var<storage, read_write> first: array<vec4<f32>>;
 
 @compute @workgroup_size(64)
 fn direct(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -282,14 +302,14 @@ fn direct(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let local = id - c.off;
 	let i = local % c.rw;
 	let j = local / c.rw;
-	let t = tris[c.tri];
-	let n = normalize(cross(t.b.xyz - t.a.xyz, t.c.xyz - t.a.xyz));
-	let world = c.u * (c.umin + (f32(i) + 0.5) * cfg.floats.x)
-		+ c.v * (c.vmin + (f32(j) + 0.5) * cfg.floats.x)
-		+ c.axis * c.plane;
-	let p = closest_point(world, c.tri);
+	let n = c.n.xyz;
+	let world = c.origin.xyz + c.u.xyz * f32(i) + c.v.xyz * f32(j);
+	let p = face_point(world, c.first, c.count);
 
-	var lum = mix(cfg.ground.xyz, cfg.sky.xyz, n.y * 0.5 + 0.5);
+	var lum = vec3<f32>(0.0);
+	if cfg.floats.w <= 0.0 {
+		lum = mix(cfg.ground.xyz, cfg.sky.xyz, n.y * 0.5 + 0.5);
+	}
 	var vis = 1.0;
 	var blocker = NO_SHADOW;
 	let n_l = max(dot(n, cfg.sun_dir.xyz), 0.0);
@@ -336,17 +356,45 @@ fn direct(@builtin(global_invocation_id) gid: vec3<u32>) {
 		k = k + 1u;
 	}
 	atlas[(c.ry + j) * cfg.counts.x + (c.rx + i)] = vec4<f32>(lum, vis);
+	first[id] = vec4<f32>(lum, vis);
 	shadow[id] = blocker;
 }
 "#;
 
-/// One bounce pass: gathers indirect light per texel from the atlas as it
-/// stands and adds it, ping-ponging into the other atlas buffer.
+/// One gather pass: per texel, the light cosine-distributed rays bring
+/// back — the albedo times what the pass before added where they hit, and
+/// in the first pass the sky where they escape — added to the atlas and
+/// written compact for the next pass to gather from.
 const BOUNCE: &str = r#"
-@group(0) @binding(6) var<storage, read_write> next: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> prev: array<vec4<f32>>;
+@group(0) @binding(9) var<storage, read_write> next: array<vec4<f32>>;
 
-@compute @workgroup_size(64)
-fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn prev_at(c: Chart, x: f32, y: f32) -> vec4<f32> {
+	return prev[c.off + u32(y) * c.rw + u32(x)];
+}
+
+// What the pass before added, bilinear at world point `p` of chart `c`.
+fn chart_sample(c: Chart, p: vec3<f32>) -> vec3<f32> {
+	// The dual basis mapping world points to texel coordinates, the
+	// inverse of the spec's `u` and `v` steps.
+	let d = dot(cross(c.u.xyz, c.v.xyz), c.n.xyz);
+	let g_u = cross(c.v.xyz, c.n.xyz) / d;
+	let g_v = cross(c.n.xyz, c.u.xyz) / d;
+	let rel = p - c.origin.xyz;
+	let x = clamp(dot(g_u, rel), 0.0, f32(c.rw) - 1.0);
+	let y = clamp(dot(g_v, rel), 0.0, f32(c.rh) - 1.0);
+	let x0 = floor(x);
+	let y0 = floor(y);
+	let tx = x - x0;
+	let ty = y - y0;
+	let x1 = min(x0 + 1.0, f32(c.rw) - 1.0);
+	let y1 = min(y0 + 1.0, f32(c.rh) - 1.0);
+	let r0 = mix(prev_at(c, x0, y0), prev_at(c, x1, y0), vec4<f32>(tx));
+	let r1 = mix(prev_at(c, x0, y1), prev_at(c, x1, y1), vec4<f32>(tx));
+	return mix(r0, r1, vec4<f32>(ty)).xyz;
+}
+
+fn gather(gid: vec3<u32>, sky: bool) {
 	// The dispatch folds past 65535 workgroups into grid Y.
 	let id = gid.x + gid.y * 65535u;
 	if id >= cfg.counts.z {
@@ -357,38 +405,43 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let i = local % c.rw;
 	let j = local / c.rw;
 	let at = (c.ry + j) * cfg.counts.x + (c.rx + i);
-	let value = atlas[at];
-	if cfg.floats.w <= 0.0 {
-		next[at] = value;
-		return;
-	}
 	let seed = bitcast<u32>(cfg.floats.z);
-	let t = tris[c.tri];
-	let n = normalize(cross(t.b.xyz - t.a.xyz, t.c.xyz - t.a.xyz));
-	let world = c.u * (c.umin + (f32(i) + 0.5) * cfg.floats.x)
-		+ c.v * (c.vmin + (f32(j) + 0.5) * cfg.floats.x)
-		+ c.axis * c.plane;
-	let p = closest_point(world, c.tri);
+	let n = c.n.xyz;
+	let world = c.origin.xyz + c.u.xyz * f32(i) + c.v.xyz * f32(j);
+	let p = face_point(world, c.first, c.count);
+	// The first pass and the later ones draw different rays.
+	let k = select(2u, 0u, sky);
 	var sum = vec3<f32>(0.0);
 	var r = 0u;
 	loop {
 		if f32(r) >= cfg.floats.w {
 			break;
 		}
-		let d = cosine(n, rand01(seed, id, r, 0u), rand01(seed, id, r, 1u));
+		let d = cosine(n, rand01(seed, id, r, k), rand01(seed, id, r, k + 1u));
 		let o = p + n * OFFSET;
 		let hit = ray_cast(o, d, cfg.floats.y);
 		if hit.hit == 1u {
 			let q = o + d * hit.at;
 			let chart = charts[chart_of(hit.tri)];
-			sum += albedo_of(hit.tri) * chart_sample(chart, q);
-		} else {
+			sum += albedo_of(hit.tri) * chart_sample(chart, q) * cfg.sun_dir.w;
+		} else if sky {
 			sum += mix(cfg.ground.xyz, cfg.sky.xyz, d.y * 0.5 + 0.5);
 		}
 		r = r + 1u;
 	}
 	let mean = sum / cfg.floats.w;
-	next[at] = vec4<f32>(value.xyz + mean, value.w);
+	next[id] = vec4<f32>(mean, 0.0);
+	atlas[at] = atlas[at] + vec4<f32>(mean, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn first_bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
+	gather(gid, true);
+}
+
+@compute @workgroup_size(64)
+fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
+	gather(gid, false);
 }
 "#;
 
@@ -403,6 +456,8 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub fn bake_gpu(
 	tris: &[Triangle],
 	albedo: &[Vec3],
+	charts: &[ChartSpec],
+	tri_chart: &[u32],
 	config: &Config,
 ) -> Result<crate::Baked, String> {
 	if tris.len() != albedo.len() {
@@ -412,40 +467,49 @@ pub fn bake_gpu(
 			albedo.len()
 		));
 	}
+	if tris.len() != tri_chart.len() {
+		return Err(format!(
+			"{} triangles but {} chart indices",
+			tris.len(),
+			tri_chart.len()
+		));
+	}
 	if config.atlas_size.count_ones() != 1 {
 		return Err(format!(
 			"atlas_size {} is not a power of two",
 			config.atlas_size
 		));
 	}
-	let (mut baked, _) = packed(tris, config)?;
+	let (mut baked, _) = packed(tris, charts, tri_chart, config)?;
 	let side = config.atlas_size;
+	let chart_tris = tri_chart_ranges(tri_chart, charts.len())?;
 
-	// The packed chart records, in triangle order so their compact texel
+	// The packed chart records, in packed order so their compact texel
 	// offsets ascend for the shader's binary search, plus each triangle's
-	// packed index, u32::MAX when it holds no chart. The WGSL struct is
-	// four u32s, then three vec3+scalar slots, then four floats: 80 bytes.
+	// packed index, u32::MAX when its chart holds none. The WGSL struct is
+	// four u32s, then four vec4s, then four u32s: 96 bytes.
 	let mut chart_bytes = Vec::new();
 	let mut chart_of_tri = vec![u32::MAX; tris.len()];
-	let mut packed_tris = Vec::new();
+	let mut packed_charts = Vec::new();
 	let mut offset = 0u32;
-	for (tri, chart) in baked.charts.iter().enumerate() {
+	for (ci, chart) in baked.charts.iter().enumerate() {
 		let Some(c) = chart else {
 			continue;
 		};
-		chart_of_tri[tri] = packed_tris.len() as u32;
-		packed_tris.push(tri);
+		let (first, count) = chart_tris[ci];
+		for t in first..first + count {
+			chart_of_tri[t as usize] = packed_charts.len() as u32;
+		}
+		packed_charts.push(ci);
 		for v in [c.rect.x, c.rect.y, c.rect.w, c.rect.h] {
 			chart_bytes.extend_from_slice(&v.to_le_bytes());
 		}
-		push3(&mut chart_bytes, c.u);
-		chart_bytes.extend_from_slice(&(tri as u32).to_le_bytes());
-		push3(&mut chart_bytes, c.v);
-		chart_bytes.extend_from_slice(&c.plane.to_bits().to_le_bytes());
-		push3(&mut chart_bytes, c.axis);
-		chart_bytes.extend_from_slice(&offset.to_le_bytes());
-		for v in [c.u_min, c.v_min, 0.0, 0.0] {
-			chart_bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+		push4(&mut chart_bytes, c.spec.origin, 0.0);
+		push4(&mut chart_bytes, c.spec.u, 0.0);
+		push4(&mut chart_bytes, c.spec.v, 0.0);
+		push4(&mut chart_bytes, c.spec.n, 0.0);
+		for v in [first, count, offset, 0] {
+			chart_bytes.extend_from_slice(&v.to_le_bytes());
 		}
 		offset += c.rect.w * c.rect.h;
 	}
@@ -507,7 +571,7 @@ pub fn bake_gpu(
 	let mut cfg_bytes = Vec::with_capacity(96);
 	for v in [
 		side,
-		packed_tris.len() as u32,
+		packed_charts.len() as u32,
 		texels,
 		config.lights.len() as u32,
 	] {
@@ -521,7 +585,11 @@ pub fn bake_gpu(
 	] {
 		cfg_bytes.extend_from_slice(&v.to_bits().to_le_bytes());
 	}
-	push4(&mut cfg_bytes, config.sun_dir, 0.0);
+	push4(
+		&mut cfg_bytes,
+		config.sun_dir,
+		(config.bounces > 0) as u32 as f32,
+	);
 	push4(&mut cfg_bytes, config.sun_color, 0.0);
 	push4(&mut cfg_bytes, config.sky_color, 0.0);
 	push4(&mut cfg_bytes, config.ground_color, 0.0);
@@ -548,9 +616,12 @@ pub fn bake_gpu(
 	let charts_buf = storage("charts", chart_bytes.len() as u64, upload);
 	let lights_buf = storage("lights", light_bytes.len() as u64, upload);
 	let copy = wgpu::BufferUsages::COPY_SRC;
-	let atlas = [
-		storage("atlas a", atlas_bytes, copy),
-		storage("atlas b", atlas_bytes, copy),
+	let atlas = storage("atlas", atlas_bytes, copy);
+	// What each pass added, compact in texel order, ping-ponged: the one a
+	// pass gathers from and the one it writes.
+	let added = [
+		storage("added a", texels as u64 * 16, copy),
+		storage("added b", texels as u64 * 16, copy),
 	];
 	let shadow_buf = storage("shadow", texels as u64 * 4, copy);
 	let cfg_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -585,11 +656,10 @@ pub fn bake_gpu(
 	let read = |b: u32| buffer(b, wgpu::BufferBindingType::Storage { read_only: true });
 	let write = |b: u32| buffer(b, wgpu::BufferBindingType::Storage { read_only: false });
 	let uniform = |b: u32| buffer(b, wgpu::BufferBindingType::Uniform);
-	// Both passes bind the same eight slots: five read-only geometry and
-	// light sources, the atlas and one writable target at 5 and 6 (the
-	// direct pass writes the shadow table at 6, each bounce pass the other
-	// atlas), and the config uniform. The atlas is read_write in WGSL —
-	// bounces sample it — so its layout entry stays writable too.
+	// Every pass binds the same ten slots: five read-only geometry and
+	// light sources, the atlas at 5, the shadow table at 6, the config
+	// uniform at 7, and the two compact buffers at 8 and 9 — the direct
+	// pass writes 8, each gather pass reads 8 and writes 9.
 	let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
 		label: None,
 		entries: &[
@@ -601,9 +671,11 @@ pub fn bake_gpu(
 			write(5),
 			write(6),
 			uniform(7),
+			write(8),
+			write(9),
 		],
 	});
-	let bind = |bgl: &wgpu::BindGroupLayout, bufs: [&wgpu::Buffer; 8]| {
+	let bind = |bgl: &wgpu::BindGroupLayout, bufs: [&wgpu::Buffer; 10]| {
 		let entries: Vec<wgpu::BindGroupEntry> = bufs
 			.iter()
 			.enumerate()
@@ -618,20 +690,7 @@ pub fn bake_gpu(
 			entries: &entries,
 		})
 	};
-	let direct_binds = bind(
-		&layout,
-		[
-			&tris_buf,
-			&bvh_buf,
-			&order_buf,
-			&charts_buf,
-			&lights_buf,
-			&atlas[0],
-			&shadow_buf,
-			&cfg_buf,
-		],
-	);
-	let bounce_binds = [
+	let binds = |from: usize| {
 		bind(
 			&layout,
 			[
@@ -640,25 +699,15 @@ pub fn bake_gpu(
 				&order_buf,
 				&charts_buf,
 				&lights_buf,
-				&atlas[0],
-				&atlas[1],
+				&atlas,
+				&shadow_buf,
 				&cfg_buf,
+				&added[from],
+				&added[1 - from],
 			],
-		),
-		bind(
-			&layout,
-			[
-				&tris_buf,
-				&bvh_buf,
-				&order_buf,
-				&charts_buf,
-				&lights_buf,
-				&atlas[1],
-				&atlas[0],
-				&cfg_buf,
-			],
-		),
-	];
+		)
+	};
+	let pass_binds = [binds(0), binds(1)];
 
 	let module = |extra: &str| {
 		device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -683,6 +732,7 @@ pub fn bake_gpu(
 		})
 	};
 	let direct = pipeline("direct", &layout, DIRECT);
+	let first_bounce = pipeline("first_bounce", &layout, BOUNCE);
 	let bounce = pipeline("bounce", &layout, BOUNCE);
 
 	let groups = texels.div_ceil(64);
@@ -693,18 +743,8 @@ pub fn bake_gpu(
 	{
 		let mut pass = encoder.begin_compute_pass(&Default::default());
 		pass.set_pipeline(&direct);
-		pass.set_bind_group(0, &direct_binds, &[]);
+		pass.set_bind_group(0, &pass_binds[0], &[]);
 		pass.dispatch_workgroups(gx, gy, 1);
-	}
-	let mut cur = 0;
-	for _ in 0..config.bounces {
-		{
-			let mut pass = encoder.begin_compute_pass(&Default::default());
-			pass.set_pipeline(&bounce);
-			pass.set_bind_group(0, &bounce_binds[cur], &[]);
-			pass.dispatch_workgroups(gx, gy, 1);
-		}
-		cur = 1 - cur;
 	}
 	let staging = |size: u64| {
 		device.create_buffer(&wgpu::BufferDescriptor {
@@ -714,14 +754,34 @@ pub fn bake_gpu(
 			mapped_at_creation: false,
 		})
 	};
+	// The direct light, before the first gather pass writes over its
+	// buffer, for the smoothing to tell the gathered light from it.
+	let direct_out = staging(texels as u64 * 16);
+	encoder.copy_buffer_to_buffer(&added[0], 0, &direct_out, 0, texels as u64 * 16);
+	// Zero bounces still runs the first gather, for the sky; zero rays
+	// leaves the direct pass's open hemisphere.
+	let passes = if config.rays > 0 {
+		config.bounces.max(1)
+	} else {
+		0
+	};
+	for k in 0..passes {
+		let mut pass = encoder.begin_compute_pass(&Default::default());
+		pass.set_pipeline(if k == 0 { &first_bounce } else { &bounce });
+		pass.set_bind_group(0, &pass_binds[k % 2], &[]);
+		pass.dispatch_workgroups(gx, gy, 1);
+	}
 	let atlas_out = staging(atlas_bytes);
 	let shadow_out = staging(texels as u64 * 4);
-	encoder.copy_buffer_to_buffer(&atlas[cur], 0, &atlas_out, 0, atlas_bytes);
+	encoder.copy_buffer_to_buffer(&atlas, 0, &atlas_out, 0, atlas_bytes);
 	encoder.copy_buffer_to_buffer(&shadow_buf, 0, &shadow_out, 0, texels as u64 * 4);
 	queue.submit(Some(encoder.finish()));
 	read_back(&device, &atlas_out)?;
 	let atlas_read = atlas_out.slice(..).get_mapped_range().to_vec();
 	atlas_out.unmap();
+	read_back(&device, &direct_out)?;
+	let direct_read = direct_out.slice(..).get_mapped_range().to_vec();
+	direct_out.unmap();
 	read_back(&device, &shadow_out)?;
 	let shadow_read = shadow_out.slice(..).get_mapped_range().to_vec();
 	shadow_out.unmap();
@@ -737,9 +797,9 @@ pub fn bake_gpu(
 
 	// The compact arrays are in packed order, their offsets ascending.
 	let mut off = 0u32;
-	for &tri in &packed_tris {
+	for &ci in &packed_charts {
 		let (values, w, h, lo, hi) = {
-			let c = baked.charts[tri].as_ref().unwrap();
+			let c = baked.charts[ci].as_ref().unwrap();
 			let mut values = vec![[0.0f32; 4]; (c.rect.w * c.rect.h) as usize];
 			for j in 0..c.rect.h {
 				for i in 0..c.rect.w {
@@ -752,7 +812,7 @@ pub fn bake_gpu(
 					];
 				}
 			}
-			let (lo, hi) = c.bounds(config.units_per_texel);
+			let (lo, hi) = c.bounds();
 			(values, c.rect.w, c.rect.h, lo, hi)
 		};
 		let shadow = shadow_u32[off as usize..(off + w * h) as usize].to_vec();
@@ -771,7 +831,31 @@ pub fn bake_gpu(
 		}
 		occluders.sort_unstable();
 		occluders.dedup();
-		baked.commit(tri, &values, &shadow, &occluders);
+		baked.commit(ci, &values, &shadow, &occluders);
+	}
+	if passes > 0 {
+		// Each chart's direct values, compact in the same packed order.
+		let mut direct = vec![None; baked.charts.len()];
+		let mut off = 0usize;
+		for &ci in &packed_charts {
+			let rect = baked.charts[ci].as_ref().unwrap().rect;
+			let n = (rect.w * rect.h) as usize;
+			direct[ci] = Some(
+				(off..off + n)
+					.map(|t| {
+						let at = t * 16;
+						[
+							f32_at(&direct_read, at),
+							f32_at(&direct_read, at + 4),
+							f32_at(&direct_read, at + 8),
+							f32_at(&direct_read, at + 12),
+						]
+					})
+					.collect(),
+			);
+			off += n;
+		}
+		baked.smooth(&direct);
 	}
 	Ok(baked)
 }
@@ -856,6 +940,19 @@ mod tests {
 		vec![vec3(0.8, 0.8, 0.8); tris.len()]
 	}
 
+	/// One chart per triangle, the same placement the CPU tests bake.
+	fn specs(tris: &[Triangle], config: &Config) -> Vec<ChartSpec> {
+		tris
+			.iter()
+			.map(|t| ChartSpec::fit_triangle(t, config))
+			.collect()
+	}
+
+	/// Every triangle its own chart, in soup order.
+	fn identity(n: usize) -> Vec<u32> {
+		(0..n as u32).collect()
+	}
+
 	/// The CPU and GPU bakes, chart by chart, texel by texel.
 	fn diff(cpu: &crate::Baked, gpu: &crate::Baked, tri: usize) -> f32 {
 		let (side, texels) = cpu.atlas();
@@ -885,8 +982,22 @@ mod tests {
 	#[test]
 	fn gpu_direct_matches_cpu() {
 		let tris = shadow_scene();
-		let cpu = crate::bake(&tris, &white(&tris), &config()).unwrap();
-		let gpu = bake_gpu(&tris, &white(&tris), &config()).unwrap();
+		let cpu = crate::bake(
+			&tris,
+			&white(&tris),
+			&specs(&tris, &config()),
+			&identity(tris.len()),
+			&config(),
+		)
+		.unwrap();
+		let gpu = bake_gpu(
+			&tris,
+			&white(&tris),
+			&specs(&tris, &config()),
+			&identity(tris.len()),
+			&config(),
+		)
+		.unwrap();
 		assert_eq!(cpu.charts(), gpu.charts());
 		let mut worst = 0.0f32;
 		for tri in 0..tris.len() {
@@ -922,8 +1033,22 @@ mod tests {
 				cone: Some((vec3(0.0, -1.0, 0.0), 30.0)),
 			},
 		];
-		let cpu = crate::bake(&tris, &white(&tris), &config).unwrap();
-		let gpu = bake_gpu(&tris, &white(&tris), &config).unwrap();
+		let cpu = crate::bake(
+			&tris,
+			&white(&tris),
+			&specs(&tris, &config),
+			&identity(tris.len()),
+			&config,
+		)
+		.unwrap();
+		let gpu = bake_gpu(
+			&tris,
+			&white(&tris),
+			&specs(&tris, &config),
+			&identity(tris.len()),
+			&config,
+		)
+		.unwrap();
 		for tri in 0..tris.len() {
 			if cpu.chart(tri).is_some() {
 				diff(&cpu, &gpu, tri);
@@ -939,8 +1064,22 @@ mod tests {
 		config.ground_color = vec3(0.16, 0.14, 0.12);
 		config.bounces = 2;
 		config.rays = 64;
-		let cpu = crate::bake(&tris, &white(&tris), &config).unwrap();
-		let gpu = bake_gpu(&tris, &white(&tris), &config).unwrap();
+		let cpu = crate::bake(
+			&tris,
+			&white(&tris),
+			&specs(&tris, &config),
+			&identity(tris.len()),
+			&config,
+		)
+		.unwrap();
+		let gpu = bake_gpu(
+			&tris,
+			&white(&tris),
+			&specs(&tris, &config),
+			&identity(tris.len()),
+			&config,
+		)
+		.unwrap();
 		// Gather rays are hashed per texel on the GPU, so indirect light
 		// carries different Monte-Carlo noise: same model, same energy,
 		// not the same samples. The mean over each chart stays close.

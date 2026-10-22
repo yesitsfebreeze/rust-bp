@@ -3,14 +3,14 @@
 # World gravity, units/s².
 sv_gravity = 800.0
 
-# Ground acceleration, multiples of wish speed per second.
-sv_accelerate = 5.0
+# Ground acceleration, multiples of wish speed per second; doubled with sv_friction so top speed is unchanged.
+sv_accelerate = 10.0
 
 # Air acceleration; air wish speed is capped at 30 u/s.
 sv_airaccelerate = 10.0
 
-# Ground friction.
-sv_friction = 4.0
+# Ground friction; doubled from CS 1.6 so the player stops in half the distance.
+sv_friction = 8.0
 
 # Friction multiplier near a drop-off.
 sv_edgefriction = 2.0
@@ -86,6 +86,9 @@ r_subsurface = 1.0
 
 # Scene brightness before tone mapping. Not in CS 1.6.
 r_exposure = 1.0
+
+# Draw the map's surfaces as the triangles they are, at native resolution; 0 voxelizes into cubes. Not in CS 1.6.
+r_surface = 1.0
 
 # Pixels a voxel of the traced map spans at any distance: smaller is finer and slower. Not in CS 1.6.
 r_voxel = 4.0

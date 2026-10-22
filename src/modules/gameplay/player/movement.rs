@@ -114,8 +114,18 @@ const JUMP_SPEED: f32 = 268.328_16;
 /// Milliseconds of slowdown after a jump (`fuser2`); it scales the next jump and
 /// ground speed by up to 25%.
 const JUMP_PENALTY_MS: f32 = 1_315.789_4;
+/// Share of the jump penalty's speed drain applied on the ground after landing;
+/// the full drain still hits the next jump's speed.
+const LANDING_PENALTY_SHARE: f32 = 0.5;
 const DUCK_MOVE_SCALE: f32 = 0.333;
-const TIME_TO_DUCK: f32 = 0.4;
+/// Seconds to go from standing to ducked on the ground, and back.
+const TIME_TO_DUCK: f32 = 0.25;
+/// A duck pressed from standing on the ground and released within this many
+/// seconds is a tap: the 18 unit hop, at ducked speed.
+const DUCK_TAP: f32 = 0.15;
+/// Seconds the duck keeps its direction after changing it before the key can turn
+/// it again, so mashing duck cannot jitter the hull or the view.
+const DUCK_REBOUNCE: f32 = 0.15;
 /// Wish speed cap while airborne: what makes air strafing work.
 const AIR_WISH_CAP: f32 = 30.0;
 /// Surfaces with a normal this upright or more are floors.
@@ -134,6 +144,34 @@ const STOP_EPSILON: f32 = 0.1;
 /// Slowest the drawn height catches up with a step, u/s: Quake's stair smoothing rate,
 /// so a step taken while nearly still does not leave the view behind for long.
 const STEP_SMOOTH_MIN_RATE: f32 = 80.0;
+
+/// `CL_CreateMove`'s clamps on the wish vector, in the client's order: first
+/// capped to the effective max speed, then scaled by the walk key. The client
+/// never lets `cl_movespeedkey` exceed 0.52, and capping first is what walks a
+/// 250 u/s weapon at 130 u/s — scaling the raw key speeds would walk at 208.
+pub fn clamp_wish(
+	mut forward: f32,
+	mut side: f32,
+	mut up: f32,
+	walking: bool,
+	maxspeed: f32,
+	movespeedkey: f32,
+) -> (f32, f32, f32) {
+	let len = (forward * forward + side * side + up * up).sqrt();
+	if len > maxspeed && len > 0.0 {
+		let scale = maxspeed / len;
+		forward *= scale;
+		side *= scale;
+		up *= scale;
+	}
+	if walking {
+		let key = movespeedkey.min(0.52);
+		forward *= key;
+		side *= key;
+		up *= key;
+	}
+	(forward, side, up)
+}
 
 /// The movement cvars a tick reads, gathered once per tick by the game from its
 /// config. Defaults are Counter-Strike 1.6's.
@@ -227,6 +265,11 @@ fn horizontal(v: Vec3) -> Vec3 {
 	vec3(v.x, 0.0, v.z)
 }
 
+/// Quadratic ease-out: the duck responds at full rate and settles into place.
+fn ease_out(t: f32) -> f32 {
+	t * (2.0 - t)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Player {
 	/// Centre of the hull.
@@ -235,10 +278,17 @@ pub struct Player {
 	pub on_ground: bool,
 	/// Fully ducked: the small hull is in use (`FL_DUCKING`).
 	pub ducked: bool,
-	/// Going down but not yet ducked (`bInDuck`); the standing hull is still in use.
+	/// Between standing and ducked (`bInDuck`); the standing hull is still in use.
 	pub in_duck: bool,
-	/// Milliseconds left of the duck transition, counting down from 1000.
-	pub duck_time: f32,
+	/// How far ducked, 0 standing to 1 ducked. On the ground it eases toward the
+	/// duck key over `TIME_TO_DUCK` either way, reversing whenever the key does.
+	pub duck_amount: f32,
+	/// Seconds left in which releasing duck is a tap.
+	duck_tap: f32,
+	/// Direction the duck is going: the key, held back by `DUCK_REBOUNCE`.
+	duck_down: bool,
+	/// Seconds left before the duck may change direction again.
+	duck_rebounce: f32,
 	/// Milliseconds of post-jump slowdown left (`fuser2`).
 	pub jump_penalty: f32,
 	/// Eye height above the origin.
@@ -265,7 +315,10 @@ impl Player {
 			on_ground: false,
 			ducked: false,
 			in_duck: false,
-			duck_time: 0.0,
+			duck_amount: 0.0,
+			duck_tap: 0.0,
+			duck_down: false,
+			duck_rebounce: 0.0,
 			jump_penalty: 0.0,
 			view_offset: VIEW_STANDING,
 			fall_velocity: 0.0,
@@ -318,7 +371,6 @@ impl Player {
 
 		// PM_ReduceTimers.
 		let ms = dt * 1000.0;
-		self.duck_time = (self.duck_time - ms).max(0.0);
 		self.jump_penalty = (self.jump_penalty - ms).max(0.0);
 
 		if self.noclip {
@@ -333,7 +385,7 @@ impl Player {
 			self.fall_velocity = -self.velocity.y;
 		}
 
-		let scale = self.duck(cmd.duck, world);
+		let scale = self.duck(cmd.duck, vars.maxspeed, world, dt);
 		(cmd.forward, cmd.side) = (cmd.forward * scale, cmd.side * scale);
 
 		// Half the gravity before moving and half after: jump height then barely
@@ -446,60 +498,86 @@ impl Player {
 		}
 	}
 
-	/// `PM_Duck`; returns the scale for this tick's movement keys.
-	fn duck(&mut self, down: bool, world: &Mesh) -> f32 {
-		let pressed = down && !self.duck_held;
-		self.duck_held = down;
-		if !down && !self.in_duck && !self.ducked {
-			return 1.0;
+	/// `PM_Duck`, eased: returns the scale for this tick's movement keys. Airborne,
+	/// the hull switches at once as in GoldSrc, so jump-ducks still clear ledges.
+	/// The direction follows the key only once `DUCK_REBOUNCE` has passed since it
+	/// last changed; a tap is still read from the key itself.
+	fn duck(&mut self, key: bool, maxspeed: f32, world: &Mesh, dt: f32) -> f32 {
+		let tap = !key && self.duck_held && self.duck_tap > 0.0;
+		self.duck_held = key;
+		self.duck_rebounce = (self.duck_rebounce - dt).max(0.0);
+		let turned = key != self.duck_down && self.duck_rebounce == 0.0;
+		if turned {
+			self.duck_down = key;
+			self.duck_rebounce = DUCK_REBOUNCE;
 		}
-		if down {
-			if pressed && !self.ducked {
-				self.duck_time = 1000.0;
-				self.in_duck = true;
-			}
-			if self.in_duck {
-				let done = self.duck_time / 1000.0;
-				if done <= 1.0 - TIME_TO_DUCK || !self.on_ground {
-					self.ducked = true;
-					self.in_duck = false;
-					self.view_offset = VIEW_DUCKED;
-					if self.on_ground {
-						self.origin.y -= DUCK_DROP;
-						self.fix_crouch_stuck(world);
-						self.categorize(world);
-					}
-				} else {
-					// Eases the eye from standing to its ducked height measured from
-					// the undropped origin.
-					let t = ((1.0 - done) / TIME_TO_DUCK).max(0.0);
-					let f = 3.0 * t * t - 2.0 * t * t * t;
-					self.view_offset = (VIEW_DUCKED - DUCK_DROP) * f + VIEW_STANDING * (1.0 - f);
-				}
+		let down = self.duck_down;
+		self.duck_tap = if turned && down && self.on_ground && self.duck_amount == 0.0 {
+			DUCK_TAP
+		} else {
+			(self.duck_tap - dt).max(0.0)
+		};
+
+		if !self.on_ground {
+			if down && !self.ducked {
+				self.ducked = true;
+				self.duck_amount = 1.0;
+			} else if !down && self.ducked && fits(world, STANDING, self.origin) {
+				self.ducked = false;
+				self.duck_amount = 0.0;
+				self.categorize(world);
 			}
 		} else {
-			self.unduck(world);
+			let step = dt / TIME_TO_DUCK;
+			if down {
+				self.duck_amount = (self.duck_amount + step).min(1.0);
+				if !self.ducked && self.duck_amount >= 1.0 {
+					self.ducked = true;
+					self.origin.y -= DUCK_DROP;
+					self.fix_crouch_stuck(world);
+					self.categorize(world);
+				}
+			} else if !self.ducked || self.stand_up(world) {
+				self.duck_amount = (self.duck_amount - step).max(0.0);
+			}
+			// The "duck tap": the origin rises as if the duck had completed, hopping
+			// 18 units, but the hop only carries ducked speed.
+			let hop = self.origin + UP * DUCK_DROP;
+			if tap && !self.ducked && fits(world, STANDING, hop) {
+				self.origin = hop;
+				let cap = maxspeed * DUCK_MOVE_SCALE;
+				let speed = self.speed();
+				if speed > cap {
+					let keep = cap / speed;
+					(self.velocity.x, self.velocity.z) = (self.velocity.x * keep, self.velocity.z * keep);
+				}
+				self.categorize(world);
+			}
 		}
-		DUCK_MOVE_SCALE
+
+		self.in_duck = !self.ducked && self.duck_amount > 0.0;
+		let f = ease_out(self.duck_amount);
+		if self.ducked {
+			self.view_offset = VIEW_DUCKED;
+			DUCK_MOVE_SCALE
+		} else {
+			// The eye eases toward its ducked height measured from the standing origin.
+			self.view_offset = lerp(VIEW_STANDING, VIEW_DUCKED - DUCK_DROP, f);
+			lerp(1.0, DUCK_MOVE_SCALE, f)
+		}
 	}
 
-	/// `PM_UnDuck`. Releasing duck before it completes still raises the origin as if
-	/// it had: the 18 unit hop of the "duck tap".
-	fn unduck(&mut self, world: &Mesh) {
-		let origin = if self.on_ground {
-			self.origin + UP * DUCK_DROP
-		} else {
-			self.origin
-		};
-		if !fits(world, self.hull(), origin) || !fits(world, STANDING, origin) {
-			return;
+	/// `PM_UnDuck` on the ground: back to the standing hull with the feet kept, if it
+	/// fits; the eye then eases up from its ducked height.
+	fn stand_up(&mut self, world: &Mesh) -> bool {
+		let origin = self.origin + UP * DUCK_DROP;
+		if !fits(world, STANDING, origin) {
+			return false;
 		}
 		self.ducked = false;
-		self.in_duck = false;
-		self.view_offset = VIEW_STANDING;
-		self.duck_time = 0.0;
 		self.origin = origin;
 		self.categorize(world);
+		true
 	}
 
 	/// `PM_FixPlayerCrouchStuck` upward: tries up to 36 one-unit raises.
@@ -579,6 +657,12 @@ impl Player {
 		}
 	}
 
+	/// Speed kept on the ground while the jump penalty lasts: landing drains only
+	/// `LANDING_PENALTY_SHARE` of the full penalty, so momentum survives.
+	fn ground_penalty_ratio(&self) -> f32 {
+		1.0 - (1.0 - self.penalty_ratio()) * LANDING_PENALTY_SHARE
+	}
+
 	/// `PM_Friction` on the ground; doubled near a drop-off by `edgefriction`.
 	fn friction(&mut self, vars: &MovementVars, world: &Mesh, dt: f32) {
 		let speed = self.velocity.length();
@@ -620,7 +704,7 @@ impl Player {
 		world: &Mesh,
 		dt: f32,
 	) {
-		let ratio = self.penalty_ratio();
+		let ratio = self.ground_penalty_ratio();
 		self.velocity.x *= ratio;
 		self.velocity.z *= ratio;
 
@@ -709,6 +793,13 @@ impl Player {
 			let Some(normal) = tr.normal else {
 				break;
 			};
+			// Stopped where it stands: it rests too deep in the skin, where the cast
+			// blocks even a slide along the surface. Back off along the normal, as far
+			// as there is room, so the clipped velocity can slide instead of sticking.
+			if tr.fraction == 0.0 {
+				let out = self.origin + normal * (SKIN * 0.5);
+				self.origin = trace(world, hull, self.origin, out).end;
+			}
 			left -= left * tr.fraction;
 			if count >= MAX_CLIP_PLANES {
 				self.velocity = Vec3::ZERO;
@@ -1210,6 +1301,92 @@ mod tests {
 	}
 
 	#[test]
+	fn duck_tap_hop_carries_only_ducked_speed() {
+		let world = floor();
+		let mut p = grounded(&world, Vec3::ZERO);
+		run(&mut p, &world, forward(), 2.0, RATE);
+		assert!(p.speed() > 249.0);
+		p.tick(
+			Input {
+				duck: true,
+				..forward()
+			},
+			&vars(),
+			&world,
+			1.0 / RATE,
+		);
+		p.tick(forward(), &vars(), &world, 1.0 / RATE);
+		assert!(
+			!p.on_ground && p.speed() <= vars().maxspeed * DUCK_MOVE_SCALE + 1e-3,
+			"{p:?}"
+		);
+	}
+
+	#[test]
+	fn held_duck_eases_and_reverses_on_release() {
+		let world = floor();
+		let mut p = grounded(&world, Vec3::ZERO);
+		let rest = p.origin.y;
+		let duck = Input {
+			duck: true,
+			..Input::default()
+		};
+		// Past the tap window but short of ducked: releasing eases back, no hop.
+		run(&mut p, &world, duck, 0.2, RATE);
+		assert!(p.in_duck && !p.ducked && p.view_offset < VIEW_STANDING);
+		let partway = p.duck_amount;
+		p.tick(Input::default(), &vars(), &world, 1.0 / RATE);
+		assert!(
+			p.on_ground && p.origin.y == rest && p.duck_amount < partway,
+			"{p:?}"
+		);
+		run(&mut p, &world, Input::default(), 0.25, RATE);
+		assert!(!p.in_duck && p.view_offset == VIEW_STANDING);
+		// Spamming taps while still easing back up never hops.
+		run(&mut p, &world, duck, 0.2, RATE);
+		run(&mut p, &world, Input::default(), 0.02, RATE);
+		run(&mut p, &world, duck, 0.02, RATE);
+		run(&mut p, &world, Input::default(), 0.02, RATE);
+		assert!(p.on_ground && p.origin.y == rest, "{p:?}");
+		// Standing from ducked eases the eye up from its ducked height.
+		run(&mut p, &world, duck, 0.5, RATE);
+		assert!(p.ducked);
+		let eye = p.eye().y;
+		p.tick(Input::default(), &vars(), &world, 1.0 / RATE);
+		assert!(
+			!p.ducked && p.in_duck && (p.eye().y - eye).abs() < 0.5,
+			"{p:?}"
+		);
+	}
+
+	#[test]
+	fn mashing_duck_cannot_turn_it_before_the_rebounce() {
+		let world = floor();
+		let mut p = grounded(&world, Vec3::ZERO);
+		let duck = Input {
+			duck: true,
+			..Input::default()
+		};
+		// Held past the tap window, then mashed starting with a release: it turns up
+		// once and keeps going up for the whole rebounce.
+		run(&mut p, &world, duck, 0.2, RATE);
+		let mut last = p.duck_amount;
+		let ticks = (DUCK_REBOUNCE * RATE) as usize;
+		for i in 0..ticks {
+			let mash = Input {
+				duck: i % 2 == 1,
+				..Input::default()
+			};
+			p.tick(mash, &vars(), &world, 1.0 / RATE);
+			assert!(p.on_ground && p.duck_amount < last, "tick {i}: {p:?}");
+			last = p.duck_amount;
+		}
+		// Held once the rebounce is over, it turns back down.
+		run(&mut p, &world, duck, 4.0 / RATE, RATE);
+		assert!(p.duck_amount > last, "{p:?}");
+	}
+
+	#[test]
 	fn steep_slopes_are_not_ground() {
 		let mut world = floor();
 		// 60° slope facing -x.
@@ -1329,6 +1506,38 @@ mod tests {
 			ratio < 0.9 && (apex - expected).abs() < 1.0,
 			"apex {apex}, expected {expected}"
 		);
+	}
+
+	#[test]
+	fn landing_drains_half_the_jump_penalty_on_the_ground() {
+		let world = floor();
+		let mut landed = grounded(&world, Vec3::ZERO);
+		let mut rested = grounded(&world, Vec3::ZERO);
+		landed.jump_penalty = JUMP_PENALTY_MS;
+		landed.velocity = vec3(250.0, 0.0, 0.0);
+		rested.velocity = vec3(250.0, 0.0, 0.0);
+		landed.tick(Input::default(), &vars(), &world, 1.0 / RATE);
+		rested.tick(Input::default(), &vars(), &world, 1.0 / RATE);
+		// Friction is the same for both; only the softened penalty drain differs.
+		let left = JUMP_PENALTY_MS - 1000.0 / RATE;
+		let full = (100.0 - left * 0.001 * 19.0) * 0.01;
+		let expected = 1.0 - (1.0 - full) * LANDING_PENALTY_SHARE;
+		let ratio = landed.speed() / rested.speed();
+		assert!(
+			(ratio - expected).abs() < 1e-4,
+			"ratio {ratio}, expected {expected}"
+		);
+	}
+
+	#[test]
+	fn walking_caps_the_wish_to_the_weapon_speed_first() {
+		// CL_CreateMove caps the wish to maxspeed before the walk scale: 400 → 250
+		// → 130, not 400 → 208. The client also clamps cl_movespeedkey to 0.52.
+		let walk = |key: f32| clamp_wish(400.0, 0.0, 0.0, true, 250.0, key).0;
+		assert!((walk(0.52) - 130.0).abs() < 1e-3, "{}", walk(0.52));
+		assert!((walk(0.9) - 130.0).abs() < 1e-3, "{}", walk(0.9));
+		let run = clamp_wish(400.0, 0.0, 0.0, false, 250.0, 0.52).0;
+		assert!((run - 250.0).abs() < 1e-3, "{}", run);
 	}
 
 	#[test]
@@ -1577,5 +1786,34 @@ mod tests {
 		};
 		let (a, b) = (travel(64.0), travel(256.0));
 		assert!((a - b).abs() / b < 0.02, "{a} vs {b}");
+	}
+
+	#[test]
+	fn slides_along_an_angled_wall_from_deep_in_its_skin() {
+		// A wall at 75°, as in a corner where it meets another at 105°.
+		let mut world = floor();
+		let along = vec3(0.258_819, 0.0, 0.965_926);
+		let n = vec3(-0.965_926, 0.0, 0.258_819);
+		let h = UP * 256.0;
+		world.push_quad(Vec3::ZERO, along * 900.0, along * 900.0 + h, h, n);
+		// Wedged against it by a corner: a quarter of the skin off it, where the cast
+		// blocks even the slide along it.
+		for gap in [0.125, 0.25, 0.375] {
+			let mut p = grounded(&world, along * 100.0 + n * 40.0);
+			p.origin += n * (STANDING.radius + SKIN * gap - n.dot(p.origin));
+			assert!(fits(&world, p.hull(), p.origin));
+			let start = p.origin;
+			// Walking 50° into it slides along it every tick.
+			let into = Input {
+				forward: 400.0,
+				yaw: 25.0,
+				..Input::default()
+			};
+			let states = run(&mut p, &world, into, 0.3, RATE);
+			let stuck = states.iter().position(|s| s.speed() == 0.0);
+			assert!(stuck.is_none(), "stuck from gap {gap} at tick {stuck:?}");
+			let slid = (p.origin - start).dot(along);
+			assert!(slid > 20.0, "slid {slid} from gap {gap}");
+		}
 	}
 }

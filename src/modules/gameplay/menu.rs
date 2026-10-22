@@ -4,7 +4,7 @@
 //! every option edits its cvar live, and Cancel puts them back.
 
 use engine::gpu::{Color, Gfx, Input};
-use engine::ui::{Rect, Theme, Ui};
+use engine::ui::{Rect, Scroll, Theme, Ui};
 
 use crate::cvars::Cvars;
 
@@ -52,6 +52,10 @@ pub struct Menu {
 	tab: usize,
 	/// The cvars as the Options dialog found them, for Cancel.
 	saved: Option<Cvars>,
+	/// How far each tab's sheet is scrolled.
+	scrolls: [Scroll; TABS.len()],
+	/// Whether the fog color's picker is open.
+	fog_color: bool,
 }
 
 impl Menu {
@@ -61,6 +65,8 @@ impl Menu {
 			page: Page::Main,
 			tab: 0,
 			saved: None,
+			scrolls: Default::default(),
+			fog_color: false,
 		}
 	}
 
@@ -153,9 +159,13 @@ impl Menu {
 
 	fn options(&mut self, ui: &mut Ui, cvars: &mut Cvars) -> Option<Choice> {
 		self.saved.get_or_insert_with(|| cvars.clone());
-		let (body, closed) = ui.frame(Rect::centered(ui.size(), 600.0, 480.0), "Options");
+		// As tall as the screen allows; the sheets scroll what does not fit.
+		let height = (ui.size().1 - 40.0).clamp(240.0, 560.0);
+		let (body, closed) = ui.frame(Rect::centered(ui.size(), 600.0, height), "Options");
 		let (buttons, body) = body.cut_bottom(34.0);
-		let mut row = ui.tabs(body.cut_bottom(6.0).1, &TABS, &mut self.tab);
+		let sheet = ui.tabs(body.cut_bottom(6.0).1, &TABS, &mut self.tab);
+		let tab = self.tab;
+		let mut row = ui.scroll(sheet, &mut self.scrolls[tab]);
 		let mut next = |h: f32| {
 			let (top, rest) = row.cut_top(h);
 			row = rest.cut_top(8.0).1;
@@ -196,16 +206,47 @@ impl Menu {
 			}
 			_ => {
 				ui.slider(next(48.0), "Field of view", &mut cvars.fov, 60.0, 130.0);
-				ui.slider(next(48.0), "Brightness", &mut cvars.r_exposure, 0.25, 3.0);
+				// Brightness moves only between the bounds the game sets.
+				let (lo, hi) = (
+					cvars.r_exposure_min,
+					cvars.r_exposure_max.max(cvars.r_exposure_min),
+				);
+				ui.slider(next(48.0), "Brightness", &mut cvars.r_exposure, lo, hi);
+				toggle(ui, next(24.0), "Auto exposure", &mut cvars.r_autoexposure);
+				toggle(ui, next(24.0), "Traced sun shadows", &mut cvars.r_shadows);
+				toggle(ui, next(24.0), "Wait for vertical sync", &mut cvars.r_vsync);
+				toggle(ui, next(24.0), "Anti-aliasing (FXAA)", &mut cvars.r_fxaa);
+				toggle(
+					ui,
+					next(24.0),
+					"Physically based surfaces",
+					&mut cvars.r_pbr,
+				);
+				toggle(ui, next(24.0), "Dynamic lights", &mut cvars.r_dlights);
+				toggle(
+					ui,
+					next(24.0),
+					"Player and object shadows",
+					&mut cvars.r_dynshadows,
+				);
+				ui.slider(next(48.0), "Global illumination", &mut cvars.r_gi, 0.0, 2.0);
+				ui.slider(next(48.0), "Ambient occlusion", &mut cvars.r_ao, 0.0, 1.0);
 				ui.slider(
 					next(48.0),
-					"Voxel size (pixels)",
-					&mut cvars.r_voxel,
-					1.0,
-					16.0,
+					"Occlusion radius (units)",
+					&mut cvars.r_ao_radius,
+					4.0,
+					96.0,
 				);
+				ui.slider(next(48.0), "Fog", &mut cvars.r_fog, 0.0, 4.0);
+				let mut fog = [cvars.r_fog_r, cvars.r_fog_g, cvars.r_fog_b];
+				let room = Ui::color_height(self.fog_color);
+				if ui.color(next(room), "Fog color", &mut fog, &mut self.fog_color) {
+					[cvars.r_fog_r, cvars.r_fog_g, cvars.r_fog_b] = fog;
+				}
 			}
 		}
+		ui.end_scroll(&mut self.scrolls[tab], row.y);
 
 		// OK, Cancel and Apply along the bottom right, as 1.6 sets them.
 		let (apply, rest) = buttons.cut_right(96.0);

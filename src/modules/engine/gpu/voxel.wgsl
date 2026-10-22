@@ -26,7 +26,8 @@ struct View {
 	// x exposure; y 1 when this pass must sRGB-encode; z the near plane;
 	// w the view mode: 0 lit, else a debug view (trace.wgsl).
 	grade: vec4f,
-	// xy viewport pixels; z, w unused.
+	// xy viewport pixels; z rays averaged per pixel: 1, 2 or 4; w 1 when
+	// the map's triangles draw as pink wireframe.
 	size: vec4f,
 	// x the frame number so far. Words, not floats: as f32 it would stop
 	// growing past 2^24 and freeze the field's clock. y how many times the

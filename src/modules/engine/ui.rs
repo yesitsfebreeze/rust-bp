@@ -2,7 +2,8 @@
 //! olive panels with bevelled edges, a gold highlight. Each widget draws
 //! through [`Gfx`] and answers from this frame's [`Input`]; whatever state
 //! it edits lives with the caller, so menus are plain functions over their
-//! own data.
+//! own data — a scrolled area's [`Scroll`] and a color picker's open flag
+//! included.
 
 use crate::gpu::{Color, Gfx, Input, MouseButton};
 
@@ -105,6 +106,55 @@ impl Rect {
 	}
 }
 
+/// A scrolled area's state, kept by its caller from frame to frame: how
+/// far down it is scrolled, how tall its content stood last frame, and
+/// where on the thumb a drag holds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Scroll {
+	pub offset: f32,
+	content: f32,
+	grab: Option<f32>,
+}
+
+/// Pixels one wheel notch scrolls.
+const WHEEL_STEP: f32 = 48.0;
+/// The scroll bar's width, and its thumb's least height.
+const BAR: f32 = 10.0;
+const THUMB_MIN: f32 = 24.0;
+/// A color picker's rows: its label and swatch, and once open the
+/// saturation-value square and hue bar below.
+const COLOR_ROW: f32 = 24.0;
+const PICKER: f32 = 132.0;
+
+/// `rgb` as hue, saturation and value, each 0 to 1.
+pub fn hsv_of(rgb: [f32; 3]) -> [f32; 3] {
+	let [r, g, b] = rgb;
+	let max = r.max(g).max(b);
+	let min = r.min(g).min(b);
+	let d = max - min;
+	let h = if d <= 0.0 {
+		0.0
+	} else if max == r {
+		((g - b) / d).rem_euclid(6.0) / 6.0
+	} else if max == g {
+		((b - r) / d + 2.0) / 6.0
+	} else {
+		((r - g) / d + 4.0) / 6.0
+	};
+	let s = if max <= 0.0 { 0.0 } else { d / max };
+	[h, s, max]
+}
+
+/// Hue, saturation and value back as red, green and blue.
+pub fn rgb_of([h, s, v]: [f32; 3]) -> [f32; 3] {
+	let h6 = h.rem_euclid(1.0) * 6.0;
+	let f = |n: f32| {
+		let k = (n + h6).rem_euclid(6.0);
+		v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
+	};
+	[f(5.0), f(3.0), f(1.0)]
+}
+
 /// The value at `x` along a track spanning `track`, clamped to its ends.
 fn slide(track: Rect, x: f32, min: f32, max: f32) -> f32 {
 	let t = ((x - track.x) / track.w.max(1.0)).clamp(0.0, 1.0);
@@ -121,6 +171,11 @@ pub struct Ui<'a> {
 	cursor: (f32, f32),
 	click: bool,
 	held: bool,
+	/// Wheel notches not yet taken by a scrolled area.
+	wheel: f32,
+	/// The scrolled area being laid out: its view, and the top of its
+	/// content.
+	scrolling: Option<(Rect, f32)>,
 }
 
 impl<'a> Ui<'a> {
@@ -132,6 +187,8 @@ impl<'a> Ui<'a> {
 			cursor: input.cursor(),
 			click: input.clicked(MouseButton::Left),
 			held: input.button_down(MouseButton::Left),
+			wheel: input.wheel(),
+			scrolling: None,
 		}
 	}
 
@@ -139,8 +196,12 @@ impl<'a> Ui<'a> {
 		self.gfx.size()
 	}
 
+	/// Whether the cursor is over `rect`, and over the scrolled area's view
+	/// when inside one: a widget scrolled out of sight answers nothing.
 	pub fn hovered(&self, rect: Rect) -> bool {
-		self.enabled && rect.contains(self.cursor)
+		self.enabled
+			&& rect.contains(self.cursor)
+			&& self.scrolling.is_none_or(|(view, _)| view.contains(self.cursor))
 	}
 
 	/// Whether this frame's click landed in `rect`; one widget takes it.
@@ -365,6 +426,163 @@ impl<'a> Ui<'a> {
 		self.bevel(thumb, false);
 		*value != before
 	}
+
+	/// Begins a scrolled area over `view`: the wheel over it, or the bar
+	/// down its right side, scrolls it by `scroll`. Returns where to lay its
+	/// content out — as wide as the view less the bar, starting above the
+	/// view by the offset, as tall as the content may be. Everything drawn
+	/// until [`Ui::end_scroll`] is cut to the view.
+	pub fn scroll(&mut self, view: Rect, scroll: &mut Scroll) -> Rect {
+		let over = scroll.content - view.h;
+		let bar = over > 0.0;
+		if self.enabled && view.contains(self.cursor) && self.wheel != 0.0 {
+			scroll.offset -= self.wheel * WHEEL_STEP;
+			self.wheel = 0.0;
+		}
+		if bar {
+			let track = Rect::new(view.x + view.w - BAR, view.y, BAR, view.h);
+			let thumb_h = (view.h * view.h / scroll.content).max(THUMB_MIN).min(view.h);
+			let travel = (view.h - thumb_h).max(1.0);
+			let thumb = |offset: f32| Rect::new(track.x, track.y + offset / over * travel, BAR, thumb_h);
+			if !self.held {
+				scroll.grab = None;
+			}
+			if self.clicked(track) {
+				let t = thumb(scroll.offset);
+				// On the thumb, hold it where it was taken; off it, jump the
+				// thumb's middle to the cursor and hold it there.
+				scroll.grab = Some(if t.contains(self.cursor) {
+					self.cursor.1 - t.y
+				} else {
+					thumb_h * 0.5
+				});
+			}
+			if let Some(grab) = scroll.grab {
+				scroll.offset = (self.cursor.1 - grab - track.y) / travel * over;
+			}
+			scroll.offset = scroll.offset.clamp(0.0, over);
+			self.fill(track, self.theme.field);
+			self.bevel(track, true);
+			let t = thumb(scroll.offset);
+			self.fill(t, self.theme.panel);
+			self.bevel(t, false);
+		} else {
+			scroll.offset = 0.0;
+		}
+		let top = view.y - scroll.offset;
+		self.scrolling = Some((view, top));
+		self.gfx.set_clip(Some([view.x, view.y, view.w, view.h]));
+		let w = if bar { view.w - BAR - 6.0 } else { view.w };
+		Rect::new(view.x, top, w, scroll.content.max(view.h))
+	}
+
+	/// Ends the scrolled area [`Ui::scroll`] began, its content having
+	/// reached down to `bottom`, so next frame's bar knows its height.
+	pub fn end_scroll(&mut self, scroll: &mut Scroll, bottom: f32) {
+		if let Some((_, top)) = self.scrolling.take() {
+			scroll.content = bottom - top;
+		}
+		self.gfx.set_clip(None);
+	}
+
+	/// How tall [`Ui::color`] stands, open or shut.
+	pub const fn color_height(open: bool) -> f32 {
+		if open {
+			COLOR_ROW + 8.0 + PICKER
+		} else {
+			COLOR_ROW
+		}
+	}
+
+	/// A labelled color: a swatch at the right that opens a picker under it
+	/// when clicked — a square of saturation across and value down at the
+	/// color's hue, a hue bar beside it, each followed while held — and
+	/// shuts it clicked again. `open` is the caller's, as is the room the
+	/// picker takes: [`Ui::color_height`]. Returns whether the color changed.
+	pub fn color(&mut self, rect: Rect, text: &str, rgb: &mut [f32; 3], open: &mut bool) -> bool {
+		let (row, below) = rect.cut_top(COLOR_ROW);
+		let (swatch_cell, name) = row.cut_right(64.0);
+		let color = if self.hovered(row) {
+			self.theme.highlight
+		} else {
+			self.theme.text
+		};
+		self.caption(name, text, false, color);
+		let swatch = Rect::new(swatch_cell.x + 8.0, row.y + 3.0, 56.0, row.h - 6.0);
+		let [r, g, b] = *rgb;
+		self.fill(swatch, Color::new(r, g, b, 1.0));
+		self.bevel(swatch, !*open);
+		if self.clicked(row) {
+			*open = !*open;
+		}
+		if !*open {
+			return false;
+		}
+		let before = *rgb;
+		let mut hsv = hsv_of(*rgb);
+		let area = below.cut_top(8.0).1;
+		let square = Rect::new(area.x, area.y, (area.w - 40.0).min(240.0), PICKER);
+		let hue = Rect::new(square.x + square.w + 12.0, area.y, 20.0, PICKER);
+		if self.held && self.hovered(square) {
+			hsv[1] = ((self.cursor.0 - square.x) / square.w).clamp(0.0, 1.0);
+			hsv[2] = 1.0 - ((self.cursor.1 - square.y) / square.h).clamp(0.0, 1.0);
+			*rgb = rgb_of(hsv);
+		}
+		if self.held && self.hovered(hue) {
+			hsv[0] = ((self.cursor.1 - hue.y) / hue.h).clamp(0.0, 0.9999);
+			*rgb = rgb_of(hsv);
+		}
+		// The square in cells, each shaded between its corners' colors, so
+		// saturation and value read true across it.
+		const CELLS: u32 = 12;
+		let (cw, ch) = (square.w / CELLS as f32, square.h / CELLS as f32);
+		let at = |i: u32, j: u32| {
+			let [r, g, b] = rgb_of([hsv[0], i as f32 / CELLS as f32, 1.0 - j as f32 / CELLS as f32]);
+			Color::new(r, g, b, 1.0)
+		};
+		for j in 0..CELLS {
+			for i in 0..CELLS {
+				self.gfx.gradient(
+					square.x + i as f32 * cw,
+					square.y + j as f32 * ch,
+					cw + 0.5,
+					ch + 0.5,
+					[at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)],
+				);
+			}
+		}
+		self.bevel(square, true);
+		// The hue bar, red through the spectrum back to red.
+		for k in 0..6 {
+			let top = rgb_of([k as f32 / 6.0, 1.0, 1.0]);
+			let bottom = rgb_of([(k + 1) as f32 / 6.0, 1.0, 1.0]);
+			let t = Color::new(top[0], top[1], top[2], 1.0);
+			let b = Color::new(bottom[0], bottom[1], bottom[2], 1.0);
+			self.gfx.gradient(
+				hue.x,
+				hue.y + k as f32 * hue.h / 6.0,
+				hue.w,
+				hue.h / 6.0 + 0.5,
+				[t, t, b, b],
+			);
+		}
+		self.bevel(hue, true);
+		// Markers: a ring at the color in the square, a notch at its hue.
+		let (mx, my) = (
+			square.x + hsv[1] * square.w,
+			square.y + (1.0 - hsv[2]) * square.h,
+		);
+		let dot = if hsv[2] > 0.5 {
+			self.theme.dark
+		} else {
+			self.theme.text
+		};
+		self.bevel(Rect::new(mx - 4.0, my - 4.0, 8.0, 8.0), false);
+		self.fill(Rect::new(mx - 1.0, my - 1.0, 2.0, 2.0), dot);
+		let hy = hue.y + hsv[0] * hue.h;
+		self.fill(Rect::new(hue.x - 3.0, hy - 1.0, hue.w + 6.0, 2.0), self.theme.text);
+		*rgb != before
+	}
 }
 
 #[cfg(test)]
@@ -389,6 +607,23 @@ mod tests {
 			Rect::centered((200.0, 100.0), 50.0, 20.0),
 			Rect::new(75.0, 40.0, 50.0, 20.0)
 		);
+	}
+
+	#[test]
+	fn hsv_round_trips_colors() {
+		for rgb in [
+			[1.0, 0.0, 0.0],
+			[0.2, 0.6, 0.3],
+			[0.9, 0.9, 0.1],
+			[0.5, 0.5, 0.5],
+			[0.0, 0.0, 0.0],
+		] {
+			let back = rgb_of(hsv_of(rgb));
+			for k in 0..3 {
+				assert!((back[k] - rgb[k]).abs() < 1e-5, "{rgb:?} -> {back:?}");
+			}
+		}
+		assert_eq!(hsv_of([0.0, 1.0, 0.0])[0], 1.0 / 3.0);
 	}
 
 	#[test]

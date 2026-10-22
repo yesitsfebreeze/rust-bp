@@ -19,7 +19,7 @@ use engine::linalg::{vec3, Vec3};
 use engine::physics;
 use engine::surface::Surface;
 use gameplay::cvars::{movement_vars, Cvars};
-use gameplay::player::movement::angle_vectors;
+use gameplay::player::movement::{angle_vectors, clamp_wish};
 use gameplay::player::{Input, Player};
 use gameplay::{draw_console, load_config, type_into, vertical_fov};
 
@@ -158,6 +158,7 @@ fn quad(tex: Rect, a: Vec3, b: Vec3, c: Vec3, d: Vec3, outward: Vec3) -> Face {
 			h: 0,
 		},
 		solid: true,
+		finish: Default::default(),
 		verts: wind
 			.into_iter()
 			.map(|p| Vert {
@@ -220,6 +221,7 @@ impl Arena {
 					rgba: vec![0, 0, 0, 0],
 				},
 				faces,
+				textures: Vec::new(),
 			},
 			spawn: vec3(-320.0, 1.0, -320.0),
 			spawn_yaw: 45.0,
@@ -438,7 +440,16 @@ fn main() {
 	};
 	let map = arena();
 	let light = lightbake::Config::default();
-	let traced = window.gfx().load_world(&map, &light);
+	// The arena's own baked light: direct sun, sky and bounces, as the map
+	// game's is. Small enough to bake at load, no map file to cache beside.
+	let baked = match engine::lightmap::bake_with(&map, &light) {
+		Ok(baked) => baked,
+		Err(e) => {
+			eprintln!("{e}");
+			std::process::exit(1);
+		}
+	};
+	let traced = window.gfx().load_world(&map, &light, &baked);
 	console.print(format!("traced world: {} triangles", traced.triangles));
 	// The arena's collision mesh, with the playground's spheres in it.
 	// GoldSrc gravity, so spheres fall like the player does.
@@ -520,24 +531,20 @@ fn main() {
 
 		let down = |k: Key| !typing && keys.down(k);
 		jump_pressed |= !typing && (keys.pressed(Key::Space) || keys.wheel() != 0.0);
-		let walk = if down(Key::ShiftLeft) {
-			cvars.cl_movespeedkey
-		} else {
-			1.0
-		};
 		let axis = |pos: Key, neg: Key, p: f32, n: f32| {
 			(if down(pos) { p } else { 0.0 }) - (if down(neg) { n } else { 0.0 })
 		};
 		let duck = down(Key::ControlLeft) || down(Key::KeyC);
-		let input = Input {
-			forward: axis(
+		let vars = movement_vars(&cvars);
+		let (forward, side, up) = clamp_wish(
+			axis(
 				Key::KeyW,
 				Key::KeyS,
 				cvars.cl_forwardspeed,
 				cvars.cl_backspeed,
-			) * walk,
-			side: axis(Key::KeyD, Key::KeyA, cvars.cl_sidespeed, cvars.cl_sidespeed) * walk,
-			up: if player.noclip {
+			),
+			axis(Key::KeyD, Key::KeyA, cvars.cl_sidespeed, cvars.cl_sidespeed),
+			if player.noclip {
 				(if down(Key::Space) {
 					cvars.cl_upspeed
 				} else {
@@ -546,6 +553,14 @@ fn main() {
 			} else {
 				0.0
 			},
+			down(Key::ShiftLeft),
+			vars.maxspeed,
+			cvars.cl_movespeedkey,
+		);
+		let input = Input {
+			forward,
+			side,
+			up,
 			yaw,
 			pitch,
 			jump: down(Key::Space) || jump_pressed,
@@ -553,7 +568,6 @@ fn main() {
 		};
 
 		let dt = 1.0 / cvars.sv_tickrate.clamp(10.0, 1000.0);
-		let vars = movement_vars(&cvars);
 		accumulator += frame_time.min(MAX_FRAME);
 		// The flycam moves per frame along the look direction; the player stands
 		// still and is drawn where it was.
@@ -647,6 +661,23 @@ fn main() {
 		}
 		gfx.set_voxel(cvars.r_voxel);
 		gfx.set_shell(cvars.r_shell != 0.0);
+		gfx.set_surfaces(cvars.r_surface != 0.0);
+		gfx.set_lod(cvars.r_lod_near, cvars.r_lod_curve);
+		gfx.set_rays(cvars.r_aa);
+		gfx.set_smooth(cvars.r_fxaa != 0.0);
+		gfx.set_indirect(cvars.r_gi, cvars.r_ao, cvars.r_ao_radius);
+		gfx.set_traced_shadows(cvars.r_shadows != 0.0);
+		gfx.set_fog(
+			cvars.r_fog,
+			cvars.r_fog_height,
+			vec3(cvars.r_fog_r, cvars.r_fog_g, cvars.r_fog_b),
+		);
+		gfx.set_auto_exposure(cvars.r_autoexposure != 0.0);
+		gfx.set_exposure_range(cvars.r_exposure_min, cvars.r_exposure_max);
+		gfx.set_vsync(cvars.r_vsync != 0.0);
+		gfx.set_pbr(cvars.r_pbr != 0.0);
+		gfx.set_dynamic_lights(cvars.r_dlights != 0.0);
+		gfx.set_dynamic_shadows(cvars.r_dynshadows != 0.0);
 		gfx.set_view(View {
 			eye,
 			forward,

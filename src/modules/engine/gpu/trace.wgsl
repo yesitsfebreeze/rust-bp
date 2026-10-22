@@ -43,10 +43,10 @@ const BODY: vec3f = vec3f(0.56, 0.38, 0.19);
 // Dents one hit weighs at most: those its cells can reach.
 const NEAR_DENTS: u32 = 4u;
 
-// How far a cube's box sits toward its low corner, in cube sides: past
+// How much a cube's box grows for the overlap test, in cube sides: past
 // f32's rounding at the map's far corners for the smallest cubes, small
-// enough to change no shape.
-const OWN: f32 = 0.02;
+// enough to change no shape. As `SHELL_GROW` in shell.wgsl.
+const GROW: f32 = 0.02;
 
 // Cells walked at most from where a grazing ray comes within a cell of
 // its triangle's plane.
@@ -297,17 +297,25 @@ struct Cube {
 	face: vec3f,
 }
 
-// The first triangle, in the hierarchy's order, that fills the cube of
-// side `s` at `center`: overlaps its box on an opaque texel. NO_HIT for an
-// empty cube. Every ray asking about a cube gets the same answer, whatever
-// triangle it hit. Map faces lie on whole units, so on cube boundaries: a
-// cube owns its box with the low faces but not the high, nudged by more
-// than f32 rounds, or a face on a boundary would land in both cubes or
-// neither, a different one per pixel.
+// The triangle a filled cube of side `s` at `center` shows as. A face
+// fills the cube when it overlaps its box, from behind — the cube's center
+// lies strictly on the solid side of the face — on an opaque texel: matter
+// only grows inward, no cube stands out past the surface, save past a
+// face's edge at a mesh's silhouette, where the face beyond the edge
+// fills the cube that hangs off it. That cube shows as the first face it
+// hangs in front of, its projection fallen on the face itself, so it
+// lights facing out of the matter, not inside out. Among the rest, the
+// first in the hierarchy's order owns the cube. Map faces lie on whole
+// units, so on cube boundaries: the box grows by more than f32 rounds, so
+// a face on a boundary still overlaps, and goes to the cube behind it
+// alone, the same one for every pixel. Every ray asking about a cube gets
+// the same answer, whatever triangle it hit. NO_HIT for an empty cube.
 fn filler(center: vec3f, s: f32) -> u32 {
-	let at = center - vec3f(OWN * s);
-	let lo = at - 0.5 * s;
-	let hi = at + 0.5 * s;
+	let half = (0.5 + GROW) * s;
+	let lo = center - half;
+	let hi = center + half;
+	var behind = NO_HIT;
+	var front = NO_HIT;
 	var stack: array<u32, STACK>;
 	stack[0] = 0u;
 	var top = 1u;
@@ -324,8 +332,23 @@ fn filler(center: vec3f, s: f32) -> u32 {
 		if (node.count > 0u) {
 			for (var i = node.first; i < node.first + node.count; i += 1u) {
 				let tri = tris[i];
-				if (overlaps_box(tri, at, 0.5 * s) && albedo(tri, center).a >= 0.5) {
-					return i;
+				if (!overlaps_box(tri, center, half) || albedo(tri, center).a < 0.5) {
+					continue;
+				}
+				let off = dot(tri_normal(tri), center - tri.a.xyz);
+				if (off < 0.0) {
+					// Behind the face, inside the matter: the first in
+					// the hierarchy's order fills the cube.
+					if (behind == NO_HIT) {
+						behind = i;
+					}
+				} else if (front == NO_HIT) {
+					// In front of the face, its projection falls on the
+					// face itself: its distance to the triangle is its
+					// distance to the plane, not past an edge.
+					if (length(closest_point(center, tri) - center) - off <= 1e-3 * s) {
+						front = i;
+					}
 				}
 			}
 		} else if (top + 2u <= STACK) {
@@ -334,7 +357,12 @@ fn filler(center: vec3f, s: f32) -> u32 {
 			top += 2u;
 		}
 	}
-	return NO_HIT;
+	// A cube hanging in front of a face is matter only where a face
+	// behind it fills it.
+	if (behind == NO_HIT) {
+		return NO_HIT;
+	}
+	return select(behind, front, front != NO_HIT);
 }
 
 // Walks the grid of cells `s` wide from `start` to `end` along the ray:
@@ -370,22 +398,26 @@ fn first_cube(o: vec3f, d: vec3f, tri_index: u32, start: f32, end: f32, s: f32, 
 
 // A matter cube's look, one color whichever ray reaches it: stored in the
 // voxel field, or worked out by the first ray to land in it from the
-// triangle that ray met there — the mean of its texels lit facing the eye
-// off that surface, or for a bowl's cube facing its dent's center — and
-// stored. When the table has no room, it is worked out on the spot.
-fn cube_color(d: vec3f, cube: Cube, s: f32, near: ptr<function, Near>) -> vec3f {
+// plane that cube shows — the mean of its texels under the light on that
+// plane, its own normal, never one turned toward the eye, or for a
+// bowl's cube facing its dent's center — and stored. When the table has
+// no room, it is worked out on the spot.
+fn cube_color(cube: Cube, s: f32, near: ptr<function, Near>) -> vec3f {
 	let stored = stored_color(voxel_key(cube.cell, s));
 	if (stored.found) {
 		return stored.color;
 	}
 	let center = (cube.cell + 0.5) * s;
 	let tri = tris[cube.tri];
-	let n = facing(tri, d);
+	let n = tri_normal(tri);
 	var light = vec3f(0.0);
 	if (cube.dent >= 0) {
 		light = bowl_light(tri, center, n, (*near).dent[cube.dent]);
 	} else {
-		light = global_light(center - n * dot(n, center - tri.a.xyz), n, SHADED);
+		// The cube's light from the plane that fills it: its face's baked
+		// chart, else the live sun and sky for what the bake left out.
+		let p = center - n * dot(n, center - tri.a.xyz);
+		light = select(global_light(p, n, SHADED), baked_light_at(tri, p), is_baked(tri));
 	}
 	let color = light * voxel_albedo(tri, center, n, s);
 	store_color(stored, color);
@@ -573,7 +605,7 @@ fn radiance(o: vec3f, d: vec3f) -> Seen {
 		let center = (map.cell + 0.5) * s;
 		return inspect(d, map.t, map.cell, s, map.face, voxel_albedo(tri, center, n, s));
 	}
-	return Seen(cube_color(d, map, s, &near), map.t, true);
+	return Seen(cube_color(map, s, &near), map.t, true);
 }
 
 struct Pixel {
@@ -582,8 +614,10 @@ struct Pixel {
 	@builtin(frag_depth) depth: f32,
 }
 
-@fragment
-fn fs(@builtin(position) at: vec4f) -> Pixel {
+// The ray through `at` on screen, in pixels: what it shows, as linear
+// light on the screen — tone mapped when lit — and its view depth, reversed
+// as the overlays draw.
+fn sample(at: vec2f) -> vec4f {
 	let ndc = vec2f(at.x / view.size.x * 2.0 - 1.0, 1.0 - at.y / view.size.y * 2.0);
 	let d = normalize(view.forward.xyz + view.right.xyz * (ndc.x * view.right.w) + view.up.xyz * (ndc.y * view.up.w));
 	let seen = radiance(view.eye.xyz, d);
@@ -592,16 +626,59 @@ fn fs(@builtin(position) at: vec4f) -> Pixel {
 		if (view_mode() == 0u) {
 			color = aces(color * view.grade.x);
 		}
-		if (view.grade.y > 0.5) {
-			color = pow(color, vec3f(1.0 / 2.2));
-		}
-	} else if (view.grade.y < 0.5) {
-		// The target encodes to sRGB itself: hand it the shown value as linear.
+	} else {
+		// The debug views' values are as shown: back to light, so they
+		// average and encode like the rest.
 		color = pow(color, vec3f(2.2));
 	}
 	var depth = 0.0;
 	if (seen.t < 1e29) {
 		depth = clamp(view.grade.z / max(seen.t * dot(d, view.forward.xyz), 1e-6), 0.0, 1.0);
 	}
+	return vec4f(color, depth);
+}
+
+// Where in the pixel each ray goes, for 2 and 4 rays: a diagonal pair, and
+// a rotated grid, so edges at any angle land between samples.
+const PAIR: array<vec2f, 2> = array<vec2f, 2>(vec2f(-0.25, -0.25), vec2f(0.25, 0.25));
+const GRID: array<vec2f, 4> = array<vec2f, 4>(
+	vec2f(-0.125, -0.375),
+	vec2f(0.375, -0.125),
+	vec2f(0.125, 0.375),
+	vec2f(-0.375, 0.125),
+);
+
+@fragment
+fn fs(@builtin(position) at: vec4f) -> Pixel {
+	// Rays a pixel averages: one through its center, or `view.size.z`
+	// spread across it, so cubes smaller than the gaps between pixels and
+	// their edges blend instead of alias.
+	let rays = u32(view.size.z);
+	var sum = vec4f(0.0);
+	var depth = 0.0;
+	var count = 1u;
+	if (rays >= 4u) {
+		count = 4u;
+		for (var i = 0u; i < 4u; i += 1u) {
+			let one = sample(at.xy + GRID[i]);
+			sum += one;
+			depth = max(depth, one.w);
+		}
+	} else if (rays >= 2u) {
+		count = 2u;
+		for (var i = 0u; i < 2u; i += 1u) {
+			let one = sample(at.xy + PAIR[i]);
+			sum += one;
+			depth = max(depth, one.w);
+		}
+	} else {
+		sum = sample(at.xy);
+		depth = sum.w;
+	}
+	var color = sum.rgb / f32(count);
+	if (view.grade.y > 0.5) {
+		color = pow(color, vec3f(1.0 / 2.2));
+	}
+	// The nearest of the rays: overlays hide behind any matter in the pixel.
 	return Pixel(vec4f(color, 1.0), depth);
 }

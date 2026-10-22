@@ -11,8 +11,14 @@ struct Tri {
 	// Texture tiling coordinates: dot(xyz, p) + w, in whole textures.
 	su: vec4f,
 	sv: vec4f,
+	// The face's baked light mapping, shared by its whole fan: lm_u(p) =
+	// dot(xyz, p) + w, in its chart's texels, and lm_v likewise.
+	lmu: vec4f,
+	lmv: vec4f,
 	// Albedo atlas rectangle: x, y, w, h.
 	tex: vec4u,
+	// The face's baked chart in the light atlas: x, y, w, h; w 0 for none.
+	lmr: vec4u,
 }
 
 struct Node {

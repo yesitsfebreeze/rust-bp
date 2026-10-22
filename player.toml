@@ -3,14 +3,14 @@
 # World gravity, units/s².
 sv_gravity = 800.0
 
-# Ground acceleration, multiples of wish speed per second.
-sv_accelerate = 5.0
+# Ground acceleration, multiples of wish speed per second; doubled with sv_friction so top speed is unchanged. Not in CS 1.6.
+sv_accelerate = 10.0
 
 # Air acceleration; air wish speed is capped at 30 u/s.
 sv_airaccelerate = 10.0
 
-# Ground friction.
-sv_friction = 4.0
+# Ground friction; doubled from CS 1.6 so the player stops in half the distance. Not in CS 1.6.
+sv_friction = 8.0
 
 # Friction multiplier near a drop-off.
 sv_edgefriction = 2.0
@@ -35,6 +35,9 @@ sv_stepangle = 45.0
 
 # Movement ticks per second; rendering interpolates between ticks. CS 1.6 ran one tick per frame.
 sv_tickrate = 128.0
+
+# Buying never checks or spends money. Not in CS 1.6.
+sv_infinite_money = 1.0
 
 # Speed of the held weapon, u/s (knife 250, AWP 210).
 player_maxspeed = 250.0
@@ -64,31 +67,94 @@ m_yaw = 0.022
 m_pitch = 0.022
 
 # Horizontal field of view at 4:3, degrees; wider screens see more.
-fov = 91.12546
+fov = 92.93358
 
 # Draw the player between the last two ticks; 0 draws the last tick.
 cl_interp = 1.0
 
 # Show horizontal speed.
-cl_showspeed = 0.0
+cl_showspeed = 1.0
 
 # Show frame rate and tick rate.
 cl_showfps = 1.0
 
 # Draw the crosshair.
-cl_crosshair = 0.0
+cl_crosshair = 1.0
 
 # Bullets punch through thin walls, losing damage per material.
-sv_penetration = 0.0
+sv_penetration = 1.0
 
 # Subsurface scattering strength; 0 renders every surface opaque. Not in CS 1.6.
 r_subsurface = 1.0
 
 # Scene brightness before tone mapping. Not in CS 1.6.
-r_exposure = 0.9146679
+r_exposure = 0.91623616
+
+# Strength of the baked bounce and sky light, all but direct sun: 1 as baked, 0 sunlight alone. Not in CS 1.6.
+r_gi = 2.0
+
+# Screen-space ambient occlusion over the bounce and sky light: 0 off, 1 full. Not in CS 1.6.
+r_ao = 1.0
+
+# How far around a pixel ambient occlusion looks for matter, units. Not in CS 1.6.
+r_ao_radius = 96.0
+
+# Adapt brightness to the scene as an eye does: brighter indoors, darker in the sun. Not in CS 1.6.
+r_autoexposure = 1.0
+
+# Lowest exposure: the Brightness slider's left end, and the darkest auto exposure closes down to in bright scenes. Not in CS 1.6.
+r_exposure_min = 0.1
+
+# Highest exposure: the Brightness slider's right end, and the brightest auto exposure opens up to in dark scenes. Not in CS 1.6.
+r_exposure_max = 8.0
+
+# Fog thickness near the ground, squared, per thousand units: 0 clear air, 2 four times 1. Glows with the sky and toward the sun; thins with height. Not in CS 1.6.
+r_fog = 0.11808118
+
+# Units of height over which the fog thins to about a third: smaller hugs the ground. Not in CS 1.6.
+r_fog_height = 512.0
+
+# Fog color, red: tints the sky and sun light the fog glows with, 1 untinted. Not in CS 1.6.
+r_fog_r = 1.0
+
+# Fog color, green: tints the sky and sun light the fog glows with, 1 untinted. Not in CS 1.6.
+r_fog_g = 1.0
+
+# Fog color, blue: tints the sky and sun light the fog glows with, 1 untinted. Not in CS 1.6.
+r_fog_b = 1.0
+
+# Trace the sun's shadow per pixel, sharp; 0 reads the baked shadow, coarser and cheaper. Not in CS 1.6.
+r_shadows = 1.0
+
+# Physically based surfaces: specular highlights by each surface's roughness and metalness, and relief from its texture; 0 plain diffuse. Not in CS 1.6.
+r_pbr = 1.0
+
+# Dynamic lights, such as muzzle flashes, lighting and shadowing the world. Not in CS 1.6.
+r_dlights = 1.0
+
+# Moving things, the player and thrown spheres, cast shadows over the world's. Not in CS 1.6.
+r_dynshadows = 1.0
+
+# Wait for the display's refresh: no tearing, frame rate capped at the refresh rate. Not in CS 1.6.
+r_vsync = 1.0
+
+# Draw the map's surfaces as the triangles they are, at native resolution; 0 voxelizes into cubes. Not in CS 1.6.
+r_surface = 1.0
 
 # Pixels a voxel of the traced map spans at any distance: smaller is finer and slower. Not in CS 1.6.
-r_voxel = 2.0239854
+r_voxel = 16.0
 
-# March the map voxelized ahead into sparse shells around the eye instead of tracing each hit. Not in CS 1.6.
+# Rays the traced map averages per pixel, 1, 2 or 4: more smooths cubes finer than a pixel and their edges, costing about as much trace time again each. Not in CS 1.6.
+r_aa = 2.0
+
+# With r_shell: draw the map's triangles as pink wireframe over the voxelized world. Not in CS 1.6.
+r_wire = 0.0
+
+# Draw the map voxelized ahead of the eye into sparse shells, marching the cubes per pixel instead of tracing each hit. Not in CS 1.6.
 r_shell = 1.0
+
+# With r_shell: units out to which the smallest cubes are drawn; 0 grows them past r_voxel pixels. Not in CS 1.6.
+r_lod_near = 0.0
+
+# With r_shell: cube sizes up per doubling of distance past r_lod_near; below 1 holds detail farther. Not in CS 1.6.
+r_lod_curve = 1.0
