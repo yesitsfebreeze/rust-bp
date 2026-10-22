@@ -117,12 +117,7 @@ fn frame(
 			sky,
 			1.0,
 			true,
-			4.0,
 			0,
-			true,
-			false,
-			1,
-			false,
 			indirect,
 			super::world::Fog {
 				density: 0.0,
@@ -139,6 +134,7 @@ fn frame(
 		&scene,
 		&depth,
 		(WIDTH, HEIGHT),
+		indirect.ao > 0.0,
 	);
 	let row = (WIDTH * 4).next_multiple_of(256);
 	let read = device.create_buffer(&wgpu::BufferDescriptor {
@@ -267,13 +263,13 @@ fn snapshot() {
 		gi: 1.0,
 		ao: 1.0,
 		radius: 24.0,
-		traced: true,
+		sharp: true,
 	};
 	let bare = world::Indirect {
 		gi: 0.0,
 		ao: 0.0,
 		radius: 24.0,
-		traced: true,
+		sharp: true,
 	};
 	// The CPU's own picture of the sun's reach from each camera, ray
 	// traced through the same triangles: lit white by the sun's angle,
@@ -295,8 +291,8 @@ fn snapshot() {
 					None => [158, 181, 209],
 					Some((i, t)) => {
 						// The face's own outward normal, as the surfaces pass
-						// lights it: a face seen from behind — the map's
-						// shell from outside — faces away from the eye.
+						// lights it: a face seen from behind — the map
+						// from outside — faces away from the eye.
 						let n = physics::triangle_normal(&scene.tris[i]);
 						let p = view.eye + d * t + n * 0.125;
 						let n_l = n.dot(sun).max(0.0);

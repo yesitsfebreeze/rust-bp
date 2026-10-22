@@ -430,7 +430,9 @@ impl<'a> Ui<'a> {
 	/// Begins a scrolled area over `view`: the wheel over it, or the bar
 	/// down its right side, scrolls it by `scroll`. Returns where to lay its
 	/// content out — as wide as the view less the bar, starting above the
-	/// view by the offset, as tall as the content may be. Everything drawn
+	/// view by the offset, with no bottom: rows cut from it keep their
+	/// heights past the view's, so [`Ui::end_scroll`] measures the whole
+	/// content and the bar appears once it overflows. Everything drawn
 	/// until [`Ui::end_scroll`] is cut to the view.
 	pub fn scroll(&mut self, view: Rect, scroll: &mut Scroll) -> Rect {
 		let over = scroll.content - view.h;
@@ -473,7 +475,7 @@ impl<'a> Ui<'a> {
 		self.scrolling = Some((view, top));
 		self.gfx.set_clip(Some([view.x, view.y, view.w, view.h]));
 		let w = if bar { view.w - BAR - 6.0 } else { view.w };
-		Rect::new(view.x, top, w, scroll.content.max(view.h))
+		Rect::new(view.x, top, w, f32::INFINITY)
 	}
 
 	/// Ends the scrolled area [`Ui::scroll`] began, its content having

@@ -213,7 +213,7 @@ impl Menu {
 				);
 				ui.slider(next(48.0), "Brightness", &mut cvars.r_exposure, lo, hi);
 				toggle(ui, next(24.0), "Auto exposure", &mut cvars.r_autoexposure);
-				toggle(ui, next(24.0), "Traced sun shadows", &mut cvars.r_shadows);
+				toggle(ui, next(24.0), "Sharp sun shadows", &mut cvars.r_shadows);
 				toggle(ui, next(24.0), "Wait for vertical sync", &mut cvars.r_vsync);
 				toggle(ui, next(24.0), "Anti-aliasing (FXAA)", &mut cvars.r_fxaa);
 				toggle(

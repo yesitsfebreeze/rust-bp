@@ -70,7 +70,7 @@ fn ray_tri(origin: Vec3, dir: Vec3, tri: &Triangle) -> Option<(f32, bool)> {
 /// which triangle, front hit). `None` takes either side, `Some(false)` looks
 /// for a wall's far side only. The BVH prunes to the triangles the ray can
 /// actually touch.
-fn nearest_hit(
+pub(crate) fn nearest_hit(
 	mesh: &Mesh,
 	origin: Vec3,
 	dir: Vec3,

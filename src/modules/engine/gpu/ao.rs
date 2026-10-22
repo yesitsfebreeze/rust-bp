@@ -108,7 +108,9 @@ impl Ambient {
 	/// Carries the world pass's `scene` into `target`, each drawn pixel
 	/// shaded by what its `depth` shows standing near it, read as `view`,
 	/// the world pass's uniform, and fogged in the sun and sky `lighting`
-	/// holds. `size` is the frame's, in pixels.
+	/// holds. `size` is the frame's, in pixels. Without `occlude` the
+	/// occlusion pass is skipped: the composite reads no openness when the
+	/// view's occlusion strength is 0.
 	#[allow(clippy::too_many_arguments)]
 	pub fn draw(
 		&mut self,
@@ -120,6 +122,7 @@ impl Ambient {
 		view: &wgpu::Buffer,
 		lighting: &wgpu::Buffer,
 		size: (u32, u32),
+		occlude: bool,
 	) {
 		let open = self.open(device, size);
 		let pass = |encoder: &mut wgpu::CommandEncoder,
@@ -146,15 +149,17 @@ impl Ambient {
 			pass.set_bind_group(0, group, &[]);
 			pass.draw(0..3, 0..1);
 		};
-		let occlusion = device.create_bind_group(&wgpu::BindGroupDescriptor {
-			label: Some("ao occlusion"),
-			layout: &self.occlusion_layout,
-			entries: &[
-				util::bind(0, view),
-				entry(1, wgpu::BindingResource::TextureView(depth)),
-			],
-		});
-		pass(encoder, "ao occlusion", &open, &self.occlusion, &occlusion);
+		if occlude {
+			let occlusion = device.create_bind_group(&wgpu::BindGroupDescriptor {
+				label: Some("ao occlusion"),
+				layout: &self.occlusion_layout,
+				entries: &[
+					util::bind(0, view),
+					entry(1, wgpu::BindingResource::TextureView(depth)),
+				],
+			});
+			pass(encoder, "ao occlusion", &open, &self.occlusion, &occlusion);
+		}
 		let composite = device.create_bind_group(&wgpu::BindGroupDescriptor {
 			label: Some("ao composite"),
 			layout: &self.composite_layout,

@@ -17,11 +17,10 @@
 // every corner and sharp along every silhouette.
 //
 // Only ambient light is occluded — sky, bounces and lamps; the straight
-// sun either reaches a point or its shadow ray already holds it back — so
+// sun either reaches a point or its shadow map already holds it back — so
 // the darkening lands on the share of the color the world pass wrote in
-// alpha, at the strength `view.light.y`. The traced view draws its whole
-// screen at depth 0 and the sky never draws, so both pass through
-// unchanged, as does every debug view.
+// alpha, at the strength `view.light.y`. The sky never draws, so it passes
+// through unchanged, as does every debug view.
 //
 // Last the pixel is fogged by the air between the eye and what it shows:
 // fog `view.fog.x` thick at height 0, thinning by e every `view.fog.y`
@@ -31,7 +30,7 @@
 // light all around and the sun's ahead of it, scattered mostly forward,
 // tone mapped as the world pass maps its colors, and laid over the pixel
 // by how much of it the air hides. No shadow reaches the fog: it glows the
-// same in the shade. Only the surface view sets `view.fog.x`.
+// same in the shade.
 //
 // First of all, with `view.fog.z` set, the color itself is read smoothed
 // along the edges it shows (FXAA): where the brightness steps sharply
@@ -41,32 +40,27 @@
 // the slope it stands for. Only the lit view smooths; debug views stay
 // exact.
 
-// The view uniform is `View` as the trace's passes declare it.
+// The view uniform is `View` as raster.wgsl declares it, with the fog.
 struct View {
-	// xyz eye; w the angle one pixel spans, radians.
+	// xyz eye.
 	eye: vec4f,
 	// xyz camera right; w tan(fovy / 2) * aspect.
 	right: vec4f,
 	// xyz camera up; w tan(fovy / 2).
 	up: vec4f,
-	// xyz view direction; w pixels per voxel, `K`.
+	// xyz view direction.
 	forward: vec4f,
-	// rgb linear sky radiance behind everything; w the smallest voxel,
-	// world units.
+	// rgb linear sky radiance behind everything.
 	sky: vec4f,
 	// x exposure; y 1 when this pass must sRGB-encode; z the near plane;
 	// w the view mode: 0 lit, else a debug view.
 	grade: vec4f,
-	// xy viewport pixels; z rays averaged per pixel: 1, 2 or 4; w 1 when
-	// the map's triangles draw as pink wireframe.
+	// xy viewport pixels.
 	size: vec4f,
-	// x the frame number so far. y how many times the dents changed.
-	frame: vec4u,
 	// x scale on the baked ambient light, all but the straight sun; y the
 	// ambient occlusion's strength, 0 off to 1 full; z how far around a
-	// pixel it looks, world units; w 1 when the sun's shadow is traced per
-	// pixel, 0 when the bake's is read. Only the raster and the occlusion
-	// pass declare it: the other passes' `View` ends before it.
+	// pixel it looks, world units; w 1 when the sun's shadow is read from
+	// the shadow map, 0 when the lightmap's coarser one is.
 	light: vec4f,
 	// x the fog's extinction per world unit at height 0, 0 clear; y the
 	// height it thins by e over, world units; z 1 when the color is

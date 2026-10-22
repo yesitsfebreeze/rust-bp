@@ -18,6 +18,8 @@
 // traces and the weapon table headless, so these stay public.
 pub mod bullets;
 pub mod cvars;
+pub mod editor;
+pub mod level;
 pub mod materials;
 mod menu;
 pub mod player;
@@ -33,6 +35,55 @@ fn root() -> &'static std::path::Path {
 		.and_then(std::path::Path::parent)
 		.and_then(std::path::Path::parent)
 		.expect("gameplay crate must be under src/modules")
+}
+
+/// The `.obj` models the level editor can place: every one under
+/// `assets/models`, by file name, sorted.
+fn model_names() -> Vec<String> {
+	let mut names: Vec<String> = std::fs::read_dir(root().join("assets").join("models"))
+		.into_iter()
+		.flatten()
+		.flatten()
+		.filter_map(|e| e.file_name().into_string().ok())
+		.filter(|n| n.to_ascii_lowercase().ends_with(".obj"))
+		.collect();
+	names.sort();
+	names
+}
+
+/// A model's triangles by file name, none when it will not load.
+fn load_model(name: &str) -> Option<Vec<[Vec3; 3]>> {
+	if name.is_empty() {
+		return None;
+	}
+	level::load_obj(&root().join("assets").join("models").join(name)).ok()
+}
+
+/// The map at `path` with `level`'s geometry joined to it.
+fn build_map(path: &std::path::Path, level: &Level) -> Result<bsp::Map, String> {
+	let mut map = bsp::load(path)?;
+	level.apply(&mut map, &load_model);
+	Ok(map)
+}
+
+/// `level`'s part of the bake cache's key: its file, and nothing for an
+/// empty level, so a map without one keys its bake by itself alone.
+fn level_key(level: &Level) -> Vec<u8> {
+	if level.objects.is_empty() {
+		Vec::new()
+	} else {
+		level.to_toml().into_bytes()
+	}
+}
+
+/// The light around a prop at `p`: the bake's on the ground under it,
+/// halved — the floor's glow bounced back up — or a dim sky with no ground
+/// under it.
+fn probe(baked: &engine::lightbake::Baked, mesh: &physics::Mesh, p: Vec3) -> Vec3 {
+	bullets::nearest_hit(mesh, p, -Vec3::Y, None)
+		.and_then(|(t, _, _)| baked.at(p - Vec3::Y * t))
+		.map(|(_, light)| light * 0.5)
+		.unwrap_or(vec3(0.15, 0.15, 0.15))
 }
 
 fn selected_map(args: &[String]) -> std::path::PathBuf {
@@ -52,6 +103,8 @@ use player::movement::{angle_vectors, clamp_wish};
 use player::{Input, Player};
 
 use crate::bullets::Shot;
+use crate::editor::{Editor, Request};
+use crate::level::{Kind, Level, Props};
 use crate::cvars::{movement_vars, Cvars};
 use crate::materials::SurfaceMaterial;
 use crate::weapons::{load, load_clip, Armed, Table};
@@ -377,7 +430,16 @@ pub fn play(
 	load_config(&mut console, &mut cvars);
 	console.print("type help for commands");
 
-	let map = match bsp::load(&map_path) {
+	// The level the editor placed over the map, its geometry joined to the
+	// map's: drawn, collided with and baked as the map's own.
+	let level_path = Level::path(&map_path);
+	let mut level = Level::load(&level_path).unwrap_or_else(|e| {
+		console.print(format!("level unreadable, starting empty: {e}"));
+		Level::default()
+	});
+	let models = model_names();
+	let mut editor = Editor::new();
+	let map = match build_map(&map_path, &level) {
 		Ok(map) => map,
 		Err(e) => {
 			eprintln!("{e}");
@@ -401,7 +463,7 @@ pub fn play(
 	// texel, cached beside the map after the first bake. The surface pass
 	// samples it as lightmaps, so its shadows and ambient light are the
 	// bake's, sharp.
-	let (baked, from_cache) = match lightmap::bake_or_load(&map, &map_path) {
+	let (mut baked, from_cache) = match lightmap::bake_or_load_level(&map, &map_path, &level_key(&level)) {
 		Ok(baked) => baked,
 		Err(e) => {
 			eprintln!("{e}");
@@ -417,9 +479,12 @@ pub fn play(
 		"light bake: baked fresh".into()
 	});
 	let traced = window.gfx().load_world(&map, &light, &baked);
+	// What new geometry can be dressed in, and the props over the map.
+	let textures = map.render.textures.clone();
+	let mut props = Props::new(&level, &map.world);
 	console.print(format!("traced world: {} triangles", traced.triangles));
 	// The map's collision mesh, with the physics playground's spheres in it.
-	let (mut play, surfaces, spawn, spawn_yaw, spawn_pitch, kill_y) = (
+	let (mut play, mut surfaces, spawn, spawn_yaw, spawn_pitch, kill_y) = (
 		physics::World::new(map.world),
 		map.surfaces,
 		map.spawn,
@@ -646,7 +711,7 @@ pub fn play(
 			}
 		} else if keys.pressed(Key::Escape) && !buy_menu {
 			menu.escape(&mut cvars);
-		} else if !menu.open && keys.pressed(Key::KeyF) {
+		} else if !menu.open && !editor.open && keys.pressed(Key::KeyF) {
 			fly = !fly;
 			if fly {
 				fly_eye = player.eye();
@@ -654,6 +719,20 @@ pub fn play(
 			console.print(format!("flycam {}", if fly { "on" } else { "off" }));
 		}
 		let typing = typing || menu.open;
+		// F2 opens the level editor over the map: the flycam takes the view,
+		// and the props stand back where they were placed.
+		if !typing && keys.pressed(Key::F2) {
+			editor.open = !editor.open;
+			fly = editor.open;
+			if fly {
+				fly_eye = player.eye();
+			}
+			props = Props::new(&level, &play.mesh);
+			console.print(format!(
+				"level editor {}",
+				if editor.open { "on" } else { "off" }
+			));
+		}
 		// B is the buy menu; there the number keys buy, elsewhere they switch.
 		if !typing && keys.pressed(Key::KeyB) {
 			buy_menu = !buy_menu;
@@ -735,7 +814,11 @@ pub fn play(
 				console.print(format!("{} not owned; B to buy", table.weapons[i].name));
 			}
 		}
-		let looking = !typing && keys.focused();
+		// In the editor the cursor is free, the view turning only while the
+		// right button is held.
+		let looking = !typing
+			&& keys.focused()
+			&& (!editor.open || keys.button_down(MouseButton::Right));
 		window.grab_cursor(looking);
 
 		// Look: raw counts every frame, never waiting for a tick.
@@ -745,6 +828,8 @@ pub fn play(
 			yaw = (yaw + dx * scale * cvars.m_yaw).rem_euclid(360.0);
 			pitch = (pitch + dy * scale * cvars.m_pitch).clamp(-89.0, 89.0);
 		}
+		// The editor's clicks and keys are its own: no weapon answers them.
+		let looking = looking && !editor.open;
 
 		let down = |k: Key| !typing && keys.down(k);
 		jump_pressed |= !typing && (keys.pressed(Key::Space) || keys.wheel() != 0.0);
@@ -1064,22 +1149,27 @@ pub fn play(
 			play.bodies.clear();
 		}
 		play.step(frame, true);
+		// The props hold still while the editor places them.
+		if !editor.open {
+			props.world.step(frame, true);
+		}
 		play.bodies.retain(|b| b.pos.y > kill_y);
-		let spheres: Vec<(Vec3, f32)> = play.bodies.iter().map(|b| (b.pos, b.radius)).collect();
+		let mut spheres: Vec<(Vec3, f32)> = play.bodies.iter().map(|b| (b.pos, b.radius)).collect();
+		// The level's balls draw with the playground's spheres.
+		spheres.extend(
+			props
+				.bodies(&level)
+				.filter(|(_, o)| o.kind == Kind::Ball)
+				.map(|(b, _)| (b.pos, b.radius)),
+		);
 
 		let fps = window.fps();
 		let gfx = window.gfx();
 		gfx.set_exposure(cvars.r_exposure);
 		gfx.set_bodies(&spheres);
-		gfx.set_voxel(cvars.r_voxel);
-		gfx.set_shell(cvars.r_shell != 0.0);
-		gfx.set_surfaces(cvars.r_surface != 0.0);
-		gfx.set_wire(cvars.r_wire != 0.0);
-		gfx.set_lod(cvars.r_lod_near, cvars.r_lod_curve);
-		gfx.set_rays(cvars.r_aa);
 		gfx.set_smooth(cvars.r_fxaa != 0.0);
 		gfx.set_indirect(cvars.r_gi, cvars.r_ao, cvars.r_ao_radius);
-		gfx.set_traced_shadows(cvars.r_shadows != 0.0);
+		gfx.set_sharp_shadows(cvars.r_shadows != 0.0);
 		gfx.set_fog(
 			cvars.r_fog,
 			cvars.r_fog_height,
@@ -1102,6 +1192,23 @@ pub fn play(
 		if flash.0 > 0.0 {
 			gfx.light(flash.1, FLASH_COLOR * (flash.0 / FLASH_LIFE), FLASH_REACH);
 			flash.0 -= frame;
+		}
+		// The level's lights, and its crates where their bodies are, in the
+		// light around them, casting a shadow about their size.
+		for o in level.objects.iter().filter(|o| o.kind == Kind::Light) {
+			let [r, g, b] = o.color;
+			gfx.light(o.pos, vec3(r, g, b) * o.intensity, o.reach);
+		}
+		for (body, o) in props.bodies(&level) {
+			if o.kind == Kind::Crate {
+				let dressed = level::dress(&textures, &o.texture);
+				gfx.faces(
+					&level::crate_faces(body, o.size, dressed),
+					probe(&baked, &play.mesh, body.pos),
+				);
+				let r = o.size.x.min(o.size.y).min(o.size.z) * 0.6;
+				gfx.occluder(body.pos, body.pos, r);
+			}
 		}
 		gfx.set_view(View {
 			eye,
@@ -1200,6 +1307,70 @@ pub fn play(
 					color,
 				);
 				y += 26.0;
+			}
+		}
+		if editor.open && !menu.open {
+			let camera = editor::Camera {
+				eye,
+				forward,
+				right,
+				up,
+				fovy,
+			};
+			let requests = editor.frame(
+				gfx,
+				&keys,
+				&camera,
+				&mut level,
+				&textures,
+				&models,
+				&play.mesh,
+			);
+			for request in requests {
+				let (rebuild, bake) = match request {
+					Request::Rebuild => (true, false),
+					Request::Bake => (true, true),
+					Request::Reset => {
+						props = Props::new(&level, &play.mesh);
+						(false, false)
+					}
+					Request::Save => (false, false),
+				};
+				if matches!(request, Request::Save | Request::Bake) {
+					editor.status = match level.save(&level_path) {
+						Ok(()) => format!("saved {}", level_path.display()),
+						Err(e) => e,
+					};
+					console.print(editor.status.clone());
+				}
+				if !rebuild {
+					continue;
+				}
+				let map = match build_map(&map_path, &level) {
+					Ok(map) => map,
+					Err(e) => {
+						editor.status = e;
+						continue;
+					}
+				};
+				if bake {
+					let started = std::time::Instant::now();
+					match lightmap::bake_or_load_level(&map, &map_path, &level_key(&level)) {
+						Ok((b, _)) => {
+							baked = b;
+							editor.status = format!(
+								"baked in {:.1} s",
+								started.elapsed().as_secs_f32()
+							);
+						}
+						Err(e) => editor.status = format!("bake failed: {e}"),
+					}
+					console.print(editor.status.clone());
+				}
+				gfx.load_world(&map, &light, &baked);
+				surfaces = map.surfaces;
+				play.mesh = map.world;
+				props = Props::new(&level, &play.mesh);
 			}
 		}
 		match menu.frame(gfx, &keys, &mut cvars) {

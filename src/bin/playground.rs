@@ -1,11 +1,10 @@
 //! The playground: the engine without a map file. The arena is generated in
 //! code — boxes and a ramp — and the same geometry feeds collision, the
-//! raycast renderer and the light sources, so movement, physics and lighting
+//! renderer and the light sources, so movement, physics and lighting
 //! can be tried where every input is known. No BSP, no WADs, no weapons.
 //!
 //! WASD move - mouse look - Space or mouse wheel jump - Ctrl or C duck -
-//! Shift walk - F flycam - G throws a physics sphere, H clears them and the
-//! dents they struck into the map - ` or
+//! Shift walk - F flycam - G throws a physics sphere, H clears them - ` or
 //! F1 console - Esc frees the mouse, click to grab it again.
 //!
 //! Cvars load from `playground.toml` beside the workspace root; a missing one
@@ -13,7 +12,7 @@
 
 use engine::bsp::{Atlas, Face, Map, MapRender, Rect, Vert};
 use engine::console::{Action, Console};
-use engine::gpu::{Color, Gfx, Key, MouseButton, View, Window, MAX_DENTS};
+use engine::gpu::{Color, Gfx, Key, MouseButton, View, Window};
 use engine::lightbake;
 use engine::linalg::{vec3, Vec3};
 use engine::physics;
@@ -26,12 +25,6 @@ use gameplay::{draw_console, load_config, type_into, vertical_fov};
 /// Spheres in the playground at most; past it, the oldest goes. The
 /// renderer's body buffer is this big.
 const BODY_CAP: usize = 64;
-/// Speed into the map, units per second, a sphere strikes it at before it
-/// dents; and the speed past that at which the dent is deepest.
-const DENT_SPEED: f32 = 250.0;
-const DENT_FULL: f32 = 600.0;
-/// The deepest dent, in sphere radii.
-const DENT_DEPTH: f32 = 0.6;
 /// Longest frame time simulated; a longer stall drops time instead of piling up ticks.
 const MAX_FRAME: f32 = 0.25;
 /// World units one albedo tile repeats over; the atlas tiles are 1024 texels.
@@ -391,38 +384,6 @@ fn hud(gfx: &mut Gfx, fps: u32, player: &Player, fly: bool, bodies: usize, ticks
 	}
 }
 
-/// The dent a sphere moving at `before` leaves, if its velocity lost
-/// enough into a triangle of `mesh` this step: the sphere's own shape, its
-/// center pushed into the surface by the depth the strike earns.
-fn dent(mesh: &physics::Mesh, body: &physics::Body, before: Vec3) -> Option<(Vec3, f32)> {
-	let lost = body.vel - before;
-	if lost.length() < DENT_SPEED {
-		return None;
-	}
-	// The surface the push came from: back along it from the center.
-	let away = lost.normalize();
-	let (p, q) = (body.pos, body.pos - away * (body.radius * 1.5));
-	let (t, tri) = mesh
-		.ray_tris(p, -away)
-		.filter_map(|(_, tri)| {
-			let t = physics::intersect_segment_triangle(p, q, tri)
-				.or_else(|| physics::intersect_segment_triangle(p, q, &[tri[0], tri[2], tri[1]]))?;
-			Some((t, tri))
-		})
-		.min_by(|a, b| a.0.total_cmp(&b.0))?;
-	let mut n = physics::triangle_normal(tri);
-	if n.dot(away) < 0.0 {
-		n = -n;
-	}
-	let speed = -before.dot(n);
-	if speed < DENT_SPEED {
-		return None;
-	}
-	let depth = body.radius * DENT_DEPTH * ((speed - DENT_SPEED) / DENT_FULL).min(1.0);
-	let at = p + (q - p) * t;
-	Some((at + n * (body.radius - depth), body.radius))
-}
-
 fn main() {
 	let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("playground.toml");
 	let mut console = Console::new(config);
@@ -450,12 +411,10 @@ fn main() {
 		}
 	};
 	let traced = window.gfx().load_world(&map, &light, &baked);
-	console.print(format!("traced world: {} triangles", traced.triangles));
+	console.print(format!("world: {} triangles", traced.triangles));
 	// The arena's collision mesh, with the playground's spheres in it.
 	// GoldSrc gravity, so spheres fall like the player does.
 	let mut play = physics::World::new(map.world);
-	// Dents the spheres struck into the map, oldest first.
-	let mut dents: Vec<(Vec3, f32)> = Vec::new();
 	play.gravity = vec3(0.0, -800.0, 0.0);
 	let (spawn, spawn_yaw, spawn_pitch, kill_y) =
 		(map.spawn, map.spawn_yaw, map.spawn_pitch, map.kill_y);
@@ -638,17 +597,8 @@ fn main() {
 		}
 		if looking && keys.pressed(Key::KeyH) {
 			play.bodies.clear();
-			dents.clear();
 		}
-		let before: Vec<Vec3> = play.bodies.iter().map(|b| b.vel).collect();
 		play.step(frame_time.min(MAX_FRAME), true);
-		let struck = dents.len();
-		for (body, &vel) in play.bodies.iter().zip(&before) {
-			dents.extend(dent(&play.mesh, body, vel));
-		}
-		if dents.len() > MAX_DENTS {
-			dents.drain(..dents.len() - MAX_DENTS);
-		}
 		play.bodies.retain(|b| b.pos.y > kill_y);
 		let spheres: Vec<(Vec3, f32)> = play.bodies.iter().map(|b| (b.pos, b.radius)).collect();
 
@@ -656,17 +606,9 @@ fn main() {
 		let gfx = window.gfx();
 		gfx.set_exposure(cvars.r_exposure);
 		gfx.set_bodies(&spheres);
-		if dents.len() != struck || keys.pressed(Key::KeyH) {
-			gfx.set_dents(&dents);
-		}
-		gfx.set_voxel(cvars.r_voxel);
-		gfx.set_shell(cvars.r_shell != 0.0);
-		gfx.set_surfaces(cvars.r_surface != 0.0);
-		gfx.set_lod(cvars.r_lod_near, cvars.r_lod_curve);
-		gfx.set_rays(cvars.r_aa);
 		gfx.set_smooth(cvars.r_fxaa != 0.0);
 		gfx.set_indirect(cvars.r_gi, cvars.r_ao, cvars.r_ao_radius);
-		gfx.set_traced_shadows(cvars.r_shadows != 0.0);
+		gfx.set_sharp_shadows(cvars.r_shadows != 0.0);
 		gfx.set_fog(
 			cvars.r_fog,
 			cvars.r_fog_height,

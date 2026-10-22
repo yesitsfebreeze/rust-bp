@@ -79,7 +79,6 @@ pub fn sampler_entry(binding: u32, stages: wgpu::ShaderStages) -> wgpu::BindGrou
 	}
 }
 
-pub const READ: wgpu::BufferBindingType = wgpu::BufferBindingType::Storage { read_only: true };
 pub const WRITE: wgpu::BufferBindingType = wgpu::BufferBindingType::Storage { read_only: false };
 pub const UNIFORM: wgpu::BufferBindingType = wgpu::BufferBindingType::Uniform;
 
@@ -95,15 +94,6 @@ pub fn buffer(
 		size,
 		usage,
 		mapped_at_creation: false,
-	})
-}
-
-/// A storage buffer holding `contents`.
-pub fn storage(device: &wgpu::Device, label: &str, contents: &[u8]) -> wgpu::Buffer {
-	device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-		label: Some(label),
-		contents,
-		usage: wgpu::BufferUsages::STORAGE,
 	})
 }
 

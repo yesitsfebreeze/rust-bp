@@ -1,20 +1,30 @@
-// The map's surfaces drawn as themselves: the triangles the BSP wound,
-// in a vertex buffer at load, rasterized at the screen's native resolution
-// into the hardware's own depth test. bvh.wgsl is prepended: each lit
-// pixel casts one ray toward the sun through the map's hierarchy, so the
-// sun's shadow lands exactly where the geometry puts it, as sharp as the
-// screen.
-// Each fragment takes two hardware-filtered taps: the albedo atlas at the
-// corner's whole-tile uv, and the baked light at the corner's lightmap
-// texel — the bake's direct sun, sky and bounces, so shadows and ambient
-// light come out as sharp as its texels. The straight sun is taken back
-// out of the baked light — its color and angle are the bake's own, its
-// visibility the texel's alpha — and lit again through the pixel's own
-// shadow ray, so the bake's coarse luxels never shape a sun shadow; the
+// The world's one renderer: the map's surfaces drawn as themselves, the
+// triangles the BSP wound, in a vertex buffer at load, rasterized at the
+// screen's native resolution into the hardware's own depth test.
+//
+// Every frame draws the map twice in one pass. First depth alone
+// (`vs_depth`/`fs_depth`): the cheapest fragment there is, one albedo tap
+// for its alpha, see-through texels discarding so what lies behind shows.
+// Then the lit draw (`vs`/`fs`) tests depth for equality and never
+// discards, so the hardware's early depth test throws away every hidden
+// fragment before it shades: each pixel is lit once, however deep the
+// map stands behind it. Both passes place their corners with the same
+// `@invariant` math, so their depths agree to the bit.
+//
+// No ray is cast per pixel. The sun is static and so is the map, so its
+// shadow is baked once at load (`vs_shadow`/`fs_shadow`): the map drawn
+// from the sun into a depth map over its whole extent, see-through texels
+// casting no shadow. Each lit pixel reads it with one filtered comparison
+// tap, as sharp as the shadow map's texels — finer than the lightmap's.
+// Each fragment also takes two hardware-filtered taps: the albedo atlas at
+// the corner's whole-tile uv, and the baked light at the corner's lightmap
+// texel — the bake's direct sun, sky and bounces. The straight sun is
+// taken back out of the baked light — its color and angle are the bake's
+// own, its visibility the texel's alpha — and lit again through the
+// shadow map, so the bake's coarse luxels never shape a sun shadow; the
 // rest, the ambient sky, bounces and lamps, scales on its own, and its
 // share of the lit color rides out in alpha for the ambient occlusion pass
 // to darken (see ao.wgsl).
-// See-through texels discard, showing what lies behind.
 //
 // Light lands physically: each face carries a finish — roughness and
 // metalness — and the sun and the frame's dynamic lights reflect off it by
@@ -24,39 +34,35 @@
 // across the screen bending the normal. The frame's moving things —
 // capsules and spheres — stand in the light of the sun and every dynamic
 // light, so the player and the playground's spheres cast shadows over the
-// baked and traced world shadows alike. The spheres themselves are drawn
-// here too, instanced from the playground's buffer (`vs_body`).
+// world's. Dynamic lights cast no world shadow: no ray is cast. The
+// spheres themselves are drawn here too, instanced from the playground's
+// buffer (`vs_body`).
 //
-// The view uniform is `View` as the trace's passes declare it, and the
+// The view uniform is `View` as ao.wgsl declares it, less its fog, and the
 // depth is reversed and infinite, near / view depth, as the overlays draw:
 // lines and boxes over the world hide behind it exactly where the map
 // stands in front of them.
 
 struct View {
-	// xyz eye; w the angle one pixel spans, radians.
+	// xyz eye.
 	eye: vec4f,
 	// xyz camera right; w tan(fovy / 2) * aspect.
 	right: vec4f,
 	// xyz camera up; w tan(fovy / 2).
 	up: vec4f,
-	// xyz view direction; w pixels per voxel, `K`.
+	// xyz view direction.
 	forward: vec4f,
-	// rgb linear sky radiance behind everything; w the smallest voxel,
-	// world units.
+	// rgb linear sky radiance behind everything.
 	sky: vec4f,
 	// x exposure; y 1 when this pass must sRGB-encode; z the near plane;
 	// w the view mode: 0 lit, else a debug view.
 	grade: vec4f,
-	// xy viewport pixels; z rays averaged per pixel: 1, 2 or 4; w 1 when
-	// the map's triangles draw as pink wireframe.
+	// xy viewport pixels.
 	size: vec4f,
-	// x the frame number so far. y how many times the dents changed.
-	frame: vec4u,
 	// x scale on the baked ambient light, all but the straight sun; y the
 	// ambient occlusion's strength, 0 off to 1 full; z how far around a
-	// pixel it looks, world units; w 1 when the sun's shadow is traced per
-	// pixel, 0 when the bake's is read. Only the raster and the occlusion
-	// pass declare it: the other passes' `View` ends before it.
+	// pixel it looks, world units; w 1 when the sun's shadow is read from
+	// the shadow map, 0 when the lightmap's coarser one is.
 	light: vec4f,
 }
 
@@ -110,28 +116,50 @@ struct Dynamic {
 @group(0) @binding(7) var<uniform> dynamic: Dynamic;
 @group(0) @binding(11) var<uniform> lighting: Lighting;
 
+// The sun's view, as raster.rs fits it around the map: three rows taking
+// a world point to the shadow map's clip space — x and y across it, -1 to
+// 1, z its depth away from the sun, 0 to 1 — and in `texel.x` the world
+// size of one shadow map texel.
+struct Sun {
+	x: vec4f,
+	y: vec4f,
+	z: vec4f,
+	texel: vec4f,
+}
+
+@group(0) @binding(8) var<uniform> sun_view: Sun;
+// The map's depth seen from the sun, baked once at load, and the sampler
+// comparing against it: lit where a point stands no deeper, its four
+// nearest texels' answers filtered.
+@group(0) @binding(9) var shadow_map: texture_depth_2d;
+@group(0) @binding(10) var shadow_cmp: sampler_comparison;
+
 const PI: f32 = 3.14159265;
+// Past every distance in the map: a ray that reaches no light's position.
+const MISS: f32 = 3.4e38;
 // How far off the surface shadow rays start, world units, so they do not
-// hit the triangle they leave.
+// hit the shape they leave.
 const SHADOW_OFFSET: f32 = 0.125;
-// The depth view's far end, world units, as in trace.wgsl.
+// How far a point steps off its face before it reads the shadow map, in
+// shadow map texels: past the depth the texel it lands on holds, so a
+// face never shadows itself at grazing sun.
+const SHADOW_NORMAL_TEXELS: f32 = 1.5;
+// The depth view's far end, world units.
 const DEPTH_RANGE: f32 = 4096.0;
 // How high the albedo's brightest texel stands over its darkest, world
 // units, for the relief.
 const RELIEF: f32 = 1.5;
 // Reflectance of every non-metal seen straight on.
 const DIELECTRIC: f32 = 0.04;
-// The playground spheres' matter, as linear albedo, as in trace.wgsl, and
-// their finish.
+// The playground spheres' matter, as linear albedo, and their finish.
 const BODY: vec3f = vec3f(0.56, 0.38, 0.19);
 const BODY_ROUGHNESS: f32 = 0.5;
 
-// The debug views F5 cycles through, after the lit one, as in trace.wgsl.
+// The debug views F5 cycles through, after the lit one, as `VIEW_MODES`
+// in mod.rs names them.
 const VIEW_DEPTH: u32 = 1u;
 const VIEW_NORMAL: u32 = 2u;
 const VIEW_ALBEDO: u32 = 3u;
-const VIEW_CUBES: u32 = 4u;
-const VIEW_SIZE: u32 = 5u;
 
 fn view_mode() -> u32 {
 	return u32(view.grade.w);
@@ -154,7 +182,8 @@ struct Corner {
 }
 
 struct Varying {
-	@builtin(position) clip: vec4f,
+	// Invariant, as the depth pass's: the lit draw tests its depth equal.
+	@invariant @builtin(position) clip: vec4f,
 	@location(0) pos: vec3f,
 	@location(1) uv: vec2f,
 	@location(2) n: vec3f,
@@ -284,6 +313,20 @@ fn moving_blocks(o: vec3f, d: vec3f, far: f32) -> bool {
 	return false;
 }
 
+// How much of the sun reaches `pos` on a face of outward normal `face`,
+// 0 to 1, by the shadow map: the point stepped off its face, then
+// compared against the four nearest texels, filtered. Off the map's extent
+// the sun is unblocked.
+fn sun_visible(pos: vec3f, face: vec3f) -> f32 {
+	let p = pos + face * (sun_view.texel.x * SHADOW_NORMAL_TEXELS);
+	let at = vec3f(dot(sun_view.x.xyz, p), dot(sun_view.y.xyz, p), dot(sun_view.z.xyz, p))
+		+ vec3f(sun_view.x.w, sun_view.y.w, sun_view.z.w);
+	let uv = vec2f(at.x * 0.5 + 0.5, 0.5 - at.y * 0.5);
+	let lit = textureSampleCompareLevel(shadow_map, shadow_cmp, uv, at.z);
+	let inside = all(uv > vec2f(0.0)) && all(uv < vec2f(1.0)) && at.z < 1.0;
+	return select(1.0, lit, inside);
+}
+
 // What a point needs to be lit: where it is, its outward face normal (for
 // shadow rays), the normal it reflects with (bent by relief, facing the
 // eye), the unit direction toward the eye, its albedo and finish, the
@@ -366,7 +409,7 @@ fn shade(p: Point) -> vec4f {
 		}
 		let o = p.pos + p.face * SHADOW_OFFSET;
 		let far = max(dist - SHADOW_OFFSET, 0.0);
-		if (occluded(o, dir, far) || moving_blocks(o, dir, far)) {
+		if (moving_blocks(o, dir, far)) {
 			continue;
 		}
 		// Inverse square, windowed to nothing at the reach.
@@ -417,27 +460,23 @@ fn grade(c: vec3f, frag: vec2f) -> vec3f {
 
 @fragment
 fn fs(in: Varying) -> @location(0) vec4f {
+	// No discard: the depth pass already dropped the see-through texels, and
+	// only the fragments it kept pass the equal depth test.
 	let texel = texel_at(in.tex, in.uv);
-	// The relief's height, read before any pixel discards so the slopes
-	// across the screen see their neighbors.
 	let height = luminance(texel.rgb) * RELIEF;
 	let d = normalize(in.pos - view.eye.xyz);
 	let n = select(in.n, -in.n, dot(in.n, d) > 0.0);
 	let bent = relief(n, in.pos, height);
-	// See-through texels show what lies behind, as the trace's hit does.
-	if (texel.a < 0.5) {
-		discard;
-	}
 	// The baked light parted into the straight sun — as the bake lit the
 	// face, by its own normal, through the filtered visibility — and the
 	// ambient rest; a face without a chart keeps the hemisphere of sky
-	// around its normal, as the trace's shade does, all of it ambient.
+	// around its normal, all of it ambient.
 	let sky = mix(lighting.ground.rgb, lighting.sky.rgb, n.y * 0.5 + 0.5) * 0.5;
 	let n_l = max(dot(in.n, lighting.sun.xyz), 0.0);
 	let sun_full = lighting.sun_color.rgb * (n_l / PI);
 	var ambient = sky;
-	// The bake's own visibility of the sun: the shadow when it is not
-	// traced.
+	// The bake's own visibility of the sun: the shadow when the shadow
+	// map's is not read.
 	var sun = 0.0;
 	if (in.lm.w >= 1.0) {
 		let baked = light_at(in.lm, in.lmuv);
@@ -445,13 +484,11 @@ fn fs(in: Varying) -> @location(0) vec4f {
 		sun = baked.a;
 	} else if (in.lm.w < 0.0) {
 		// A loose face — a prop — carries the light around it instead of
-		// a chart, and sees the sun by its own ray.
+		// a chart, and sees the sun through the shadow map.
 		ambient = in.lm.rgb;
-		sun = 1.0;
 	}
 	if (view.light.w > 0.5 || in.lm.w < 0.0) {
-		sun = select(0.0, 1.0, n_l > 0.0
-			&& !occluded(in.pos + in.n * SHADOW_OFFSET, lighting.sun.xyz, MISS));
+		sun = select(0.0, sun_visible(in.pos, in.n), n_l > 0.0);
 	}
 	var p: Point;
 	p.pos = in.pos;
@@ -465,7 +502,7 @@ fn fs(in: Varying) -> @location(0) vec4f {
 	p.sun = sun;
 	let lit = shade(p);
 	var color = lit.rgb;
-	// The debug views F5 cycles through, as in trace.wgsl.
+	// The debug views F5 cycles through.
 	switch view_mode() {
 		case VIEW_DEPTH: {
 			let z = dot(in.pos - view.eye.xyz, view.forward.xyz);
@@ -476,11 +513,6 @@ fn fs(in: Varying) -> @location(0) vec4f {
 		}
 		case VIEW_ALBEDO: {
 			color = texel.rgb;
-		}
-		case VIEW_CUBES, VIEW_SIZE: {
-			// The cubes and cube-size views, of voxelized matter: whole
-			// surfaces, one color for both.
-			color = vec3f(0.9);
 		}
 		default: {}
 	}
@@ -528,8 +560,7 @@ fn fs_body(in: BodyVarying) -> @location(0) vec4f {
 	// No chart: the hemisphere of sky around its normal, as a face without
 	// one keeps.
 	p.ambient = mix(lighting.ground.rgb, lighting.sky.rgb, n.y * 0.5 + 0.5) * 0.5 * view.light.x;
-	p.sun = select(0.0, 1.0, dot(n, lighting.sun.xyz) > 0.0
-		&& !occluded(in.pos + n * SHADOW_OFFSET, lighting.sun.xyz, MISS));
+	p.sun = select(0.0, sun_visible(in.pos, n), dot(n, lighting.sun.xyz) > 0.0);
 	let lit = shade(p);
 	var color = lit.rgb;
 	if (view_mode() == VIEW_NORMAL) {
@@ -538,4 +569,46 @@ fn fs_body(in: BodyVarying) -> @location(0) vec4f {
 		color = vec3f(0.9);
 	}
 	return vec4f(grade(color, in.clip.xy), select(1.0, lit.a, view_mode() == 0u));
+}
+
+// The depth pass: where each corner lands, by the lit draw's own math, and
+// what the fragment needs to read its texel's alpha.
+struct DepthVarying {
+	@invariant @builtin(position) clip: vec4f,
+	@location(0) uv: vec2f,
+	@location(1) tex: vec4f,
+}
+
+@vertex
+fn vs_depth(c: Corner) -> DepthVarying {
+	var out: DepthVarying;
+	out.clip = clip_of(c.pos.xyz);
+	out.uv = c.uv.xy;
+	out.tex = c.tex;
+	return out;
+}
+
+// See-through texels leave no depth, so what lies behind them shows.
+@fragment
+fn fs_depth(in: DepthVarying) {
+	if (texel_at(in.tex, in.uv).a < 0.5) {
+		discard;
+	}
+}
+
+// The shadow map's bake: each corner in the sun's clip space, as
+// `sun_visible` reads it back. Drawn once, at load.
+@vertex
+fn vs_shadow(c: Corner) -> DepthVarying {
+	let p = c.pos.xyz;
+	var out: DepthVarying;
+	out.clip = vec4f(
+		dot(sun_view.x.xyz, p) + sun_view.x.w,
+		dot(sun_view.y.xyz, p) + sun_view.y.w,
+		dot(sun_view.z.xyz, p) + sun_view.z.w,
+		1.0,
+	);
+	out.uv = c.uv.xy;
+	out.tex = c.tex;
+	return out;
 }

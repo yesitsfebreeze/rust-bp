@@ -50,19 +50,12 @@ engine::cvar::cvars! {
 		r_fog_r = 1.0, "Fog color, red: tints the sky and sun light the fog glows with, 1 untinted. Not in CS 1.6.";
 		r_fog_g = 1.0, "Fog color, green: tints the sky and sun light the fog glows with, 1 untinted. Not in CS 1.6.";
 		r_fog_b = 1.0, "Fog color, blue: tints the sky and sun light the fog glows with, 1 untinted. Not in CS 1.6.";
-		r_shadows = 1.0, "Trace the sun's shadow per pixel, sharp; 0 reads the baked shadow, coarser and cheaper. Not in CS 1.6.";
+		r_shadows = 1.0, "Sharp sun shadow from a shadow map baked at load; 0 reads the lightmap's coarser one. Not in CS 1.6.";
 		r_pbr = 1.0, "Physically based surfaces: specular highlights by each surface's roughness and metalness, and relief from its texture; 0 plain diffuse. Not in CS 1.6.";
-		r_dlights = 1.0, "Dynamic lights, such as muzzle flashes, lighting and shadowing the world. Not in CS 1.6.";
+		r_dlights = 1.0, "Dynamic lights, such as muzzle flashes, lighting the world; only moving things shadow them. Not in CS 1.6.";
 		r_dynshadows = 1.0, "Moving things, the player and thrown spheres, cast shadows over the world's. Not in CS 1.6.";
 		r_vsync = 0.0, "Wait for the display's refresh: no tearing, frame rate capped at the refresh rate. Not in CS 1.6.";
-		r_surface = 1.0, "Draw the map's surfaces as the triangles they are, at native resolution; 0 voxelizes into cubes. Not in CS 1.6.";
-		r_voxel = 4.0, "Pixels a voxel of the traced map spans at any distance: smaller is finer and slower. Not in CS 1.6.";
-		r_aa = 2.0, "Rays the traced map averages per pixel, 1, 2 or 4: more smooths cubes finer than a pixel and their edges, costing about as much trace time again each. Not in CS 1.6.";
 		r_fxaa = 1.0, "Smooth the stairs along the frame's edges after it is drawn (FXAA), whatever draws the map; costs one full-screen pass. Not in CS 1.6.";
-	r_wire = 1.0, "With r_shell: draw the map's triangles as pink wireframe over the voxelized world. Not in CS 1.6.";
-		r_shell = 1.0, "Draw the map voxelized ahead of the eye into sparse shells, marching the cubes per pixel instead of tracing each hit. Not in CS 1.6.";
-		r_lod_near = 0.0, "With r_shell: units out to which the smallest cubes are drawn; 0 grows them past r_voxel pixels. Not in CS 1.6.";
-		r_lod_curve = 1.0, "With r_shell: cube sizes up per doubling of distance past r_lod_near; below 1 holds detail farther. Not in CS 1.6.";
 	}
 }
 
