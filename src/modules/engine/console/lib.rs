@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 use cvar::Registry;
 
+mod edit;
+pub use edit::{LineEdit, Movement};
+
 /// What a command asks of the game beyond changing cvars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -39,11 +42,12 @@ const SCROLLBACK: usize = 512;
 
 pub struct Console {
 	pub open: bool,
-	pub input: String,
+	pub input: LineEdit,
 	lines: Vec<String>,
 	history: Vec<String>,
 	/// Index into `history` while browsing it with up and down.
 	recall: Option<usize>,
+	draft: Option<LineEdit>,
 	/// The config `exec` and `writeconfig` use without an argument.
 	config: PathBuf,
 }
@@ -52,10 +56,11 @@ impl Console {
 	pub fn new(config: impl Into<PathBuf>) -> Console {
 		Console {
 			open: false,
-			input: String::new(),
+			input: LineEdit::default(),
 			lines: Vec::new(),
 			history: Vec::new(),
 			recall: None,
+			draft: None,
 			config: config.into(),
 		}
 	}
@@ -77,8 +82,10 @@ impl Console {
 
 	/// Runs the input line, echoing it and remembering it in the history.
 	pub fn submit<R: Registry>(&mut self, cvars: &mut R) -> Vec<Action> {
-		let line = std::mem::take(&mut self.input);
+		let line = self.input.text().to_owned();
+		self.input = LineEdit::default();
 		self.recall = None;
+		self.draft = None;
 		self.print(format!("] {line}"));
 		if !line.trim().is_empty() && self.history.last() != Some(&line) {
 			self.history.push(line.clone());
@@ -189,13 +196,22 @@ impl Console {
 		}
 	}
 
-	/// Completes the first word to the longest prefix shared by matching commands
-	/// and cvars of `R`, listing them when there is more than one.
+	/// Completes the command at the caret, preserving arguments and other commands.
 	pub fn complete<R: Registry>(&mut self) {
-		if self.input.contains(char::is_whitespace) {
+		if !self.input.selection().is_empty() {
 			return;
 		}
-		let prefix = self.input.as_str();
+		let text = self.input.text();
+		let cursor = self.input.cursor();
+		let start = text[..cursor].rfind(';').map_or(0, |i| i + 1);
+		let start = start + text[start..].len() - text[start..].trim_start().len();
+		if cursor < start || text[start..cursor].contains(char::is_whitespace) {
+			return;
+		}
+		let end = text[cursor..]
+			.find(|c: char| c.is_whitespace() || c == ';')
+			.map_or(text.len(), |i| cursor + i);
+		let prefix = &text[start..cursor];
 		let matches: Vec<&str> = COMMANDS
 			.iter()
 			.map(|(c, _)| *c)
@@ -205,7 +221,7 @@ impl Console {
 		let Some(first) = matches.first() else {
 			return;
 		};
-		let common = matches.iter().fold(first.len(), |len, m| {
+		let mut common = matches.iter().fold(first.len(), |len, m| {
 			first
 				.bytes()
 				.zip(m.bytes())
@@ -213,20 +229,27 @@ impl Console {
 				.take_while(|(a, b)| a == b)
 				.count()
 		});
+		while !first.is_char_boundary(common) {
+			common -= 1;
+		}
+		let mut replacement = first[..common].to_owned();
+		if matches.len() == 1 && !text[end..].starts_with(char::is_whitespace) {
+			replacement.push(' ');
+		}
 		if matches.len() > 1 {
 			let listing = matches.join("  ");
 			self.print(listing);
 		}
-		self.input = first[..common].to_owned();
-		if matches.len() == 1 {
-			self.input.push(' ');
-		}
+		self.input.replace_range(start..end, &replacement);
 	}
 
 	/// Steps back (`older`) or forward through submitted lines.
 	pub fn recall(&mut self, older: bool) {
-		if self.history.is_empty() {
+		if self.history.is_empty() || (self.recall.is_none() && !older) {
 			return;
+		}
+		if self.recall.is_none() {
+			self.draft = Some(self.input.clone());
 		}
 		let last = self.history.len() - 1;
 		self.recall = match (self.recall, older) {
@@ -236,9 +259,11 @@ impl Console {
 			(Some(i), false) if i < last => Some(i + 1),
 			(Some(_), false) => None,
 		};
-		self.input = self
-			.recall
-			.map_or_else(String::new, |i| self.history[i].clone());
+		if let Some(i) = self.recall {
+			self.input.set(&self.history[i]);
+		} else {
+			self.input = self.draft.take().unwrap_or_default();
+		}
 	}
 }
 
@@ -258,7 +283,7 @@ mod tests {
 	}
 
 	fn run(console: &mut Console, cvars: &mut Test, line: &str) -> Vec<Action> {
-		console.input = line.to_owned();
+		console.input.set(line);
 		console.submit(cvars)
 	}
 
@@ -302,20 +327,52 @@ mod tests {
 	#[test]
 	fn completes_and_recalls() {
 		let (mut con, mut cv) = (Console::new("unused.toml"), Test::default());
-		con.input = "sv_air".into();
+		con.input.set("sv_air");
 		con.complete::<Test>();
-		assert_eq!(con.input, "sv_airaccelerate ");
-		con.input = "sv_ma".into();
+		assert_eq!(con.input.text(), "sv_airaccelerate ");
+		con.input.set("sv_ma");
 		con.complete::<Test>();
-		assert_eq!(con.input, "sv_max");
+		assert_eq!(con.input.text(), "sv_max");
 		run(&mut con, &mut cv, "fov 100");
 		run(&mut con, &mut cv, "fov 95");
 		con.recall(true);
-		assert_eq!(con.input, "fov 95");
+		assert_eq!(con.input.text(), "fov 95");
 		con.recall(true);
-		assert_eq!(con.input, "fov 100");
+		assert_eq!(con.input.text(), "fov 100");
 		con.recall(false);
 		con.recall(false);
-		assert_eq!(con.input, "");
+		assert_eq!(con.input.text(), "");
+	}
+
+	#[test]
+	fn recall_restores_the_draft_selection_and_undo_history() {
+		let (mut con, mut cv) = (Console::new("unused.toml"), Test::default());
+		run(&mut con, &mut cv, "echo previous");
+		con.input.type_text("echo draft");
+		con.input.select(5, 10);
+		con.recall(false);
+		assert_eq!(con.input.selected(), "draft");
+		con.recall(true);
+		con.input.insert(" edited");
+		con.recall(false);
+		assert_eq!(con.input.selected(), "draft");
+		con.input.undo();
+		assert_eq!(con.input.text(), "");
+		con.recall(true);
+		assert_eq!(con.input.text(), "echo previous");
+	}
+
+	#[test]
+	fn completion_replaces_only_the_active_command_and_is_undoable() {
+		let mut con = Console::new("unused.toml");
+		con.input.set("echo hi; sv_airBAD 100; echo done");
+		con.input.place(15, false);
+		con.complete::<Test>();
+		assert_eq!(con.input.text(), "echo hi; sv_airaccelerate 100; echo done");
+		con.input.undo();
+		assert_eq!(con.input.text(), "echo hi; sv_airBAD 100; echo done");
+		con.input.move_cursor(Movement::End, false);
+		con.complete::<Test>();
+		assert_eq!(con.input.text(), "echo hi; sv_airBAD 100; echo done");
 	}
 }

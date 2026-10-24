@@ -17,10 +17,11 @@ use engine::lightbake;
 use engine::linalg::{vec3, Vec3};
 use engine::physics;
 use engine::surface::Surface;
+use gameplay::console_ui::ConsoleUi;
 use gameplay::cvars::{movement_vars, Cvars};
 use gameplay::player::movement::{angle_vectors, clamp_wish};
 use gameplay::player::{Input, Player};
-use gameplay::{draw_console, load_config, type_into, vertical_fov};
+use gameplay::{load_config, vertical_fov};
 
 /// Spheres in the playground at most; past it, the oldest goes. The
 /// renderer's body buffer is this big.
@@ -387,6 +388,7 @@ fn hud(gfx: &mut Gfx, fps: u32, player: &Player, fly: bool, bodies: usize, ticks
 fn main() {
 	let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("playground.toml");
 	let mut console = Console::new(config);
+	let mut console_ui = ConsoleUi::default();
 	let mut cvars = Cvars::default();
 	load_config(&mut console, &mut cvars);
 	console.print("playground: generated arena, no map file".to_string());
@@ -434,8 +436,10 @@ fn main() {
 	loop {
 		let frame_time = window.frame_time();
 		let keys = window.input().clone();
-		if keys.pressed(Key::Backquote) || keys.pressed(Key::F1) {
+		let console_toggled = keys.pressed(Key::F1) || (!console.open && keys.pressed(Key::Backquote));
+		if console_toggled {
 			console.open = !console.open;
+			console_ui.blur();
 		}
 		// F5 steps through what the trace shows: lit, then its debug views.
 		if keys.pressed(Key::F5) {
@@ -445,8 +449,8 @@ fn main() {
 		}
 		let typing = console.open;
 		if typing {
-			if type_into(&mut console, &keys) {
-				for action in console.submit(&mut cvars) {
+			if !console_toggled {
+				for action in console_ui.input(window.gfx(), &mut console, &keys, &mut cvars, frame_time) {
 					match action {
 						Action::Quit => return,
 						Action::Respawn => {
@@ -463,9 +467,6 @@ fn main() {
 					}
 				}
 			}
-			if keys.pressed(Key::Escape) {
-				console.open = false;
-			}
 		} else if keys.pressed(Key::Escape) {
 			grabbed = false;
 		} else if !grabbed && keys.clicked(MouseButton::Left) {
@@ -479,6 +480,11 @@ fn main() {
 		}
 		let looking = grabbed && !typing && keys.focused();
 		window.grab_cursor(looking);
+		window.set_text_input(console.open && keys.focused());
+		if !console.open {
+			console_ui.blur();
+			window.gfx().text_cursor(false);
+		}
 
 		// Look: raw counts every frame, never waiting for a tick.
 		let (dx, dy) = keys.mouse_delta();
@@ -629,7 +635,7 @@ fn main() {
 		});
 		hud(gfx, fps, &shown, fly, spheres.len(), ticks_per_second);
 		if console.open {
-			draw_console(gfx, &console);
+			console_ui.draw(gfx, &console, keys.focused());
 		}
 		if !window.next_frame() {
 			return;

@@ -77,3 +77,14 @@ start with [llms.txt](llms.txt), which links to the focused guides in `docs/*.tx
 ## Star history
 
 [![Star History Chart](https://api.star-history.com/svg?repos=yesitsfebreeze/rust-bp&type=Date)](https://star-history.com/#yesitsfebreeze/rust-bp&Date)
+
+## In-game console editing
+
+- Console: arrows/Home/End move the caret, Shift selects, Ctrl+arrows and
+  Ctrl+Backspace/Delete edit words. Click or drag to select; double-click selects
+  a word and triple-click selects the line. Ctrl+A/C/X/V/Z/Y select all,
+  copy/cut/paste and undo/redo (Command on macOS, Option for word movement).
+  Right-click opens the edit menu. Up/Down browse history and restore your draft;
+  Tab completes at the caret. F1 or Escape closes the console; backtick and caret
+  characters can be typed while it is open. Pasting line breaks inserts spaces
+  and never submits a command.

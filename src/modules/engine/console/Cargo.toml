@@ -10,3 +10,4 @@ path = "lib.rs"
 
 [dependencies]
 cvar = { path = "../cvar" }
+unicode-segmentation = "1.13"

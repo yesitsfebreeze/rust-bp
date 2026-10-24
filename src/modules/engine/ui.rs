@@ -7,6 +7,9 @@
 
 use crate::gpu::{Color, Gfx, Input, MouseButton};
 
+mod text_field;
+pub use text_field::{TextAction, TextField};
+
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
 	Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
 }
@@ -201,7 +204,9 @@ impl<'a> Ui<'a> {
 	pub fn hovered(&self, rect: Rect) -> bool {
 		self.enabled
 			&& rect.contains(self.cursor)
-			&& self.scrolling.is_none_or(|(view, _)| view.contains(self.cursor))
+			&& self
+				.scrolling
+				.is_none_or(|(view, _)| view.contains(self.cursor))
 	}
 
 	/// Whether this frame's click landed in `rect`; one widget takes it.
@@ -443,7 +448,9 @@ impl<'a> Ui<'a> {
 		}
 		if bar {
 			let track = Rect::new(view.x + view.w - BAR, view.y, BAR, view.h);
-			let thumb_h = (view.h * view.h / scroll.content).max(THUMB_MIN).min(view.h);
+			let thumb_h = (view.h * view.h / scroll.content)
+				.max(THUMB_MIN)
+				.min(view.h);
 			let travel = (view.h - thumb_h).max(1.0);
 			let thumb = |offset: f32| Rect::new(track.x, track.y + offset / over * travel, BAR, thumb_h);
 			if !self.held {
@@ -539,7 +546,11 @@ impl<'a> Ui<'a> {
 		const CELLS: u32 = 12;
 		let (cw, ch) = (square.w / CELLS as f32, square.h / CELLS as f32);
 		let at = |i: u32, j: u32| {
-			let [r, g, b] = rgb_of([hsv[0], i as f32 / CELLS as f32, 1.0 - j as f32 / CELLS as f32]);
+			let [r, g, b] = rgb_of([
+				hsv[0],
+				i as f32 / CELLS as f32,
+				1.0 - j as f32 / CELLS as f32,
+			]);
 			Color::new(r, g, b, 1.0)
 		};
 		for j in 0..CELLS {
@@ -582,7 +593,10 @@ impl<'a> Ui<'a> {
 		self.bevel(Rect::new(mx - 4.0, my - 4.0, 8.0, 8.0), false);
 		self.fill(Rect::new(mx - 1.0, my - 1.0, 2.0, 2.0), dot);
 		let hy = hue.y + hsv[0] * hue.h;
-		self.fill(Rect::new(hue.x - 3.0, hy - 1.0, hue.w + 6.0, 2.0), self.theme.text);
+		self.fill(
+			Rect::new(hue.x - 3.0, hy - 1.0, hue.w + 6.0, 2.0),
+			self.theme.text,
+		);
 		*rgb != before
 	}
 }

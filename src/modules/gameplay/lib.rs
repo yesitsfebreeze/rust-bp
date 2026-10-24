@@ -17,6 +17,7 @@
 // The profiling workload in `src/bin/engine_bench.rs` drives movement, bullet
 // traces and the weapon table headless, so these stay public.
 pub mod bullets;
+pub mod console_ui;
 pub mod cvars;
 pub mod editor;
 pub mod level;
@@ -103,9 +104,9 @@ use player::movement::{angle_vectors, clamp_wish};
 use player::{Input, Player};
 
 use crate::bullets::Shot;
+use crate::cvars::{movement_vars, Cvars};
 use crate::editor::{Editor, Request};
 use crate::level::{Kind, Level, Props};
-use crate::cvars::{movement_vars, Cvars};
 use crate::materials::SurfaceMaterial;
 use crate::weapons::{load, load_clip, Armed, Table};
 use audio::{Binaural, Clip};
@@ -148,44 +149,6 @@ pub fn load_config(console: &mut Console, cvars: &mut Cvars) {
 		}
 	}
 	console.exec(&path, cvars);
-}
-
-/// Edits the console line from this frame's keys; returns whether it was submitted.
-pub fn type_into(console: &mut Console, keys: &gpu::Input) -> bool {
-	for &c in keys.chars() {
-		if !c.is_control() && c != '`' && c != '^' {
-			console.input.push(c);
-		}
-	}
-	if keys.pressed(Key::Backspace) {
-		console.input.pop();
-	}
-	if keys.pressed(Key::Tab) {
-		console.complete::<Cvars>();
-	}
-	if keys.pressed(Key::ArrowUp) {
-		console.recall(true);
-	}
-	if keys.pressed(Key::ArrowDown) {
-		console.recall(false);
-	}
-	keys.pressed(Key::Enter) || keys.pressed(Key::NumpadEnter)
-}
-
-pub fn draw_console(gfx: &mut Gfx, console: &Console) {
-	let (width, height) = gfx.size();
-	let h = height * 0.45;
-	gfx.rect(0.0, 0.0, width, h, Color::new(0.05, 0.07, 0.09, 0.88));
-	let size = 20.0;
-	let mut y = h - 12.0;
-	gfx.text(&format!("] {}_", console.input), 12.0, y, size, TEXT);
-	for line in console.lines().iter().rev() {
-		y -= size;
-		if y < size {
-			break;
-		}
-		gfx.text(line, 12.0, y, size, MUTED);
-	}
 }
 
 /// The heads-up display reads like 1.6's: the weapon bottom-left, the money and
@@ -426,6 +389,7 @@ pub fn play(
 		.map(std::path::PathBuf::from)
 		.unwrap_or_else(|| root().join("player.toml"));
 	let mut console = Console::new(config);
+	let mut console_ui = console_ui::ConsoleUi::default();
 	let mut cvars = Cvars::default();
 	load_config(&mut console, &mut cvars);
 	console.print("type help for commands");
@@ -463,13 +427,14 @@ pub fn play(
 	// texel, cached beside the map after the first bake. The surface pass
 	// samples it as lightmaps, so its shadows and ambient light are the
 	// bake's, sharp.
-	let (mut baked, from_cache) = match lightmap::bake_or_load_level(&map, &map_path, &level_key(&level)) {
-		Ok(baked) => baked,
-		Err(e) => {
-			eprintln!("{e}");
-			std::process::exit(1);
-		}
-	};
+	let (mut baked, from_cache) =
+		match lightmap::bake_or_load_level(&map, &map_path, &level_key(&level)) {
+			Ok(baked) => baked,
+			Err(e) => {
+				eprintln!("{e}");
+				std::process::exit(1);
+			}
+		};
 	console.print(if from_cache {
 		format!(
 			"light bake: loaded from {}",
@@ -677,8 +642,10 @@ pub fn play(
 		let keys = window.input().clone();
 		let frame_interval_ms = frame_time * 1000.0;
 		let frame_started = std::time::Instant::now();
-		if keys.pressed(Key::Backquote) || keys.pressed(Key::F1) {
+		let console_toggled = keys.pressed(Key::F1) || (!console.open && keys.pressed(Key::Backquote));
+		if console_toggled {
 			console.open = !console.open;
+			console_ui.blur();
 		}
 		// F5 steps through what the trace shows: lit, then its debug views.
 		if keys.pressed(Key::F5) {
@@ -688,8 +655,8 @@ pub fn play(
 		}
 		let typing = console.open;
 		if typing {
-			if type_into(&mut console, &keys) {
-				for action in console.submit(&mut cvars) {
+			if !console_toggled {
+				for action in console_ui.input(window.gfx(), &mut console, &keys, &mut cvars, frame_time) {
 					match action {
 						Action::Quit => return None,
 						Action::Respawn => {
@@ -705,9 +672,6 @@ pub fn play(
 						}
 					}
 				}
-			}
-			if keys.pressed(Key::Escape) {
-				console.open = false;
 			}
 		} else if keys.pressed(Key::Escape) && !buy_menu {
 			menu.escape(&mut cvars);
@@ -816,10 +780,14 @@ pub fn play(
 		}
 		// In the editor the cursor is free, the view turning only while the
 		// right button is held.
-		let looking = !typing
-			&& keys.focused()
-			&& (!editor.open || keys.button_down(MouseButton::Right));
+		let looking =
+			!typing && keys.focused() && (!editor.open || keys.button_down(MouseButton::Right));
 		window.grab_cursor(looking);
+		window.set_text_input(console.open && keys.focused());
+		if !console.open {
+			console_ui.blur();
+			window.gfx().text_cursor(false);
+		}
 
 		// Look: raw counts every frame, never waiting for a tick.
 		let (dx, dy) = keys.mouse_delta();
@@ -1309,7 +1277,7 @@ pub fn play(
 				y += 26.0;
 			}
 		}
-		if editor.open && !menu.open {
+		if editor.open && !menu.open && !console.open {
 			let camera = editor::Camera {
 				eye,
 				forward,
@@ -1318,13 +1286,7 @@ pub fn play(
 				fovy,
 			};
 			let requests = editor.frame(
-				gfx,
-				&keys,
-				&camera,
-				&mut level,
-				&textures,
-				&models,
-				&play.mesh,
+				gfx, &keys, &camera, &mut level, &textures, &models, &play.mesh,
 			);
 			for request in requests {
 				let (rebuild, bake) = match request {
@@ -1358,10 +1320,7 @@ pub fn play(
 					match lightmap::bake_or_load_level(&map, &map_path, &level_key(&level)) {
 						Ok((b, _)) => {
 							baked = b;
-							editor.status = format!(
-								"baked in {:.1} s",
-								started.elapsed().as_secs_f32()
-							);
+							editor.status = format!("baked in {:.1} s", started.elapsed().as_secs_f32());
 						}
 						Err(e) => editor.status = format!("bake failed: {e}"),
 					}
@@ -1373,7 +1332,8 @@ pub fn play(
 				props = Props::new(&level, &play.mesh);
 			}
 		}
-		match menu.frame(gfx, &keys, &mut cvars) {
+		let inert = gpu::Input::default();
+		match menu.frame(gfx, if console.open { &inert } else { &keys }, &mut cvars) {
 			Some(menu::Choice::NewGame) => {
 				player = Player::spawn(spawn);
 				previous = player;
@@ -1386,7 +1346,7 @@ pub fn play(
 			Some(menu::Choice::Resume) | None => {}
 		}
 		if console.open {
-			draw_console(gfx, &console);
+			console_ui.draw(gfx, &console, keys.focused());
 		}
 		if let Some(profiler) = &mut profiler {
 			if profiler.observe(profiler::Sample::new(

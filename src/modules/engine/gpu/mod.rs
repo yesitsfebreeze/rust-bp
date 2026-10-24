@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::platform::pump_events::EventLoopExtPumpEvents;
@@ -37,6 +37,7 @@ use winit::window::{CursorGrabMode, WindowId};
 pub use overlay::{TextureId, Vertex};
 pub use winit::event::MouseButton;
 pub use winit::keyboard::KeyCode as Key;
+pub use winit::keyboard::{Key as TextKey, ModifiersState, NamedKey};
 pub use world::WorldStats;
 
 /// What the world can show, in the order [`Gfx::cycle_view_mode`] steps
@@ -46,6 +47,27 @@ pub const VIEW_MODES: [&str; 4] = ["lit", "depth", "normal", "albedo"];
 
 /// The sky the map is drawn against, and lit by in the bake.
 pub const SKY: Color = Color::new(0.62, 0.71, 0.82, 1.0);
+
+/// Ordered window events for text fields. Unlike gameplay's `pressed` set,
+/// these retain key repeat, keyboard-layout text and modifiers at event time.
+#[derive(Clone, Debug)]
+pub enum TextEvent {
+	Key {
+		key: TextKey,
+		text: Option<String>,
+		modifiers: ModifiersState,
+		repeat: bool,
+	},
+	PointerMoved((f32, f32)),
+	PointerButton {
+		position: (f32, f32),
+		button: MouseButton,
+		pressed: bool,
+		modifiers: ModifiersState,
+	},
+	Preedit(String, Option<(usize, usize)>),
+	Commit(String),
+}
 
 /// A straight-alpha color, its channels as the screen shows them.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,7 +95,8 @@ pub struct Input {
 	pressed: HashSet<Key>,
 	buttons: HashSet<MouseButton>,
 	clicked: HashSet<MouseButton>,
-	chars: Vec<char>,
+	text_events: Vec<TextEvent>,
+	modifiers: ModifiersState,
 	mouse: (f32, f32),
 	cursor: (f32, f32),
 	wheel: f32,
@@ -98,9 +121,9 @@ impl Input {
 		self.clicked.contains(&button)
 	}
 
-	/// Text typed since the last frame.
-	pub fn chars(&self) -> &[char] {
-		&self.chars
+	/// Ordered text, editing keys, composition and pointer events for this frame.
+	pub fn text_events(&self) -> &[TextEvent] {
+		&self.text_events
 	}
 
 	/// Raw mouse counts since the last frame, unaffected by the cursor grab.
@@ -127,7 +150,7 @@ impl Input {
 	fn begin(&mut self) {
 		self.pressed.clear();
 		self.clicked.clear();
-		self.chars.clear();
+		self.text_events.clear();
 		self.mouse = (0.0, 0.0);
 		self.wheel = 0.0;
 	}
@@ -153,6 +176,7 @@ struct Shell {
 	error: Option<String>,
 	closed: bool,
 	grabbed: bool,
+	text_input: bool,
 }
 
 impl Window {
@@ -173,6 +197,7 @@ impl Window {
 				error: None,
 				closed: false,
 				grabbed: false,
+				text_input: false,
 			},
 			last: Instant::now(),
 			frame_time: 1.0 / 60.0,
@@ -237,6 +262,16 @@ impl Window {
 		self.fps
 	}
 
+	/// Enables native text composition only while a text field has focus.
+	pub fn set_text_input(&mut self, enabled: bool) {
+		if self.shell.text_input != enabled {
+			self.shell.text_input = enabled;
+			if let Some(window) = &self.shell.window {
+				window.set_ime_allowed(enabled);
+			}
+		}
+	}
+
 	/// Locks and hides the cursor for mouse look, or frees it.
 	pub fn grab_cursor(&mut self, grab: bool) {
 		if self.shell.grabbed == grab {
@@ -292,13 +327,31 @@ impl ApplicationHandler for Shell {
 				if !focused {
 					input.down.clear();
 					input.buttons.clear();
+					input.modifiers = ModifiersState::empty();
+					input.begin();
 				}
 			}
-			WindowEvent::KeyboardInput { event, .. } => {
-				if event.state == ElementState::Pressed {
-					if let Some(text) = &event.text {
-						input.chars.extend(text.chars());
-					}
+			WindowEvent::ModifiersChanged(modifiers) => input.modifiers = modifiers.state(),
+			WindowEvent::Ime(ime) => match ime {
+				Ime::Preedit(text, cursor) => input.text_events.push(TextEvent::Preedit(text, cursor)),
+				Ime::Commit(text) => input.text_events.push(TextEvent::Commit(text)),
+				Ime::Disabled => input
+					.text_events
+					.push(TextEvent::Preedit(String::new(), None)),
+				Ime::Enabled => {}
+			},
+			WindowEvent::KeyboardInput {
+				event,
+				is_synthetic,
+				..
+			} => {
+				if event.state == ElementState::Pressed && !is_synthetic {
+					input.text_events.push(TextEvent::Key {
+						key: event.logical_key,
+						text: event.text.map(|text| text.to_string()),
+						modifiers: input.modifiers,
+						repeat: event.repeat,
+					});
 				}
 				let PhysicalKey::Code(key) = event.physical_key else {
 					return;
@@ -315,17 +368,28 @@ impl ApplicationHandler for Shell {
 					}
 				}
 			}
-			WindowEvent::MouseInput { state, button, .. } => match state {
-				ElementState::Pressed => {
-					input.buttons.insert(button);
-					input.clicked.insert(button);
+			WindowEvent::MouseInput { state, button, .. } => {
+				input.text_events.push(TextEvent::PointerButton {
+					position: input.cursor,
+					button,
+					pressed: state == ElementState::Pressed,
+					modifiers: input.modifiers,
+				});
+				match state {
+					ElementState::Pressed => {
+						input.buttons.insert(button);
+						input.clicked.insert(button);
+					}
+					ElementState::Released => {
+						input.buttons.remove(&button);
+					}
 				}
-				ElementState::Released => {
-					input.buttons.remove(&button);
-				}
-			},
+			}
 			WindowEvent::CursorMoved { position, .. } => {
 				input.cursor = (position.x as f32, position.y as f32);
+				input
+					.text_events
+					.push(TextEvent::PointerMoved(input.cursor));
 			}
 			WindowEvent::MouseWheel { delta, .. } => {
 				input.wheel += match delta {
@@ -806,6 +870,22 @@ impl Gfx {
 		self.overlay.text_width(&self.queue, text, size)
 	}
 
+	pub fn text_cursor(&self, over_field: bool) {
+		self.window.set_cursor(if over_field {
+			winit::window::CursorIcon::Text
+		} else {
+			winit::window::CursorIcon::Default
+		});
+	}
+
+	/// Anchor the platform's composition/candidate window to the visible caret.
+	pub fn ime_cursor(&self, x: f32, y: f32, height: f32) {
+		self.window.set_ime_cursor_area(
+			winit::dpi::PhysicalPosition::new(x, y),
+			winit::dpi::PhysicalSize::new(1.0, height),
+		);
+	}
+
 	fn present(&mut self) {
 		let frame = match self.surface.get_current_texture() {
 			Ok(frame) => frame,
@@ -833,10 +913,7 @@ impl Gfx {
 		// draws straight to the window, one pass in all.
 		let drawn = self.world.is_some() && self.view.is_some();
 		let post = drawn
-			&& (self.indirect.ao > 0.0
-				|| self.fog.density > 0.0
-				|| self.smooth
-				|| self.auto_exposure);
+			&& (self.indirect.ao > 0.0 || self.fog.density > 0.0 || self.smooth || self.auto_exposure);
 		let mut encoder = self.device.create_command_encoder(&Default::default());
 		if let Some(timer) = &mut self.timer {
 			timer.begin(&mut encoder);
@@ -942,9 +1019,7 @@ impl Gfx {
 			timer.end(&mut encoder);
 		}
 		self.queue.submit([encoder.finish()]);
-		self
-			.meter
-			.collect(&self.device, self.auto_exposure && post);
+		self.meter.collect(&self.device, self.auto_exposure && post);
 		if let Some(timer) = &mut self.timer {
 			timer.collect(&self.device);
 		}

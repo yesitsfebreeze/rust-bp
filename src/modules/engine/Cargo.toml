@@ -19,9 +19,14 @@ lightbake = { path = "lightbake", features = ["gpu"] }
 # The window, input and renderer (`gpu`): winit and wgpu, ProggyClean
 # rasterized by fontdue for the HUD.
 fontdue = "0.9"
+fontdb = "0.23"
+ttf-parser = "0.25"
 pollster = "0.4"
 wgpu = "26"
 winit = "0.30"
 physics = { path = "physics" }
 console = { path = "console" }
 cvar = { path = "cvar" }
+
+# Native text clipboard, without image encoding dependencies.
+arboard = { version = "3.6", default-features = false }

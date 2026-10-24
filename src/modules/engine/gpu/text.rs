@@ -9,9 +9,6 @@ use std::collections::HashMap;
 pub const SIDE: u32 = 1024;
 /// The solid block in the top-left corner.
 pub const SOLID: u32 = 4;
-/// Printable ASCII: space through tilde.
-const FIRST: char = ' ';
-const LAST: char = '~';
 
 const FONT: &[u8] = include_bytes!("ProggyClean.ttf");
 
@@ -29,7 +26,9 @@ pub struct Glyph {
 
 pub struct Glyphs {
 	font: fontdue::Font,
-	sets: HashMap<u16, Vec<Glyph>>,
+	sets: HashMap<u16, HashMap<char, Glyph>>,
+	fallbacks: Vec<fontdue::Font>,
+	fonts: Option<fontdb::Database>,
 	/// The shelf packer for the atlas, `lightbake`'s; it starts past the
 	/// solid block in the top-left corner, which that first row clears.
 	packer: lightbake::pack::Packer,
@@ -42,43 +41,100 @@ impl Glyphs {
 		Ok(Glyphs {
 			font,
 			sets: HashMap::new(),
+			fallbacks: Vec::new(),
+			fonts: None,
 			packer: lightbake::pack::Packer::restore([SIDE, SOLID, 0, SOLID]),
 		})
 	}
 
-	/// The glyphs at `px` pixels, rasterizing them the first time through
-	/// `upload(x, y, width, height, coverage)`. A full atlas leaves glyphs
-	/// empty rather than failing.
-	pub fn set(&mut self, px: u16, mut upload: impl FnMut(u32, u32, u32, u32, &[u8])) -> &[Glyph] {
-		if !self.sets.contains_key(&px) {
-			let mut set = Vec::new();
-			for c in FIRST..=LAST {
-				let (metrics, coverage) = self.font.rasterize(c, px as f32);
-				let (w, h) = (metrics.width as u32, metrics.height as u32);
-				let mut glyph = Glyph {
-					rect: [0, 0, 0, 0],
-					xmin: metrics.xmin as f32,
-					ymin: metrics.ymin as f32,
-					advance: metrics.advance_width,
-				};
-				if w > 0 && h > 0 {
-					if let Some((x, y)) = self.packer.place(w, h) {
-						upload(x, y, w, h, &coverage);
-						glyph.rect = [x, y, w, h];
-					}
-				}
-				set.push(glyph);
-			}
-			self.sets.insert(px, set);
+	/// Choose a system fallback lazily, so ordinary HUD text never scans fonts.
+	fn font_for(&mut self, c: char) -> &fontdue::Font {
+		if self.font.lookup_glyph_index(c) != 0 {
+			return &self.font;
 		}
-		&self.sets[&px]
+		if let Some(at) = self
+			.fallbacks
+			.iter()
+			.position(|font| font.lookup_glyph_index(c) != 0)
+		{
+			return &self.fallbacks[at];
+		}
+		let fonts = self.fonts.get_or_insert_with(|| {
+			let mut fonts = fontdb::Database::new();
+			fonts.load_system_fonts();
+			fonts
+		});
+		let preferred = fonts.query(&fontdb::Query {
+			families: &[fontdb::Family::Monospace, fontdb::Family::SansSerif],
+			..Default::default()
+		});
+		let ids = preferred
+			.into_iter()
+			.chain(fonts.faces().map(|face| face.id));
+		for id in ids {
+			let font = fonts
+				.with_face_data(id, |data, index| {
+					let face = ttf_parser::Face::parse(data, index).ok()?;
+					face.glyph_index(c)?;
+					fontdue::Font::from_bytes(
+						data,
+						fontdue::FontSettings {
+							collection_index: index,
+							..Default::default()
+						},
+					)
+					.ok()
+				})
+				.flatten();
+			if let Some(font) = font {
+				self.fallbacks.push(font);
+				return self.fallbacks.last().unwrap();
+			}
+		}
+		&self.font
+	}
+
+	/// Rasterize only missing characters. Unsupported characters get a visible
+	/// replacement instead of silently turning into spaces in an editable line.
+	pub fn set(
+		&mut self,
+		px: u16,
+		text: &str,
+		mut upload: impl FnMut(u32, u32, u32, u32, &[u8]),
+	) -> &HashMap<char, Glyph> {
+		for c in text.chars() {
+			if self.sets.get(&px).is_some_and(|set| set.contains_key(&c)) {
+				continue;
+			}
+			let font = self.font_for(c);
+			let shown = if font.lookup_glyph_index(c) != 0 {
+				c
+			} else {
+				'?'
+			};
+			let (metrics, coverage) = font.rasterize(shown, px as f32);
+			let (w, h) = (metrics.width as u32, metrics.height as u32);
+			let mut glyph = Glyph {
+				rect: [0, 0, 0, 0],
+				xmin: metrics.xmin as f32,
+				ymin: metrics.ymin as f32,
+				advance: metrics.advance_width,
+			};
+			if w > 0 && h > 0 {
+				if let Some((x, y)) = self.packer.place(w, h) {
+					upload(x, y, w, h, &coverage);
+					glyph.rect = [x, y, w, h];
+				}
+			}
+			self.sets.entry(px).or_default().insert(c, glyph);
+		}
+		self.sets.entry(px).or_default()
 	}
 }
 
-/// The glyph for `c` in a set, or a space for characters the font lacks.
-pub fn glyph(set: &[Glyph], c: char) -> Glyph {
-	let at = (c as u32).wrapping_sub(FIRST as u32) as usize;
-	set.get(at).copied().unwrap_or(set[0])
+/// `set` has been prepared for all characters in the line being measured/drawn.
+pub fn glyph(set: &HashMap<char, Glyph>, c: char) -> Glyph {
+	set[&c]
 }
 
 #[cfg(test)]
@@ -89,20 +145,25 @@ mod tests {
 	fn rasterizes_each_size_once_into_distinct_rects() {
 		let mut glyphs = Glyphs::new().unwrap();
 		let mut uploads = 0;
-		let a = glyph(glyphs.set(20, |_, _, _, _, _| uploads += 1), 'A');
-		let again = glyph(glyphs.set(20, |_, _, _, _, _| uploads += 1000), 'A');
+		let a = glyph(glyphs.set(20, "AB", |_, _, _, _, _| uploads += 1), 'A');
+		let again = glyph(glyphs.set(20, "AB", |_, _, _, _, _| uploads += 1000), 'A');
 		assert_eq!(a.rect, again.rect);
-		assert!(uploads > 50 && uploads < 1000, "{uploads}");
-		let b = glyph(glyphs.set(20, |_, _, _, _, _| {}), 'B');
+		assert!(uploads == 2, "{uploads}");
+		let b = glyph(glyphs.set(20, "AB", |_, _, _, _, _| {}), 'B');
 		assert_ne!(a.rect, b.rect);
 		assert!(a.rect[0] >= SOLID || a.rect[1] > 0);
 		assert!(a.advance > 0.0);
 	}
 
 	#[test]
-	fn unknown_characters_draw_as_spaces() {
+	fn accented_input_is_visible_and_cached() {
 		let mut glyphs = Glyphs::new().unwrap();
-		let set = glyphs.set(16, |_, _, _, _, _| {});
-		assert_eq!(glyph(set, 'é').advance, glyph(set, ' ').advance);
+		let set = glyphs.set(16, "é ", |_, _, _, _, _| {});
+		assert!(glyph(set, 'é').rect[2] > 0);
+		assert!(glyph(set, 'é').advance > 0.0);
+		assert_eq!(glyph(set, ' ').rect[2], 0);
+		glyphs.set(16, "é", |_, _, _, _, _| {
+			panic!("cached glyph uploaded twice")
+		});
 	}
 }

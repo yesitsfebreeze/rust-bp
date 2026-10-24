@@ -52,13 +52,28 @@ fn quad(
 ) {
 	let vertex = |i: usize| {
 		let c = colors[i];
-		[corners[i][0], corners[i][1], uv[i][0], uv[i][1], c.r, c.g, c.b, c.a]
+		[
+			corners[i][0],
+			corners[i][1],
+			uv[i][0],
+			uv[i][1],
+			c.r,
+			c.g,
+			c.b,
+			c.a,
+		]
 	};
 	let mut poly: Vec<[f32; 8]> = (0..4).map(vertex).collect();
 	if let Some([x0, y0, x1, y1]) = clip {
 		// Each edge as (axis, bound, keep below it).
 		for (axis, bound, below) in [(0, x0, false), (0, x1, true), (1, y0, false), (1, y1, true)] {
-			let inside = |v: &[f32; 8]| if below { v[axis] <= bound } else { v[axis] >= bound };
+			let inside = |v: &[f32; 8]| {
+				if below {
+					v[axis] <= bound
+				} else {
+					v[axis] >= bound
+				}
+			};
 			let mut out = Vec::with_capacity(poly.len() + 2);
 			for k in 0..poly.len() {
 				let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
@@ -443,7 +458,13 @@ impl Overlay {
 			[x + width, y + height],
 			[x, y + height],
 		];
-		quad(&mut self.screen, corners, Self::solid_uv(), [color; 4], self.clip);
+		quad(
+			&mut self.screen,
+			corners,
+			Self::solid_uv(),
+			[color; 4],
+			self.clip,
+		);
 	}
 
 	/// A rectangle shaded between its corners' colors: top left, top right,
@@ -455,7 +476,13 @@ impl Overlay {
 			[x + width, y + height],
 			[x, y + height],
 		];
-		quad(&mut self.screen, corners, Self::solid_uv(), colors, self.clip);
+		quad(
+			&mut self.screen,
+			corners,
+			Self::solid_uv(),
+			colors,
+			self.clip,
+		);
 	}
 
 	/// Cuts the screen drawing that follows to `rect`, x, y, width, height,
@@ -477,11 +504,17 @@ impl Overlay {
 			[x2 - nx, y2 - ny],
 			[x1 - nx, y1 - ny],
 		];
-		quad(&mut self.screen, corners, Self::solid_uv(), [color; 4], self.clip);
+		quad(
+			&mut self.screen,
+			corners,
+			Self::solid_uv(),
+			[color; 4],
+			self.clip,
+		);
 	}
 
 	pub fn text(&mut self, queue: &wgpu::Queue, line: &str, x: f32, y: f32, size: f32, color: Color) {
-		let set = glyph_set(&mut self.glyphs, &self.glyph_texture, queue, size);
+		let set = glyph_set(&mut self.glyphs, &self.glyph_texture, queue, size, line);
 		let side = text::SIDE as f32;
 		let mut pen = x;
 		for c in line.chars() {
@@ -509,7 +542,7 @@ impl Overlay {
 	}
 
 	pub fn text_width(&mut self, queue: &wgpu::Queue, line: &str, size: f32) -> f32 {
-		let set = glyph_set(&mut self.glyphs, &self.glyph_texture, queue, size);
+		let set = glyph_set(&mut self.glyphs, &self.glyph_texture, queue, size, line);
 		line.chars().map(|c| text::glyph(set, c).advance).sum()
 	}
 
@@ -655,9 +688,10 @@ fn glyph_set<'a>(
 	texture: &wgpu::Texture,
 	queue: &wgpu::Queue,
 	size: f32,
-) -> &'a [text::Glyph] {
+	line: &str,
+) -> &'a std::collections::HashMap<char, text::Glyph> {
 	let px = size.round().clamp(6.0, 96.0) as u16;
-	glyphs.set(px, |gx, gy, w, h, coverage| {
+	glyphs.set(px, line, |gx, gy, w, h, coverage| {
 		write_glyphs(queue, texture, gx, gy, w, h, coverage)
 	})
 }
